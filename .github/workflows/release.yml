@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    environment: prod
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release archives
+        run: make release
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          REQUESTBITE_API_URL: ${{ vars.REQUESTBITE_API_URL }}
+          STORAGE_API_URL: ${{ vars.STORAGE_API_URL }}
+          OAUTH_CLIENT_ID: ${{ vars.OAUTH_CLIENT_ID }}
+          OAUTH_SCOPES: ${{ vars.OAUTH_SCOPES }}
+          OAUTH_CALLBACK_URL: ${{ vars.OAUTH_CALLBACK_URL }}
+          DEBUG: ${{ vars.DEBUG }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true

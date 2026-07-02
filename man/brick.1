@@ -1,0 +1,139 @@
+.TH BRICK 1 "" "brick" "User Commands"
+.SH NAME
+brick \- storage sync CLI client for RequestBite
+.SH SYNOPSIS
+.B brick
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B brick
+is the command-line client for RequestBite's Storage Sync feature. It performs
+two-way synchronization between a local folder and the Storage API: it walks
+both trees, uploads local-only files, downloads remote-only files, and
+resolves conflicts with the remote copy winning. After the initial pass it
+watches the local folder for filesystem changes and also polls the Storage
+API periodically, so both sides stay in sync until interrupted.
+.PP
+.B brick
+also manages the OIDC login and active account used for sync.
+.PP
+On first run
+.B brick
+creates a configuration file at
+.I ~/.config/brick/config.yaml
+containing a unique client identifier.
+Authentication tokens are stored in the same file after a successful login.
+.SH OPTIONS
+.SS Account management
+.TP
+.B \-\-login
+Open the default web browser and start login flow.
+On completion the received credentials are saved to the configuration file.
+Run this command before using any feature that requires an authenticated account.
+.TP
+.B \-\-switch\-accounts
+Interactively select which account to make active when more than one account
+has been authenticated.
+The selected account ID is persisted to the configuration file.
+.TP
+.B \-\-whoami
+Print the name, email address, and active account of the currently authenticated
+user.
+If the access token has expired it is refreshed silently using the stored refresh
+token.
+.SS Storage sync
+.TP
+.BR \-s ", " \-\-sync
+Synchronize the folder configured as
+.I storageSyncFolder
+in the configuration file with the Storage API, then watch it for changes.
+If no sync folder is configured yet,
+.B brick
+prompts for one and persists it to the configuration file. The remote copy
+always wins on conflict. Requires a logged-in session with an active account
+(see
+.B \-\-login
+and
+.BR \-\-switch\-accounts ).
+Press
+.B Ctrl\-C
+to stop syncing.
+.SS Other
+.TP
+.B \-\-no\-upgrade\-check
+Suppress the automatic check for a newer version of
+.B brick
+that normally runs at startup before
+.BR \-\-sync .
+.TP
+.B \-\-uninstall
+Interactively remove the
+.B brick
+binary, configuration directory, shell completion files, and man page.
+Each step prompts for confirmation before proceeding.
+.TP
+.BR \-h ", " \-\-help
+Print a short usage summary and exit.
+.TP
+.BR \-v ", " \-\-version
+Print the version number, build timestamp, and git commit hash, then exit.
+.SH EXAMPLES
+.TP
+Log in to a RequestBite account:
+.EX
+brick \-\-login
+.EE
+.TP
+Show the currently authenticated user:
+.EX
+brick \-\-whoami
+.EE
+.TP
+Switch to a different account:
+.EX
+brick \-\-switch\-accounts
+.EE
+.TP
+Sync the configured folder with the Storage API and watch for changes:
+.EX
+brick \-\-sync
+.EE
+.TP
+Sync without checking for CLI upgrades first:
+.EX
+brick \-s \-\-no\-upgrade\-check
+.EE
+.SH FILES
+.TP
+.I ~/.config/brick/config.yaml
+Per-user configuration file.
+Created automatically on first run.
+Contains the client identifier, the configured
+.IR storageSyncFolder ,
+and, after login, OAuth credentials.
+Stored with mode
+.B 0600
+to protect the tokens.
+Do not share this file.
+.TP
+.I ~/.config/brick/sync-state-<hash>.json
+Per-folder sync state index, one file per distinct
+.I storageSyncFolder
+ever synced. Records the last-known local hash and remote ETag for each
+synced file so repeated runs only transfer what changed. Safe to delete;
+.B brick
+will simply re-reconcile the full tree on the next
+.B \-\-sync
+run.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error occurred (invalid flags, network failure, authentication error, etc.).
+.SH BUGS
+Please report bugs and feature requests at:
+.br
+.I https://github.com/requestbite/brick/issues
+.SH AUTHORS
+The RequestBite team (https://requestbite.com)

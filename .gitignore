@@ -1,0 +1,7 @@
+build/
+/brick
+tmp/
+
+.env
+.env.prod
+.env.dev

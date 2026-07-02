@@ -1,0 +1,44 @@
+# Air configuration for brick development
+# https://github.com/air-verse/air
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+# Binary file yields from "make build"
+bin = "build/brick"
+# Custom build command (make build)
+cmd = "make build"
+# Full binary path
+full_bin = "build/brick"
+# Include files with these extensions
+include_ext = ["go", "toml", "yaml", "yml", "json"]
+# Exclude these directories
+exclude_dir = ["dist", "build", "tmp", "vendor", ".git"]
+# Exclude specific files
+exclude_file = []
+# Exclude unchanged files
+exclude_unchanged = true
+# Follow symlink for directories
+follow_symlink = false
+# Log build errors
+log = "build-errors.log"
+# Delay after file change before building (ms)
+delay = 1000
+# Stop running old binary when building new one
+stop_on_error = true
+
+[log]
+# Show log time
+# time = true
+
+[color]
+# Customize each part's color. If no color found, use the raw app log.
+main = "magenta"
+watcher = "cyan"
+build = "yellow"
+runner = "green"
+
+[misc]
+# Delete tmp directory on exit
+clean_on_exit = true

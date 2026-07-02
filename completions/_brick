@@ -1,0 +1,21 @@
+#compdef brick
+# zsh completion for brick
+# Place this file at:
+#   ~/.local/share/zsh/site-functions/_brick
+
+_brick() {
+    local -a args
+    args=(
+        '(--login)'--login'[Log in via browser]'
+        '(--switch-accounts)'--switch-accounts'[Switch the active account]'
+        '(--whoami)'--whoami'[Show logged-in user and account details]'
+        '(-s --sync)'{-s,--sync}'[Sync storageSyncFolder with the Storage API and watch for changes]'
+        '(--no-upgrade-check)'--no-upgrade-check'[Disable automatic upgrade check]'
+        '(--uninstall)'--uninstall'[Uninstall brick]'
+        '(-h --help)'{-h,--help}'[Show help information]'
+        '(-v --version)'{-v,--version}'[Show version information]'
+    )
+    _arguments -s $args
+}
+
+_brick "$@"
