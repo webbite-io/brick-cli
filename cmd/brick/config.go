@@ -32,6 +32,12 @@ type Config struct {
 	// Storage sync
 	StorageSyncFolder string `yaml:"storageSyncFolder,omitempty"`
 
+	// ExcludeDirs lists folder paths, relative to storageSyncFolder and
+	// slash-separated (e.g. "folder/subfolder"), whose files are never
+	// uploaded or downloaded. Changes under them are still detected and
+	// logged, just not synced.
+	ExcludeDirs []string `yaml:"excludeDirs,omitempty"`
+
 	// Remote file agent: additional directories (beyond the sync folder) that
 	// -r/--remote-control exposes to remote clients attached via the storage API.
 	AgentRoots []string `yaml:"agentRoots,omitempty"`

@@ -99,6 +99,20 @@ Pass `-r`/`--remote-control` to also allow the Storage API to remotely
 list, browse, and transfer files on this device while syncing. Without it,
 the local agent refuses any such request.
 
+To exclude folders from sync (Dropbox-style selective sync), add an
+`excludeDirs` list to `~/.config/brick/config.yaml`, with paths relative to
+`storageSyncFolder`:
+
+```yaml
+excludeDirs:
+  - folder/subfolder
+  - other-folder
+```
+
+Files inside an excluded folder (or any folder below it) are never uploaded
+or downloaded; changes to them are detected and logged, but otherwise
+ignored.
+
 ## Development
 
 This repo uses a `Makefile` for building:

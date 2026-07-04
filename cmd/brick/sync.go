@@ -390,6 +390,10 @@ type syncEngine struct {
 	folder string
 	rootID string
 
+	// excludeDirs are the configured excludeDirs entries (slash-separated,
+	// relative to folder); files under them are never uploaded or downloaded.
+	excludeDirs []string
+
 	mu    sync.Mutex // serializes reconcile + state access
 	state *SyncState
 
@@ -672,10 +676,29 @@ func isUnderAny(rel string, handled map[string]bool) bool {
 	return false
 }
 
+// isExcludedPath reports whether rel (a slash-separated path relative to the
+// sync folder) is one of excludeDirs or nested below one of them.
+func isExcludedPath(rel string, excludeDirs []string) bool {
+	for _, dir := range excludeDirs {
+		dir = strings.Trim(filepath.ToSlash(dir), "/")
+		if dir == "" {
+			continue
+		}
+		if rel == dir || strings.HasPrefix(rel, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileFile applies the per-path reconciliation rules: creates, updates and
 // deletes push from whichever side changed to the other; on a genuine content
 // conflict (both sides changed the same file), remote wins.
 func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, remoteFolders map[string]storageNode, folderID map[string]string) error {
+	if isExcludedPath(rel, e.excludeDirs) {
+		return e.reconcileExcludedFile(rel, remoteFiles, localFiles)
+	}
+
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	remoteNode, hasRemote := remoteFiles[rel]
 	_, localExists := localFiles[rel]
@@ -733,6 +756,55 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 		}
 		return nil
 	}
+}
+
+// reconcileExcludedFile handles a path under a configured excludeDirs entry:
+// it is never uploaded or downloaded. The index entry is kept purely to
+// detect when the file changes on either side, so each change is logged once
+// rather than on every reconcile pass.
+func (e *syncEngine) reconcileExcludedFile(rel string, remoteFiles map[string]storageNode, localFiles map[string]int64) error {
+	remoteNode, hasRemote := remoteFiles[rel]
+	_, localExists := localFiles[rel]
+	entry, hasEntry := e.state.Entries[rel]
+
+	if !hasRemote && !localExists {
+		if hasEntry {
+			delete(e.state.Entries, rel)
+		}
+		return nil
+	}
+
+	var localHash string
+	if localExists {
+		abs := filepath.Join(e.folder, filepath.FromSlash(rel))
+		h, err := hashFile(abs)
+		if err != nil {
+			return err
+		}
+		localHash = h
+	}
+
+	if hasEntry && entry.LocalHash == localHash && entry.RemoteEtag == remoteNode.Etag {
+		return nil // already logged, nothing changed since
+	}
+
+	switch {
+	case localExists && !hasRemote:
+		log.Printf("⊘ ignored local change to %s (excluded directory)", rel)
+	case hasRemote && !localExists:
+		log.Printf("⊘ ignored remote change to %s (excluded directory)", rel)
+	default:
+		log.Printf("⊘ ignored change to %s (excluded directory)", rel)
+	}
+
+	e.state.Entries[rel] = SyncEntry{
+		RelPath:    rel,
+		NodeID:     remoteNode.ID,
+		RemoteEtag: remoteNode.Etag,
+		LocalHash:  localHash,
+		SyncedAt:   time.Now(),
+	}
+	return nil
 }
 
 func (e *syncEngine) downloadFile(rel string, node storageNode) error {
@@ -913,6 +985,7 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		sc:              sc,
 		folder:          folder,
 		rootID:          root.ID,
+		excludeDirs:     cfg.ExcludeDirs,
 		state:           loadSyncState(folder),
 		recentlyWritten: map[string]time.Time{},
 	}
