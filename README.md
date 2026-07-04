@@ -7,9 +7,13 @@
 This repository hosts the RequestBite Brick CLI, the command-line client for
 [RequestBite][rb]'s Storage Sync feature. `brick` keeps a local folder in
 two-way sync with the Storage API: it uploads local-only files, downloads
-remote-only files, and resolves conflicts with the remote copy winning. After
-the initial pass it watches the folder for filesystem changes and polls the
-API periodically, so both sides stay in sync until interrupted.
+remote-only files, and propagates deletions in either direction — deleting a
+file or folder locally moves it to trash on the server, and a file or folder
+trashed on the server is removed locally. When both sides edit the same file,
+the server's copy wins. After the initial pass it watches the folder for
+filesystem changes and polls the API periodically, so both sides stay in sync
+until
+interrupted.
 
 `brick` also handles logging in via OIDC and managing which account is active
 for sync.
