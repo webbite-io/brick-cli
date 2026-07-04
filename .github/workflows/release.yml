@@ -33,7 +33,7 @@ jobs:
         run: make release
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
-          REQUESTBITE_API_URL: ${{ vars.REQUESTBITE_API_URL }}
+          ACC_API_URL: ${{ vars.ACC_API_URL }}
           STORAGE_API_URL: ${{ vars.STORAGE_API_URL }}
           OAUTH_CLIENT_ID: ${{ vars.OAUTH_CLIENT_ID }}
           OAUTH_SCOPES: ${{ vars.OAUTH_SCOPES }}

@@ -113,10 +113,10 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// resolveAPIURL returns the effective REQUESTBITE_API_URL, preferring (in order):
+// resolveAPIURL returns the effective ACC_API_URL, preferring (in order):
 // the runtime env var, the compile-time default, then a localhost dev fallback.
 func resolveAPIURL() string {
-	if v := getEnv("REQUESTBITE_API_URL", ""); v != "" {
+	if v := getEnv("ACC_API_URL", ""); v != "" {
 		return v
 	}
 	if DefaultAPIURL != "" {
