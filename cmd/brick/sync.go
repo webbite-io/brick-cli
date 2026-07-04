@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -214,28 +213,29 @@ func (sc *storageClient) createFolder(parentID, name string) (*storageNode, erro
 // as repeated 401s until the process restarts.
 var tokenMu sync.Mutex
 
-// currentIDToken returns cfg.IDToken under the token lock. Callers snapshot the
-// token they present this way and pass it back to refreshIDToken, so a refresh
-// races against a stable value rather than a field another goroutine may be
-// rewriting.
-func currentIDToken(cfg *Config) string {
+// currentAccessToken returns cfg.AccessToken under the token lock. Callers
+// snapshot the token they present this way and pass it back to
+// rotateAccessToken, so a refresh races against a stable value rather than a
+// field another goroutine may be rewriting.
+func currentAccessToken(cfg *Config) string {
 	tokenMu.Lock()
 	defer tokenMu.Unlock()
-	return cfg.IDToken
+	return cfg.AccessToken
 }
 
-// refreshIDToken rotates cfg's tokens and returns the ID token to retry with.
-// presentedIDToken is the token whose request was just rejected; if cfg.IDToken
-// no longer matches it, another goroutine already refreshed while we waited for
-// the lock, so we adopt that result instead of replaying the now-revoked refresh
-// token. The whole operation is serialized by tokenMu.
-func refreshIDToken(refreshAPIURL string, cfg *Config, presentedIDToken string) (string, error) {
+// rotateAccessToken refreshes cfg's tokens and returns the access token to
+// retry with. presentedAccessToken is the token whose request was just
+// rejected; if cfg.AccessToken no longer matches it, another goroutine already
+// refreshed while we waited for the lock, so we adopt that result instead of
+// replaying the now-revoked refresh token. The whole operation is serialized
+// by tokenMu.
+func rotateAccessToken(refreshAPIURL string, cfg *Config, presentedAccessToken string) (string, error) {
 	tokenMu.Lock()
 	defer tokenMu.Unlock()
 
 	// A concurrent goroutine already rotated the token we presented; adopt it.
-	if cfg.IDToken != "" && cfg.IDToken != presentedIDToken {
-		return cfg.IDToken, nil
+	if cfg.AccessToken != "" && cfg.AccessToken != presentedAccessToken {
+		return cfg.AccessToken, nil
 	}
 	if cfg.RefreshToken == "" {
 		return "", errors.New("no refresh token available")
@@ -258,15 +258,18 @@ func refreshIDToken(refreshAPIURL string, cfg *Config, presentedIDToken string) 
 	if err := saveConfig(cfg); err != nil {
 		return "", err
 	}
-	return cfg.IDToken, nil
+	return cfg.AccessToken, nil
 }
 
 // authedRequest performs an authenticated request with a binary body and custom
 // headers, refreshing tokens once on a 401. reqBaseURL is the target service;
 // refreshAPIURL is the companion auth API used for token refresh.
 //
-// The Storage API authenticates with the OIDC ID token (a 3-part RS256 JWT), not
-// the opaque access token, so this helper sends cfg.IDToken as the bearer.
+// The Storage API resolves the caller via the companion API's storage-authz
+// endpoint, which recognizes first-party session JWTs and delegated OAuth2
+// access tokens (introspected for their brick/brick:manage scopes) — not the
+// OIDC ID token, which that endpoint rejects. So this helper sends
+// cfg.AccessToken as the bearer, same as the rest of the CLI.
 func authedRequest(reqBaseURL, refreshAPIURL, method, path string, body []byte, headers map[string]string, cfg *Config) (*http.Response, error) {
 	client := &http.Client{Timeout: 10 * time.Minute}
 	doRequest := func(token string) (*http.Response, error) {
@@ -285,7 +288,7 @@ func authedRequest(reqBaseURL, refreshAPIURL, method, path string, body []byte, 
 		return client.Do(req)
 	}
 
-	presented := currentIDToken(cfg)
+	presented := currentAccessToken(cfg)
 	resp, err := doRequest(presented)
 	if err != nil {
 		return nil, err
@@ -295,14 +298,14 @@ func authedRequest(reqBaseURL, refreshAPIURL, method, path string, body []byte, 
 	// 403), so refresh-and-retry on both statuses rather than 401 alone.
 	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && cfg.RefreshToken != "" {
 		resp.Body.Close()
-		newID, refreshErr := refreshIDToken(refreshAPIURL, cfg, presented)
+		newAccess, refreshErr := rotateAccessToken(refreshAPIURL, cfg, presented)
 		if refreshErr != nil {
 			return nil, fmt.Errorf("%w; token refresh failed: %v", errSessionExpired, refreshErr)
 		}
-		if newID == "" {
-			return nil, fmt.Errorf("%w; no ID token available (run 'brick --login')", errSessionExpired)
+		if newAccess == "" {
+			return nil, fmt.Errorf("%w; no access token available (run 'brick --login')", errSessionExpired)
 		}
-		return doRequest(newID)
+		return doRequest(newAccess)
 	}
 	return resp, nil
 }
@@ -781,9 +784,6 @@ func runStorageSync(apiURL, storageURL string) error {
 	if cfg.AccountID == "" {
 		return errors.New("no active account selected; run 'brick --switch-accounts' first")
 	}
-	if err := ensureIDToken(apiURL, cfg); err != nil {
-		return err
-	}
 
 	folder, err := ensureStorageSyncFolder(cfg)
 	if err != nil {
@@ -916,58 +916,6 @@ func runStorageSync(apiURL, storageURL string) error {
 	<-ctx.Done()
 	eng.saveState()
 	eng.printSummary()
-	return nil
-}
-
-// tokenExpiringSoon reports whether a JWT's exp claim is at or within
-// expirySkew of now (or already past). A malformed/undecodable token is treated
-// as expiring so the caller refreshes rather than sending a token the server
-// will reject; a token with no exp claim is treated as long-lived.
-func tokenExpiringSoon(token string) bool {
-	const expirySkew = 60 * time.Second
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return true
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return true
-	}
-	var claims struct {
-		Exp int64 `json:"exp"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return true
-	}
-	if claims.Exp == 0 {
-		return false
-	}
-	return time.Until(time.Unix(claims.Exp, 0)) <= expirySkew
-}
-
-// ensureIDToken makes sure cfg carries a usable OIDC ID token (required by the
-// Storage API), refreshing if it is missing or already (nearly) expired. The
-// Storage API rejects an expired token, so refreshing proactively here is
-// cheaper and more reliable than relying on a downstream retry. Logins that
-// predate ID-token storage will not have one until a refresh or a fresh login.
-func ensureIDToken(apiURL string, cfg *Config) error {
-	if cfg.IDToken != "" && !tokenExpiringSoon(cfg.IDToken) {
-		return nil
-	}
-	if cfg.RefreshToken == "" {
-		if cfg.IDToken == "" {
-			return errors.New("no ID token available; run 'brick --login' to enable storage sync")
-		}
-		// Can't refresh without a refresh token; fall back to the existing token
-		// and let the server decide.
-		return nil
-	}
-	if _, err := refreshIDToken(apiURL, cfg, cfg.IDToken); err != nil {
-		return fmt.Errorf("could not refresh credentials: %w", err)
-	}
-	if cfg.IDToken == "" {
-		return errors.New("the auth server did not return an ID token; run 'brick --login' to re-authenticate")
-	}
 	return nil
 }
 
