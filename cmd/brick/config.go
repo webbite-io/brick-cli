@@ -31,6 +31,10 @@ type Config struct {
 
 	// Storage sync
 	StorageSyncFolder string `yaml:"storageSyncFolder,omitempty"`
+
+	// Remote file agent: additional directories (beyond the sync folder) that
+	// -s/--sync exposes to remote clients attached via the storage API.
+	AgentRoots []string `yaml:"agentRoots,omitempty"`
 }
 
 // configPath returns the absolute path to ~/.config/brick/config.yaml.
@@ -145,6 +149,7 @@ func printHelp() {
 	fmt.Printf("      --whoami                Show logged-in user and account details\n")
 	fmt.Println("\nStorage Sync\n============")
 	fmt.Printf("  -s, --sync                  Sync storageSyncFolder with the Storage API and watch for changes\n")
+	fmt.Printf("      --agent-root PATH       Additional directory to expose to remote clients during sync (repeatable)\n")
 	fmt.Println("\nOther\n=====")
 	fmt.Printf("      --no-upgrade-check      Disable automatic upgrade check\n")
 	fmt.Printf("      --uninstall             Uninstall brick\n")

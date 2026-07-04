@@ -816,6 +816,21 @@ func runStorageSync(apiURL, storageURL string) error {
 
 	fmt.Printf("Syncing %s with the Storage API. Press Ctrl+C to stop.\n", folder)
 
+	// Remote file agent: register this device with the storage API and expose the
+	// allowed roots so the same user can browse/transfer files remotely. Runs
+	// alongside sync; failures here are non-fatal to syncing.
+	agentRoots := resolveAgentRoots(cfg, folder)
+	agentSecret := newAgentSecret()
+	if _, agentLn, aerr := startAgentServer(agentRoots, agentSecret, sc); aerr != nil {
+		log.Printf("could not start remote file agent: %v", aerr)
+	} else {
+		agentAddr := agentLn.Addr().String()
+		defer agentLn.Close()
+		go connectAgentWithReconnect(ctx, storageURL, apiURL, cfg, agentSecret, agentAddr)
+		defer deregisterAgent(storageURL, apiURL, cfg)
+		fmt.Printf("Remote file agent enabled (roots: %s)\n", strings.Join(agentRoots, ", "))
+	}
+
 	// Initial full reconciliation (pulls everything, pushes local-only files).
 	if err := eng.reconcileAll(); err != nil {
 		if errors.Is(err, errSessionExpired) {

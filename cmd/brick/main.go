@@ -48,6 +48,7 @@ func main() {
 	flag.BoolVar(&whoami, "whoami", false, "")
 	flag.BoolVar(&syncMode, "s", false, "")
 	flag.BoolVar(&syncMode, "sync", false, "")
+	flag.Var(&agentRootsFlag, "agent-root", "")
 	flag.Usage = printHelp
 	flag.Parse()
 
