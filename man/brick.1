@@ -42,10 +42,11 @@ If the access token has expired it is refreshed silently using the stored refres
 token.
 .SS Storage sync
 .TP
-.BR \-s ", " \-\-sync
-Synchronize the folder configured as
+Running
+.B brick
+with no other options synchronizes the folder configured as
 .I storageSyncFolder
-in the configuration file with the Storage API, then watch it for changes.
+in the configuration file with the Storage API, then watches it for changes.
 If no sync folder is configured yet,
 .B brick
 prompts for one and persists it to the configuration file. The remote copy
@@ -57,13 +58,24 @@ and
 Press
 .B Ctrl\-C
 to stop syncing.
+.TP
+.BR \-r ", " \-\-remote\-control
+Allow the Storage API to remotely list, browse, and transfer files on this
+device while syncing. Without this flag the local agent refuses any such
+request from the Storage API, even if it is otherwise connected.
+.TP
+.B \-\-agent\-root \fIPATH\fR
+Expose an additional directory (beyond
+.IR storageSyncFolder )
+to remote clients when
+.B \-\-remote\-control
+is enabled. Repeatable.
 .SS Other
 .TP
 .B \-\-no\-upgrade\-check
 Suppress the automatic check for a newer version of
 .B brick
-that normally runs at startup before
-.BR \-\-sync .
+that normally runs at startup before syncing.
 .TP
 .B \-\-uninstall
 Interactively remove the
@@ -95,12 +107,17 @@ brick \-\-switch\-accounts
 .TP
 Sync the configured folder with the Storage API and watch for changes:
 .EX
-brick \-\-sync
+brick
+.EE
+.TP
+Sync and allow the Storage API to remotely browse and transfer files:
+.EX
+brick \-\-remote\-control
 .EE
 .TP
 Sync without checking for CLI upgrades first:
 .EX
-brick \-s \-\-no\-upgrade\-check
+brick \-\-no\-upgrade\-check
 .EE
 .SH FILES
 .TP
@@ -121,9 +138,7 @@ Per-folder sync state index, one file per distinct
 ever synced. Records the last-known local hash and remote ETag for each
 synced file so repeated runs only transfer what changed. Safe to delete;
 .B brick
-will simply re-reconcile the full tree on the next
-.B \-\-sync
-run.
+will simply re-reconcile the full tree on the next run.
 .SH EXIT STATUS
 .TP
 .B 0

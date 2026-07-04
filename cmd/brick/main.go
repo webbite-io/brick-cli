@@ -34,7 +34,7 @@ func main() {
 		loginMode      bool
 		switchAccounts bool
 		whoami         bool
-		syncMode       bool
+		remoteControl  bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "")
@@ -46,8 +46,8 @@ func main() {
 	flag.BoolVar(&loginMode, "login", false, "")
 	flag.BoolVar(&switchAccounts, "switch-accounts", false, "")
 	flag.BoolVar(&whoami, "whoami", false, "")
-	flag.BoolVar(&syncMode, "s", false, "")
-	flag.BoolVar(&syncMode, "sync", false, "")
+	flag.BoolVar(&remoteControl, "r", false, "")
+	flag.BoolVar(&remoteControl, "remote-control", false, "")
 	flag.Var(&agentRootsFlag, "agent-root", "")
 	flag.Usage = printHelp
 	flag.Parse()
@@ -103,21 +103,15 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Storage sync
-	if syncMode {
-		if !noUpgradeCheck && !isRunningInDevelopment() {
-			checkForUpdates()
-		}
-		apiURL := resolveAPIURL()
-		storageURL := resolveStorageAPIURL()
-		if err := runStorageSync(apiURL, storageURL); err != nil {
-			log.Fatalf("Storage sync failed: %v", err)
-		}
-		os.Exit(0)
+	// Storage sync: the default action, requiring no CLI options.
+	if !noUpgradeCheck && !isRunningInDevelopment() {
+		checkForUpdates()
 	}
-
-	// No flags given — show help.
-	printHelp()
+	apiURL := resolveAPIURL()
+	storageURL := resolveStorageAPIURL()
+	if err := runStorageSync(apiURL, storageURL, remoteControl); err != nil {
+		log.Fatalf("Storage sync failed: %v", err)
+	}
 }
 
 // isRunningInDevelopment detects if the binary is running in a development environment (e.g., with Air)

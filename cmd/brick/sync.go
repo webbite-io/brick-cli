@@ -776,7 +776,7 @@ func (e *syncEngine) printSummary() {
 // runStorageSync performs an initial full sync of storageSyncFolder with the
 // Storage API, then watches the folder and polls the API for changes until
 // interrupted. The API always has precedence on conflict.
-func runStorageSync(apiURL, storageURL string) error {
+func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 	cfg, err := ensureAuthenticated(apiURL)
 	if err != nil {
 		return err
@@ -816,19 +816,23 @@ func runStorageSync(apiURL, storageURL string) error {
 
 	fmt.Printf("Syncing %s with the Storage API. Press Ctrl+C to stop.\n", folder)
 
-	// Remote file agent: register this device with the storage API and expose the
-	// allowed roots so the same user can browse/transfer files remotely. Runs
-	// alongside sync; failures here are non-fatal to syncing.
+	// Remote file agent: register this device with the storage API. When
+	// remoteControl is enabled, the allowed roots are also exposed so the same
+	// user can browse/list/transfer files remotely; otherwise the storage API is
+	// refused if it tries to call that functionality. Runs alongside sync;
+	// failures here are non-fatal to syncing.
 	agentRoots := resolveAgentRoots(cfg, folder)
 	agentSecret := newAgentSecret()
-	if _, agentLn, aerr := startAgentServer(agentRoots, agentSecret, sc); aerr != nil {
+	if _, agentLn, aerr := startAgentServer(agentRoots, agentSecret, sc, remoteControl); aerr != nil {
 		log.Printf("could not start remote file agent: %v", aerr)
 	} else {
 		agentAddr := agentLn.Addr().String()
 		defer agentLn.Close()
-		go connectAgentWithReconnect(ctx, storageURL, apiURL, cfg, agentSecret, agentAddr)
+		go connectAgentWithReconnect(ctx, storageURL, apiURL, cfg, agentSecret, agentAddr, remoteControl)
 		defer deregisterAgent(storageURL, apiURL, cfg)
-		fmt.Printf("Remote file agent enabled (roots: %s)\n", strings.Join(agentRoots, ", "))
+		if remoteControl {
+			fmt.Printf("Remote control enabled (roots: %s)\n", strings.Join(agentRoots, ", "))
+		}
 	}
 
 	// Initial full reconciliation (pulls everything, pushes local-only files).

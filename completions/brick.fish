@@ -16,8 +16,13 @@ complete -c brick -l whoami \
     -d 'Show logged-in user and account details'
 
 # ── Storage sync ──────────────────────────────────────────────────────────────
-complete -c brick -s s -l sync \
-    -d 'Sync storageSyncFolder with the Storage API and watch for changes'
+# Running brick with no other options syncs storageSyncFolder with the Storage
+# API and watches for changes.
+complete -c brick -s r -l remote-control \
+    -d 'Allow the Storage API to remotely list/browse/transfer files on this device'
+
+complete -c brick -l agent-root \
+    -d 'Additional directory to expose to remote clients when remote control is enabled' -r
 
 # ── Other ─────────────────────────────────────────────────────────────────────
 complete -c brick -l no-upgrade-check \

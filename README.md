@@ -68,7 +68,9 @@ Account Mgmt
 
 Storage Sync
 ============
-  -s, --sync                  Sync storageSyncFolder with the Storage API and watch for changes
+  Running brick with no other options syncs storageSyncFolder with the Storage API and watches for changes
+  -r, --remote-control        Allow the Storage API to remotely list/browse/transfer files on this device
+      --agent-root PATH       Additional directory to expose to remote clients when remote control is enabled (repeatable)
 
 Other
 =====
@@ -83,11 +85,15 @@ Log in, pick an account, then sync:
 ```bash
 brick --login
 brick --switch-accounts   # only needed if your user has more than one account
-brick --sync
+brick
 ```
 
-On first run, `--sync` prompts for the local folder to sync and remembers it
+On first run, `brick` prompts for the local folder to sync and remembers it
 (`storageSyncFolder` in `~/.config/brick/config.yaml`) for subsequent runs.
+
+Pass `-r`/`--remote-control` to also allow the Storage API to remotely
+list, browse, and transfer files on this device while syncing. Without it,
+the local agent refuses any such request.
 
 ## Development
 

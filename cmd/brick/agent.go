@@ -54,9 +54,10 @@ var agentRootsFlag stringList
 // --- Local agent HTTP API ---
 
 type agentServer struct {
-	roots  []string // absolute, cleaned allowed roots
-	secret string
-	sc     *storageClient
+	roots         []string // absolute, cleaned allowed roots
+	secret        string
+	sc            *storageClient
+	remoteControl bool
 }
 
 type fsEntry struct {
@@ -68,12 +69,12 @@ type fsEntry struct {
 
 // startAgentServer binds a loopback listener and serves the agent API. The
 // caller closes the returned listener to stop it.
-func startAgentServer(roots []string, secret string, sc *storageClient) (*agentServer, net.Listener, error) {
+func startAgentServer(roots []string, secret string, sc *storageClient, remoteControl bool) (*agentServer, net.Listener, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, nil, err
 	}
-	a := &agentServer{roots: roots, secret: secret, sc: sc}
+	a := &agentServer{roots: roots, secret: secret, sc: sc, remoteControl: remoteControl}
 	srv := &http.Server{Handler: a.handler()}
 	go srv.Serve(ln) //nolint:errcheck
 	return a, ln, nil
@@ -97,6 +98,10 @@ func (a *agentServer) handler() http.Handler {
 
 func (a *agentServer) auth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.remoteControl {
+			writeError(w, http.StatusForbidden, "remote_control_disabled", "remote control is not enabled on this client")
+			return
+		}
 		if a.secret == "" || r.Header.Get(agentSecretHeader) != a.secret {
 			writeError(w, http.StatusForbidden, "forbidden", "missing or invalid agent secret")
 			return
@@ -672,13 +677,14 @@ func proxyAgentStream(stream net.Conn, agentAddr string) {
 // proxies incoming streams to the local agent until the session ends or ctx is
 // cancelled. It reads cfg.AccessToken fresh so reconnects pick up refreshed
 // tokens, and refreshes once on a 401/403.
-func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string) error {
+func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string, remoteControl bool) error {
 	hostname, _ := os.Hostname()
 	q := url.Values{}
 	q.Set("clientId", cfg.ClientID)
 	q.Set("hostname", hostname)
 	q.Set("os", runtime.GOOS)
 	q.Set("arch", runtime.GOARCH)
+	q.Set("remoteControl", strconv.FormatBool(remoteControl))
 	muxURL := toWSURL(storageURL) + "/v1/accounts/" + url.PathEscape(cfg.AccountID) + "/agent/connect?" + q.Encode()
 
 	presented := currentAccessToken(cfg)
@@ -762,10 +768,10 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 // connectAgentWithReconnect keeps the agent connected, retrying with backoff
 // until ctx is cancelled. Unlike a tunnel's reconnect logic it never gives up,
 // since the agent is a long-lived background service alongside sync.
-func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string) {
+func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string, remoteControl bool) {
 	attempt := 0
 	for {
-		err := connectAgentOnce(ctx, storageURL, apiURL, cfg, secret, agentAddr)
+		err := connectAgentOnce(ctx, storageURL, apiURL, cfg, secret, agentAddr, remoteControl)
 		if ctx.Err() != nil {
 			return
 		}

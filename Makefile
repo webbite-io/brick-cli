@@ -160,7 +160,7 @@ install: build
 	fi
 
 # Run with hot reload (requires air)
-# Usage: make dev ARGS="-s"
+# Usage: make dev ARGS="-r"
 dev:
 	@# For --help or --version, run directly without Air
 	@if echo "$(ARGS)" | grep -qE "(-h|--help|-v|--version)"; then \
@@ -201,7 +201,7 @@ help:
 	@echo "$(COLOR_BOLD)Examples:$(COLOR_RESET)"
 	@echo "  make build                                    # Quick build for development"
 	@echo "  make dev                                      # Run with hot reload"
-	@echo "  make dev ARGS="-s"                             # Run with CLI arguments"
+	@echo "  make dev ARGS="-r"                             # Run with CLI arguments"
 	@echo "  make build-all                                # Build for all platforms"
 	@echo "  make release                                  # Create release archives"
 	@echo "  make install                                  # Install locally"
