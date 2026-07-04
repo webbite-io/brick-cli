@@ -174,6 +174,20 @@ func (sc *storageClient) replace(nodeID string, data []byte) (*storageNode, erro
 	return &result.Node, nil
 }
 
+// delete soft-deletes a node (file or folder), moving it to trash. A 404 means
+// it's already gone remotely, which is treated as success.
+func (sc *storageClient) delete(nodeID string) error {
+	resp, err := sc.request("DELETE", "/nodes/"+nodeID, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return sc.errFrom(resp)
+	}
+	return nil
+}
+
 func (sc *storageClient) createFolder(parentID, name string) (*storageNode, error) {
 	body, _ := json.Marshal(map[string]string{"parentId": parentID, "name": name})
 	resp, err := sc.request("POST", "/nodes", body, map[string]string{"Content-Type": "application/json"})
@@ -476,7 +490,10 @@ func (e *syncEngine) buildLocalTree() (files map[string]int64, dirs map[string]b
 
 // reconcileAll performs a full two-way reconciliation between the remote tree and
 // the local folder. It is idempotent and safe to call repeatedly; the sync index
-// ensures already-synced files do no work. Remote always wins on conflict.
+// ensures already-synced files do no work. Deletions push from whichever side
+// removed the file to the other (a local delete trashes the file remotely; a
+// remote delete/trash removes it locally); on content conflicts (both sides
+// changed the same file), remote wins.
 func (e *syncEngine) reconcileAll() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -490,7 +507,47 @@ func (e *syncEngine) reconcileAll() error {
 		return err
 	}
 
-	// 1. Create missing local directories for remote folders, and record every
+	// 1. Detect previously-synced folders that are now missing locally -> the
+	//    user deleted them -> push the removal to the server as a soft-delete
+	//    (trash), the folder counterpart of deleteRemoteFile for files. The
+	//    server cascades a folder delete to its whole subtree, so once a
+	//    folder is trashed we prune that subtree from remoteFolders/
+	//    remoteFiles/folderID (and the matching index entries) instead of
+	//    letting later passes redundantly re-process each descendant.
+	//    Shallowest-first, skipping any folder already covered by an ancestor's
+	//    cascade in this same pass.
+	var deletedDirs []string
+	for rel := range e.state.Folders {
+		if _, ok := remoteFolders[rel]; !ok {
+			continue // already gone remotely; handled by the gone-folder pass below
+		}
+		if localDirs[rel] {
+			continue // still present locally
+		}
+		deletedDirs = append(deletedDirs, rel)
+	}
+	sort.Slice(deletedDirs, func(i, j int) bool {
+		return strings.Count(deletedDirs[i], "/") < strings.Count(deletedDirs[j], "/")
+	})
+	handledDeletes := map[string]bool{}
+	for _, rel := range deletedDirs {
+		if isUnderAny(rel, handledDeletes) {
+			continue
+		}
+		if err := e.sc.delete(remoteFolders[rel].ID); err != nil {
+			if errors.Is(err, errSessionExpired) {
+				return err
+			}
+			log.Printf("delete folder %s: %v", rel, err)
+			continue
+		}
+		handledDeletes[rel] = true
+		e.pruneRemoteSubtree(rel, remoteFolders, remoteFiles, folderID)
+		e.deleted++
+		log.Printf("🗑  trashed folder %s (deleted locally)", rel)
+	}
+
+	// 2. Create missing local directories for remote folders, and record every
 	//    remote folder in the index so later passes can recognise which local
 	//    folders were once synced.
 	for rel := range remoteFolders {
@@ -500,7 +557,7 @@ func (e *syncEngine) reconcileAll() error {
 		e.state.Folders[rel] = true
 	}
 
-	// 2. Reconcile every file across the union of remote, local and index keys.
+	// 3. Reconcile every file across the union of remote, local and index keys.
 	//    File uploads create any missing remote parent folders on demand (see
 	//    ensureRemoteFolder), so this runs before the folder push/delete passes.
 	keys := map[string]struct{}{}
@@ -522,7 +579,7 @@ func (e *syncEngine) reconcileAll() error {
 		}
 	}
 
-	// 3. Push genuinely new local folders (not on the server and never synced).
+	// 4. Push genuinely new local folders (not on the server and never synced).
 	//    This is what carries up empty directories the user just created; folders
 	//    that hold new files were already created during the file pass.
 	for rel := range localDirs {
@@ -530,7 +587,7 @@ func (e *syncEngine) reconcileAll() error {
 			continue
 		}
 		if e.state.Folders[rel] {
-			continue // was synced before -> server deletion, handled in pass 4
+			continue // was synced before -> server deletion, handled in pass 5
 		}
 		if _, err := e.ensureRemoteFolder(rel, remoteFolders, folderID); err != nil {
 			if errors.Is(err, errSessionExpired) {
@@ -540,7 +597,7 @@ func (e *syncEngine) reconcileAll() error {
 		}
 	}
 
-	// 4. Remove local folders that were synced before but are now gone from the
+	// 5. Remove local folders that were synced before but are now gone from the
 	//    server (deepest first, so children empty out before their parents). We
 	//    only remove empty directories: a folder still holding new local content
 	//    is dropped from the index instead, so the next pass re-pushes it rather
@@ -567,7 +624,7 @@ func (e *syncEngine) reconcileAll() error {
 		if err := os.Remove(abs); err != nil {
 			if !os.IsNotExist(err) {
 				// Non-empty (holds new local content) -> leave it; having dropped
-				// it from the index, pass 3 will re-push it on the next run.
+				// it from the index, pass 4 will re-push it on the next run.
 				log.Printf("keeping %s: %v", rel, err)
 			}
 			continue
@@ -580,7 +637,44 @@ func (e *syncEngine) reconcileAll() error {
 	return nil
 }
 
-// reconcileFile applies the per-path reconciliation rules (remote wins on conflict).
+// pruneRemoteSubtree removes rel (a folder) and everything nested under it from
+// the in-memory remote tree and the sync index, after the server has soft-
+// deleted that folder (which cascades to its descendants). This keeps the rest
+// of reconcileAll from redundantly re-processing files and folders that are
+// already gone.
+func (e *syncEngine) pruneRemoteSubtree(rel string, remoteFolders, remoteFiles map[string]storageNode, folderID map[string]string) {
+	prefix := rel + "/"
+	delete(remoteFolders, rel)
+	delete(folderID, rel)
+	delete(e.state.Folders, rel)
+	for k := range remoteFolders {
+		if strings.HasPrefix(k, prefix) {
+			delete(remoteFolders, k)
+			delete(folderID, k)
+			delete(e.state.Folders, k)
+		}
+	}
+	for k := range remoteFiles {
+		if strings.HasPrefix(k, prefix) {
+			delete(remoteFiles, k)
+			delete(e.state.Entries, k)
+		}
+	}
+}
+
+// isUnderAny reports whether rel is nested inside any path in handled.
+func isUnderAny(rel string, handled map[string]bool) bool {
+	for h := range handled {
+		if strings.HasPrefix(rel, h+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// reconcileFile applies the per-path reconciliation rules: creates, updates and
+// deletes push from whichever side changed to the other; on a genuine content
+// conflict (both sides changed the same file), remote wins.
 func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, remoteFolders map[string]storageNode, folderID map[string]string) error {
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	remoteNode, hasRemote := remoteFiles[rel]
@@ -589,7 +683,12 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 
 	switch {
 	case hasRemote && !localExists:
-		// Remote-only (new on server) or locally deleted -> download (never delete remote).
+		if hasEntry {
+			// Was synced before and is now gone locally -> the user deleted it ->
+			// push that removal to the server as a soft-delete (trash).
+			return e.deleteRemoteFile(rel, remoteNode.ID)
+		}
+		// Remote-only, never synced locally -> download.
 		return e.downloadFile(rel, remoteNode)
 
 	case !hasRemote && localExists:
@@ -662,6 +761,18 @@ func (e *syncEngine) downloadFile(rel string, node storageNode) error {
 	}
 	e.downloaded++
 	log.Printf("↓ downloaded %s", rel)
+	return nil
+}
+
+// deleteRemoteFile pushes a local file removal to the server as a soft-delete
+// (trash), the mirror image of downloadFile pushing a remote removal to local.
+func (e *syncEngine) deleteRemoteFile(rel, nodeID string) error {
+	if err := e.sc.delete(nodeID); err != nil {
+		return err
+	}
+	delete(e.state.Entries, rel)
+	e.deleted++
+	log.Printf("🗑  trashed %s (deleted locally)", rel)
 	return nil
 }
 
@@ -775,7 +886,9 @@ func (e *syncEngine) printSummary() {
 
 // runStorageSync performs an initial full sync of storageSyncFolder with the
 // Storage API, then watches the folder and polls the API for changes until
-// interrupted. The API always has precedence on conflict.
+// interrupted. Creates, updates and deletes all push from whichever side made
+// the change to the other; simultaneous edits of the same file are the one
+// case where the API's copy wins.
 func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 	cfg, err := ensureAuthenticated(apiURL)
 	if err != nil {
