@@ -113,6 +113,68 @@ Files inside an excluded folder (or any folder below it) are never uploaded
 or downloaded; changes to them are detected and logged, but otherwise
 ignored.
 
+## Local Status/Control API
+
+While syncing, `brick` runs a local, loopback-only control API so another
+local process on the same machine — e.g. a system-tray companion app — can
+read live sync status and issue commands, without touching the terminal
+`brick` is attached to. The full request/response schema is in
+[`openapi.yaml`](openapi.yaml).
+
+It's on by default; disable it with `--no-control-api` if you don't want any
+local IPC surface (for example, running `brick` unattended on a server).
+
+**Transport.** The API is served over a Unix domain socket (this works on
+Windows too — Go/Windows have supported `AF_UNIX` sockets since Go 1.20 — so
+there's no separate named-pipe code path). It is never bound to a
+network-reachable address.
+
+**Discovery.** On startup, `brick` writes a small JSON file so a client can
+find the running instance and how to talk to it:
+
+| OS      | Path                                                |
+| ------- | ---------------------------------------------------- |
+| Linux   | `$XDG_RUNTIME_DIR/brick/agent.json` (falls back to `~/.config/brick/run/agent.json`) |
+| macOS   | `~/Library/Application Support/brick/run/agent.json` |
+| Windows | `%LOCALAPPDATA%\brick\run\agent.json`                |
+
+```json
+{
+  "pid": 48213,
+  "version": "1.4.2",
+  "protocolVersion": 1,
+  "transport": "unix",
+  "address": "/run/user/1000/brick/control.sock",
+  "token": "base64-random-32-bytes",
+  "startedAt": "2026-07-05T12:00:00Z"
+}
+```
+
+The file (and the socket) are mode `0600` in a `0700` directory, and are
+removed on clean shutdown. A client should treat a leftover file as stale —
+and safely overwrite-able — if `pid` isn't a live process.
+
+**Auth.** Every endpoint except `/v1/health` requires the `token` from the
+discovery file in an `X-Brick-Control-Secret` header. The token is
+regenerated every time `brick` starts.
+
+**Single instance.** `brick` takes an exclusive lock (`~/.config/brick/brick.lock`)
+before doing anything else, so only one sync engine ever runs per user per
+machine — a second invocation fails fast with "brick is already running for
+this user" instead of racing the first.
+
+**Endpoints** (see `openapi.yaml` for full schemas):
+
+| Method | Path            | Description                                                       |
+| ------ | --------------- | ------------------------------------------------------------------ |
+| GET    | `/v1/health`    | Liveness check; no auth required.                                  |
+| GET    | `/v1/status`    | Current sync state, counters, in-flight transfer, last error.       |
+| GET    | `/v1/activity`  | Recent upload/download/delete events (`?limit=`, default 50).      |
+| GET    | `/v1/account`   | The logged-in account/client ID.                                   |
+| POST   | `/v1/pause`     | Stop reconciling until resumed (the filesystem watcher keeps running). |
+| POST   | `/v1/resume`    | Resume reconciling immediately.                                     |
+| POST   | `/v1/quit`      | Gracefully shut down `brick` (same path as Ctrl+C).                 |
+
 ## Development
 
 This repo uses a `Makefile` for building:

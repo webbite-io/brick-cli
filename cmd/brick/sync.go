@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/huh"
@@ -437,12 +438,158 @@ type syncEngine struct {
 	mu    sync.Mutex // serializes reconcile + state access
 	state *SyncState
 
-	downloaded int
-	uploaded   int
-	deleted    int
+	downloaded atomic.Int64
+	uploaded   atomic.Int64
+	deleted    atomic.Int64
 
 	recentMu        sync.Mutex
 	recentlyWritten map[string]time.Time
+
+	// paused gates reconcileAll calls from the debounce worker and poll
+	// ticker (sync.go's runStorageSync goroutines) without tearing down the
+	// fsnotify watcher, so resuming is instant rather than needing a full
+	// rescan. Controlled via the local control API's /v1/pause and /v1/resume.
+	paused atomic.Bool
+
+	// ctrlMu guards the live-status fields below, which are read by the
+	// control API's /v1/status handler from a separate goroutine. It is
+	// deliberately distinct from mu (which serializes reconcile passes) so a
+	// status read never blocks on an in-progress reconcile.
+	ctrlMu        sync.RWMutex
+	ctrlState     string // "starting" | "syncing" | "idle" | "error"
+	ctrlLastError string
+	ctrlLastSync  time.Time
+	ctrlInFlight  *controlInFlight
+	ctrlActivity  []controlActivityEvent
+}
+
+// controlInFlight describes the single file transfer in progress, if any.
+type controlInFlight struct {
+	RelPath   string `json:"relPath"`
+	Direction string `json:"direction"` // "upload" | "download"
+}
+
+// controlActivityEvent is one entry in the bounded recent-activity feed the
+// control API serves at /v1/activity.
+type controlActivityEvent struct {
+	Kind    string    `json:"kind"` // "upload" | "download" | "update" | "trash" | "remove" | "keep-both"
+	RelPath string    `json:"relPath"`
+	At      time.Time `json:"at"`
+}
+
+// controlActivityCap bounds the in-memory activity ring buffer.
+const controlActivityCap = 200
+
+// setState updates the coarse sync state reported by /v1/status. It does not
+// touch paused: the control API overlays "paused" on top of whatever state
+// is recorded here for as long as e.paused is set.
+func (e *syncEngine) setState(s string) {
+	e.ctrlMu.Lock()
+	e.ctrlState = s
+	e.ctrlMu.Unlock()
+}
+
+// setSynced records a successful reconcile pass.
+func (e *syncEngine) setSynced() {
+	e.ctrlMu.Lock()
+	e.ctrlState = "idle"
+	e.ctrlLastError = ""
+	e.ctrlLastSync = time.Now()
+	e.ctrlMu.Unlock()
+}
+
+// setSyncError records a failed reconcile pass.
+func (e *syncEngine) setSyncError(err error) {
+	e.ctrlMu.Lock()
+	e.ctrlState = "error"
+	e.ctrlLastError = err.Error()
+	e.ctrlMu.Unlock()
+}
+
+// setInFlight/clearInFlight track the single file transfer in progress, if
+// any, for /v1/status's inFlight field.
+func (e *syncEngine) setInFlight(relPath, direction string) {
+	e.ctrlMu.Lock()
+	e.ctrlInFlight = &controlInFlight{RelPath: relPath, Direction: direction}
+	e.ctrlMu.Unlock()
+}
+
+func (e *syncEngine) clearInFlight() {
+	e.ctrlMu.Lock()
+	e.ctrlInFlight = nil
+	e.ctrlMu.Unlock()
+}
+
+// publishActivity appends to the bounded recent-activity feed, dropping the
+// oldest entry once controlActivityCap is reached.
+func (e *syncEngine) publishActivity(kind, relPath string) {
+	e.ctrlMu.Lock()
+	defer e.ctrlMu.Unlock()
+	e.ctrlActivity = append(e.ctrlActivity, controlActivityEvent{Kind: kind, RelPath: relPath, At: time.Now()})
+	if len(e.ctrlActivity) > controlActivityCap {
+		e.ctrlActivity = e.ctrlActivity[len(e.ctrlActivity)-controlActivityCap:]
+	}
+}
+
+// recentActivity returns up to limit of the most recent activity events,
+// newest first.
+func (e *syncEngine) recentActivity(limit int) []controlActivityEvent {
+	e.ctrlMu.RLock()
+	defer e.ctrlMu.RUnlock()
+	n := len(e.ctrlActivity)
+	if limit > n {
+		limit = n
+	}
+	out := make([]controlActivityEvent, limit)
+	for i := 0; i < limit; i++ {
+		out[i] = e.ctrlActivity[n-1-i]
+	}
+	return out
+}
+
+// setPaused toggles whether the debounce worker in runStorageSync is allowed
+// to call reconcileAll.
+func (e *syncEngine) setPaused(p bool) {
+	e.paused.Store(p)
+}
+
+// controlStatus is the JSON shape served at /v1/status.
+type controlStatus struct {
+	State               string           `json:"state"`
+	Folder              string           `json:"folder"`
+	LastError           string           `json:"lastError,omitempty"`
+	LastSyncCompletedAt time.Time        `json:"lastSyncCompletedAt,omitempty"`
+	Counters            controlCounters  `json:"counters"`
+	InFlight            *controlInFlight `json:"inFlight"`
+}
+
+type controlCounters struct {
+	Uploaded   int64 `json:"uploaded"`
+	Downloaded int64 `json:"downloaded"`
+	Deleted    int64 `json:"deleted"`
+}
+
+// statusSnapshot builds the current /v1/status payload. paused overlays the
+// underlying reconcile-derived state, matching setState's contract above.
+func (e *syncEngine) statusSnapshot() controlStatus {
+	e.ctrlMu.RLock()
+	defer e.ctrlMu.RUnlock()
+	state := e.ctrlState
+	if e.paused.Load() {
+		state = "paused"
+	}
+	return controlStatus{
+		State:               state,
+		Folder:              e.folder,
+		LastError:           e.ctrlLastError,
+		LastSyncCompletedAt: e.ctrlLastSync,
+		Counters: controlCounters{
+			Uploaded:   e.uploaded.Load(),
+			Downloaded: e.downloaded.Load(),
+			Deleted:    e.deleted.Load(),
+		},
+		InFlight: e.ctrlInFlight,
+	}
 }
 
 func (e *syncEngine) markRecentlyWritten(abs string) {
@@ -538,9 +685,21 @@ func (e *syncEngine) buildLocalTree() (files map[string]int64, dirs map[string]b
 // removed the file to the other (a local delete trashes the file remotely; a
 // remote delete/trash removes it locally); on content conflicts (both sides
 // changed the same file), remote wins.
-func (e *syncEngine) reconcileAll() error {
+func (e *syncEngine) reconcileAll() (err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	e.setState("syncing")
+	defer func() {
+		// errSessionExpired ends the whole sync loop (see runStorageSync), so
+		// surfacing it as a lingering "error" status would be misleading —
+		// the process is shutting down, not stuck.
+		if err != nil && !errors.Is(err, errSessionExpired) {
+			e.setSyncError(err)
+		} else if err == nil {
+			e.setSynced()
+		}
+	}()
 
 	remoteFiles, remoteFolders, folderID, err := e.buildRemoteTree()
 	if err != nil {
@@ -587,8 +746,9 @@ func (e *syncEngine) reconcileAll() error {
 		}
 		handledDeletes[rel] = true
 		e.pruneRemoteSubtree(rel, remoteFolders, remoteFiles, folderID)
-		e.deleted++
+		e.deleted.Add(1)
 		log.Printf("🗑  trashed folder %s (deleted locally)", rel)
+		e.publishActivity("trash-folder", rel)
 	}
 
 	// 2. Create missing local directories for remote folders, and record every
@@ -673,8 +833,9 @@ func (e *syncEngine) reconcileAll() error {
 			}
 			continue
 		}
-		e.deleted++
+		e.deleted.Add(1)
 		log.Printf("🗑  removed folder %s (deleted on server)", rel)
+		e.publishActivity("remove-folder", rel)
 	}
 
 	e.saveStateLocked()
@@ -765,8 +926,9 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 				return err
 			}
 			delete(e.state.Entries, rel)
-			e.deleted++
+			e.deleted.Add(1)
 			log.Printf("🗑  removed %s (deleted on server)", rel)
+			e.publishActivity("remove", rel)
 			return nil
 		}
 		// Local-only new file (or locally changed after a server delete) -> upload.
@@ -884,6 +1046,7 @@ func (e *syncEngine) keepBothFile(rel string, remoteNode storageNode, remoteFold
 		return err
 	}
 	log.Printf("⧉ kept both copies of %s (as %s)", rel, copyRel)
+	e.publishActivity("keep-both", rel)
 	return nil
 }
 
@@ -901,6 +1064,9 @@ func dupPath(rel string) string {
 }
 
 func (e *syncEngine) downloadFile(rel string, node storageNode) error {
+	e.setInFlight(rel, "download")
+	defer e.clearInFlight()
+
 	data, etag, err := e.sc.download(node.ID)
 	if err != nil {
 		return err
@@ -924,8 +1090,9 @@ func (e *syncEngine) downloadFile(rel string, node storageNode) error {
 		LocalSize:  int64(len(data)),
 		SyncedAt:   time.Now(),
 	}
-	e.downloaded++
+	e.downloaded.Add(1)
 	log.Printf("↓ downloaded %s", rel)
+	e.publishActivity("download", rel)
 	return nil
 }
 
@@ -936,8 +1103,9 @@ func (e *syncEngine) deleteRemoteFile(rel, nodeID string) error {
 		return err
 	}
 	delete(e.state.Entries, rel)
-	e.deleted++
+	e.deleted.Add(1)
 	log.Printf("🗑  trashed %s (deleted locally)", rel)
+	e.publishActivity("trash", rel)
 	return nil
 }
 
@@ -967,6 +1135,9 @@ func (e *syncEngine) ensureRemoteFolder(rel string, remoteFolders map[string]sto
 }
 
 func (e *syncEngine) uploadNewFile(rel string, remoteFolders map[string]storageNode, folderID map[string]string) error {
+	e.setInFlight(rel, "upload")
+	defer e.clearInFlight()
+
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	data, err := os.ReadFile(abs)
 	if err != nil {
@@ -982,10 +1153,14 @@ func (e *syncEngine) uploadNewFile(rel string, remoteFolders map[string]storageN
 	}
 	e.recordUpload(rel, node, data)
 	log.Printf("↑ uploaded %s", rel)
+	e.publishActivity("upload", rel)
 	return nil
 }
 
 func (e *syncEngine) replaceFile(rel, nodeID string) error {
+	e.setInFlight(rel, "upload")
+	defer e.clearInFlight()
+
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	data, err := os.ReadFile(abs)
 	if err != nil {
@@ -997,6 +1172,7 @@ func (e *syncEngine) replaceFile(rel, nodeID string) error {
 	}
 	e.recordUpload(rel, node, data)
 	log.Printf("↑ uploaded %s (updated)", rel)
+	e.publishActivity("update", rel)
 	return nil
 }
 
@@ -1009,7 +1185,7 @@ func (e *syncEngine) recordUpload(rel string, node *storageNode, data []byte) {
 		LocalSize:  int64(len(data)),
 		SyncedAt:   time.Now(),
 	}
-	e.uploaded++
+	e.uploaded.Add(1)
 }
 
 func (e *syncEngine) saveState() {
@@ -1044,9 +1220,9 @@ func (e *syncEngine) addWatchesRecursive(w *fsnotify.Watcher) {
 
 func (e *syncEngine) printSummary() {
 	fmt.Printf("\n--- Sync summary ---\n")
-	fmt.Printf("Downloaded: %d\n", e.downloaded)
-	fmt.Printf("Uploaded:   %d\n", e.uploaded)
-	fmt.Printf("Removed:    %d\n", e.deleted)
+	fmt.Printf("Downloaded: %d\n", e.downloaded.Load())
+	fmt.Printf("Uploaded:   %d\n", e.uploaded.Load())
+	fmt.Printf("Removed:    %d\n", e.deleted.Load())
 }
 
 // runStorageSync performs an initial full sync of storageSyncFolder with the
@@ -1054,7 +1230,26 @@ func (e *syncEngine) printSummary() {
 // interrupted. Creates, updates and deletes all push from whichever side made
 // the change to the other; simultaneous edits of the same file are the one
 // case where the API's copy wins.
-func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
+func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool) error {
+	// Only one sync engine may run per user at a time — a second reconcileAll
+	// loop against the same folder would race the first. Acquired before
+	// anything else so a second invocation (e.g. a tray app trying to launch
+	// brick when it's already running) fails fast instead of corrupting
+	// state. Released automatically by the OS if this process dies, so a
+	// crash never leaves a stale lock behind.
+	lockPath, err := instanceLockPath()
+	if err != nil {
+		return err
+	}
+	lock, err := acquireInstanceLock(lockPath)
+	if err != nil {
+		if errors.Is(err, errInstanceLocked) {
+			return errors.New("brick is already running for this user")
+		}
+		return err
+	}
+	defer lock.Release()
+
 	cfg, err := ensureAuthenticated(apiURL)
 	if err != nil {
 		return err
@@ -1092,6 +1287,7 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		state:           loadSyncState(folder),
 		recentlyWritten: map[string]time.Time{},
 	}
+	eng.setState("starting")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1152,6 +1348,18 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		}
 	}
 
+	// Local status/control API: lets a local client (e.g. a tray app) read
+	// live sync status and issue pause/resume/quit without touching the
+	// terminal this process is attached to. Loopback-only (unix domain
+	// socket), token-gated; see controlapi.go for the full protocol.
+	if !noControlAPI {
+		if cs, csErr := startControlServer(eng, cancel, notify); csErr != nil {
+			log.Printf("could not start control API: %v", csErr)
+		} else {
+			defer cs.Close()
+		}
+	}
+
 	// Debounced reconcile worker.
 	go func() {
 		var timer *time.Timer
@@ -1169,6 +1377,12 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 				}
 			case <-timerC:
 				timer, timerC = nil, nil
+				if eng.paused.Load() {
+					// Gate only the reconcile call itself (not the watcher or
+					// ticker) so resuming is instant: notify() below already
+					// woke this worker, so resume just needs to flip the flag.
+					continue
+				}
 				if err := eng.reconcileAll(); err != nil {
 					if errors.Is(err, errSessionExpired) {
 						log.Printf("session expired — run 'brick --login' to re-authenticate")

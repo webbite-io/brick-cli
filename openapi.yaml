@@ -1,0 +1,308 @@
+openapi: 3.1.0
+info:
+  title: brick local control API
+  version: "1"
+  description: |
+    A loopback-only control API served by a running `brick` process over a
+    Unix domain socket (see `startControlServer` in `cmd/brick/controlapi.go`).
+    It exists so a local client on the same machine — e.g. a system-tray
+    companion app — can read live sync status and issue commands without
+    attaching to `brick`'s terminal.
+
+    This API is never reachable over a network interface. A client discovers
+    the socket path and auth token from a per-user JSON file written on
+    startup (see the README's "Local Status/Control API" section for the
+    exact path per OS); every request in this document is made against that
+    Unix socket, so the `servers` entry below is illustrative only — there is
+    no real host or port.
+  license:
+    name: Proprietary
+servers:
+  - url: http://unix
+    description: >-
+      Placeholder base URL. Requests are actually sent over the Unix domain
+      socket named in the discovery file's "address" field, not over TCP.
+security:
+  - controlSecret: []
+paths:
+  /v1/health:
+    get:
+      operationId: getHealth
+      summary: Liveness check
+      description: >-
+        The only endpoint that does not require the control secret header —
+        reachability of the socket itself (0600, in a 0700 directory) is
+        the only thing it attests to.
+      security: []
+      responses:
+        "200":
+          description: The process is alive and serving.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /v1/status:
+    get:
+      operationId: getStatus
+      summary: Current sync status
+      description: >-
+        A live snapshot of sync state: coarse state, per-run counters, the
+        file transfer in progress (if any), and the last error (if any).
+        Safe to poll frequently — it never blocks on an in-progress
+        reconcile pass.
+      responses:
+        "200":
+          description: Current status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/activity:
+    get:
+      operationId: getActivity
+      summary: Recent sync activity
+      description: >-
+        A bounded, in-memory, newest-first feed of completed sync actions
+        (uploads, downloads, deletes, conflict resolutions). Capped at 200
+        entries; the oldest are dropped once that cap is reached.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of events to return.
+          schema:
+            type: integer
+            minimum: 1
+            default: 50
+      responses:
+        "200":
+          description: Recent activity, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ActivityEvent"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/account:
+    get:
+      operationId: getAccount
+      summary: Logged-in account
+      description: >-
+        Returns the account and client identifiers already cached in
+        `~/.config/brick/config.yaml`; does not make a network call, so it
+        reflects whatever account was active when `brick` last started.
+      responses:
+        "200":
+          description: Account identifiers for the current session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/pause:
+    post:
+      operationId: pauseSync
+      summary: Pause syncing
+      description: >-
+        Stops the debounced reconcile worker from running until
+        `/v1/resume` is called. The filesystem watcher and the periodic
+        remote poll keep running underneath — only the reconcile pass
+        itself is gated — so resuming is instant rather than requiring a
+        full rescan.
+      responses:
+        "200":
+          description: Paused. Returns the resulting status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /v1/resume:
+    post:
+      operationId: resumeSync
+      summary: Resume syncing
+      description: >-
+        Clears the pause flag and immediately wakes the reconcile worker
+        (rather than waiting for the next filesystem event or poll tick).
+      responses:
+        "200":
+          description: Resumed. Returns the resulting status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /v1/quit:
+    post:
+      operationId: quit
+      summary: Gracefully shut down brick
+      description: >-
+        Triggers the same graceful-shutdown path as sending SIGINT (Ctrl+C)
+        to the process: the response is written before shutdown begins, so
+        a 200 confirms the request was received, not that shutdown has
+        finished.
+      responses:
+        "200":
+          description: Shutdown has been triggered.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                required: [ok]
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+components:
+  securitySchemes:
+    controlSecret:
+      type: apiKey
+      in: header
+      name: X-Brick-Control-Secret
+      description: >-
+        The `token` field from the discovery file, regenerated every time
+        brick starts. Compared with a constant-time comparison.
+
+  responses:
+    Forbidden:
+      description: Missing or incorrect X-Brick-Control-Secret header.
+      content:
+        text/plain:
+          schema:
+            type: string
+            example: forbidden
+    MethodNotAllowed:
+      description: Wrong HTTP method for this endpoint.
+      content:
+        text/plain:
+          schema:
+            type: string
+            example: method not allowed
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        protocolVersion:
+          type: integer
+          description: >-
+            Echoed on every response so a client can detect a too-old/too-new
+            brick binary. Bumped whenever a change to these schemas isn't
+            purely additive.
+      required: [ok, protocolVersion]
+
+    SyncState:
+      type: string
+      description: >-
+        Coarse sync state. "paused" overlays whatever state the last
+        reconcile pass recorded, for as long as a pause is in effect.
+      enum:
+        - starting
+        - syncing
+        - idle
+        - paused
+        - error
+
+    InFlight:
+      type: object
+      description: The single file transfer currently in progress, if any.
+      properties:
+        relPath:
+          type: string
+          description: Path relative to the sync folder.
+        direction:
+          type: string
+          enum: [upload, download]
+      required: [relPath, direction]
+
+    Counters:
+      type: object
+      description: Cumulative counts for this process's lifetime.
+      properties:
+        uploaded:
+          type: integer
+          format: int64
+        downloaded:
+          type: integer
+          format: int64
+        deleted:
+          type: integer
+          format: int64
+      required: [uploaded, downloaded, deleted]
+
+    StatusResponse:
+      type: object
+      properties:
+        state:
+          $ref: "#/components/schemas/SyncState"
+        folder:
+          type: string
+          description: Absolute path of the configured sync folder.
+        lastError:
+          type: string
+          description: Message from the most recent failed reconcile pass, if any.
+        lastSyncCompletedAt:
+          type: string
+          format: date-time
+          description: Timestamp of the most recent successful reconcile pass.
+        counters:
+          $ref: "#/components/schemas/Counters"
+        inFlight:
+          oneOf:
+            - $ref: "#/components/schemas/InFlight"
+            - type: "null"
+      required: [state, folder, counters, inFlight]
+
+    ActivityEvent:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+            - upload
+            - update
+            - download
+            - trash
+            - trash-folder
+            - remove
+            - remove-folder
+            - keep-both
+        relPath:
+          type: string
+          description: Path relative to the sync folder.
+        at:
+          type: string
+          format: date-time
+      required: [kind, relPath, at]
+
+    AccountResponse:
+      type: object
+      properties:
+        accountId:
+          type: string
+        clientId:
+          type: string
+      required: [accountId, clientId]

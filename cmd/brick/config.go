@@ -159,6 +159,7 @@ func printHelp() {
 	fmt.Printf("      --agent-root PATH       Additional directory to expose to remote clients when remote control is enabled (repeatable)\n")
 	fmt.Println("\nOther\n=====")
 	fmt.Printf("      --no-upgrade-check      Disable automatic upgrade check\n")
+	fmt.Printf("      --no-control-api        Disable the local status/control API (used by tray apps)\n")
 	fmt.Printf("      --uninstall             Uninstall brick\n")
 	fmt.Printf("  -h, --help                  Show help information\n")
 	fmt.Printf("  -v, --version               Show version information\n")

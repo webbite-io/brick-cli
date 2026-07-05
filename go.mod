@@ -9,6 +9,7 @@ require (
 	github.com/gorilla/websocket v1.5.2
 	github.com/hashicorp/yamux v0.1.2
 	github.com/joho/godotenv v1.5.1
+	golang.org/x/sys v0.33.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -38,6 +39,5 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/net v0.23.0 // indirect
 	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
 )

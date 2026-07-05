@@ -35,6 +35,7 @@ func main() {
 		switchAccounts bool
 		whoami         bool
 		remoteControl  bool
+		noControlAPI   bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "")
@@ -48,6 +49,7 @@ func main() {
 	flag.BoolVar(&whoami, "whoami", false, "")
 	flag.BoolVar(&remoteControl, "r", false, "")
 	flag.BoolVar(&remoteControl, "remote-control", false, "")
+	flag.BoolVar(&noControlAPI, "no-control-api", false, "")
 	flag.Var(&agentRootsFlag, "agent-root", "")
 	flag.Usage = printHelp
 	flag.Parse()
@@ -109,7 +111,7 @@ func main() {
 	}
 	apiURL := resolveAPIURL()
 	storageURL := resolveStorageAPIURL()
-	if err := runStorageSync(apiURL, storageURL, remoteControl); err != nil {
+	if err := runStorageSync(apiURL, storageURL, remoteControl, noControlAPI); err != nil {
 		log.Fatalf("Storage sync failed: %v", err)
 	}
 }
