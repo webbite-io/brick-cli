@@ -872,7 +872,7 @@ func (e *syncEngine) applyFirstSyncConflict(rel string, remoteNode storageNode, 
 // copy is downloaded to the original path.
 func (e *syncEngine) keepBothFile(rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
-	copyRel := deviceCopyPath(rel)
+	copyRel := dupPath(rel)
 	copyAbs := filepath.Join(e.folder, filepath.FromSlash(copyRel))
 	if err := os.Rename(abs, copyAbs); err != nil {
 		return err
@@ -887,13 +887,13 @@ func (e *syncEngine) keepBothFile(rel string, remoteNode storageNode, remoteFold
 	return nil
 }
 
-// deviceCopyPath returns rel with " (device copy)" inserted before the file
-// extension, used to keep a local file's pre-sync content under a new name.
-func deviceCopyPath(rel string) string {
+// dupPath returns rel with " (copy)" inserted before the file extension,
+// used to keep a local file's pre-sync content under a new name.
+func dupPath(rel string) string {
 	dir := parentOf(rel)
 	base := baseName(rel)
 	ext := filepath.Ext(base)
-	newBase := strings.TrimSuffix(base, ext) + " (device copy)" + ext
+	newBase := strings.TrimSuffix(base, ext) + " (copy)" + ext
 	if dir == "" {
 		return newBase
 	}
