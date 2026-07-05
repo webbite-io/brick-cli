@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -21,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/huh"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -219,6 +219,36 @@ func (sc *storageClient) createFolder(parentID, name string) (*storageNode, erro
 	return &node, nil
 }
 
+// folderSummary walks the entire remote tree under rootID and returns its
+// direct folder children (for the onboarding "pick which folders to sync"
+// prompt) along with the total size in bytes of every file in the tree.
+func (sc *storageClient) folderSummary(rootID string) (topFolders []storageNode, totalSize int64, err error) {
+	queue := []string{rootID}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		children, err := sc.listChildren(id)
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, ch := range children {
+			if ch.IsDeleted {
+				continue
+			}
+			switch ch.NodeType {
+			case "folder":
+				if id == rootID {
+					topFolders = append(topFolders, ch)
+				}
+				queue = append(queue, ch.ID)
+			case "file":
+				totalSize += ch.SizeBytes
+			}
+		}
+	}
+	return topFolders, totalSize, nil
+}
+
 // tokenMu serializes token refreshes across the goroutines that share a single
 // *Config. The sync engine's HTTP requests all refresh reactively on a
 // 401/403. The auth server issues single-use refresh tokens with no grace
@@ -393,6 +423,16 @@ type syncEngine struct {
 	// excludeDirs are the configured excludeDirs entries (slash-separated,
 	// relative to folder); files under them are never uploaded or downloaded.
 	excludeDirs []string
+
+	// firstSync is true only for the very first reconcileAll call of this
+	// process. conflictMode ("device", "brick" or "copy") says how to resolve a
+	// file that already exists on both sides with no prior sync history —
+	// which can only happen during that first pass, when the sync folder was
+	// pre-populated before ever being synced. Once firstSync is cleared, the
+	// ordinary last-writer-wins-on-remote logic in reconcileFile applies to any
+	// future coincidental double-create.
+	firstSync    bool
+	conflictMode string
 
 	mu    sync.Mutex // serializes reconcile + state access
 	state *SyncState
@@ -742,6 +782,10 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 		switch {
 		case !remoteChanged && !localChanged:
 			return nil // in sync
+		case e.firstSync && !hasEntry:
+			// Present on both sides with no prior sync history: this is the
+			// pre-existing-folder conflict the onboarding wizard asked about.
+			return e.applyFirstSyncConflict(rel, remoteNode, remoteFolders, folderID)
 		case localChanged && !remoteChanged:
 			return e.replaceFile(rel, remoteNode.ID)
 		default:
@@ -805,6 +849,55 @@ func (e *syncEngine) reconcileExcludedFile(rel string, remoteFiles map[string]st
 		SyncedAt:   time.Now(),
 	}
 	return nil
+}
+
+// applyFirstSyncConflict resolves a file present on both sides with no sync
+// history, per the mode chosen in the onboarding wizard (e.conflictMode):
+// "device" downloads the remote copy over the local one, "brick" uploads the
+// local copy over the remote one, and "copy" keeps both by renaming the local
+// file aside before downloading the remote one to the original path.
+func (e *syncEngine) applyFirstSyncConflict(rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
+	switch e.conflictMode {
+	case "brick":
+		return e.replaceFile(rel, remoteNode.ID)
+	case "copy":
+		return e.keepBothFile(rel, remoteNode, remoteFolders, folderID)
+	default: // "device", or unset (folder was empty, so this case is unreachable in practice)
+		return e.downloadFile(rel, remoteNode)
+	}
+}
+
+// keepBothFile resolves a first-sync conflict by keeping both copies: the
+// local file is renamed aside and re-uploaded as a new file, and the remote
+// copy is downloaded to the original path.
+func (e *syncEngine) keepBothFile(rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
+	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
+	copyRel := deviceCopyPath(rel)
+	copyAbs := filepath.Join(e.folder, filepath.FromSlash(copyRel))
+	if err := os.Rename(abs, copyAbs); err != nil {
+		return err
+	}
+	if err := e.downloadFile(rel, remoteNode); err != nil {
+		return err
+	}
+	if err := e.uploadNewFile(copyRel, remoteFolders, folderID); err != nil {
+		return err
+	}
+	log.Printf("⧉ kept both copies of %s (as %s)", rel, copyRel)
+	return nil
+}
+
+// deviceCopyPath returns rel with " (device copy)" inserted before the file
+// extension, used to keep a local file's pre-sync content under a new name.
+func deviceCopyPath(rel string) string {
+	dir := parentOf(rel)
+	base := baseName(rel)
+	ext := filepath.Ext(base)
+	newBase := strings.TrimSuffix(base, ext) + " (device copy)" + ext
+	if dir == "" {
+		return newBase
+	}
+	return dir + "/" + newBase
 }
 
 func (e *syncEngine) downloadFile(rel string, node storageNode) error {
@@ -970,7 +1063,8 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		return errors.New("no active account selected; run 'brick --switch-accounts' first")
 	}
 
-	folder, err := ensureStorageSyncFolder(cfg)
+	isFirstSetup := strings.TrimSpace(cfg.StorageSyncFolder) == ""
+	folder, conflictMode, err := ensureStorageSyncFolder(cfg)
 	if err != nil {
 		return err
 	}
@@ -981,11 +1075,20 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
 	}
 
+	if isFirstSetup {
+		if err := runSyncScopeOnboarding(sc, root.ID, cfg); err != nil {
+			return err
+		}
+		fmt.Println("Now, we're ready. Brick will now sync your files...\n")
+	}
+
 	eng := &syncEngine{
 		sc:              sc,
 		folder:          folder,
 		rootID:          root.ID,
 		excludeDirs:     cfg.ExcludeDirs,
+		firstSync:       isFirstSetup,
+		conflictMode:    conflictMode,
 		state:           loadSyncState(folder),
 		recentlyWritten: map[string]time.Time{},
 	}
@@ -1028,6 +1131,7 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		}
 		log.Printf("initial sync error: %v", err)
 	}
+	eng.firstSync = false
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -1126,42 +1230,204 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 
 // ensureStorageSyncFolder returns the configured sync folder, prompting the user
 // to set it if unset, expanding ~, creating it on disk, and persisting it.
-func ensureStorageSyncFolder(cfg *Config) (string, error) {
-	folder := strings.TrimSpace(cfg.StorageSyncFolder)
+// conflictMode is only meaningful the first time a folder is configured, and is
+// empty otherwise; it reports how pre-existing local files that already have a
+// remote counterpart should be reconciled during the very first sync.
+func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, err error) {
+	folder = strings.TrimSpace(cfg.StorageSyncFolder)
 	if folder == "" {
-		fmt.Println("No storage sync folder is configured (storageSyncFolder).")
-		fmt.Print("Enter the local folder to sync with the Storage API: ")
-		reader := bufio.NewReader(os.Stdin)
-		line, err := reader.ReadString('\n')
+		folder, conflictMode, err = promptForSyncFolder()
 		if err != nil {
-			return "", fmt.Errorf("could not read input: %w", err)
-		}
-		folder = strings.TrimSpace(line)
-		if folder == "" {
-			return "", errors.New("no folder provided")
+			return "", "", err
 		}
 	}
 
 	if strings.HasPrefix(folder, "~") {
-		if home, err := os.UserHomeDir(); err == nil {
+		if home, herr := os.UserHomeDir(); herr == nil {
 			folder = filepath.Join(home, strings.TrimPrefix(folder, "~"))
 		}
 	}
 	abs, err := filepath.Abs(folder)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return "", fmt.Errorf("could not create sync folder: %w", err)
+		return "", "", fmt.Errorf("could not create sync folder: %w", err)
 	}
 	if cfg.StorageSyncFolder != abs {
 		cfg.StorageSyncFolder = abs
 		if err := saveConfig(cfg); err != nil {
-			return "", err
+			return "", "", err
 		}
 		fmt.Printf("Saved storageSyncFolder = %s\n", abs)
 	}
-	return abs, nil
+	return abs, conflictMode, nil
+}
+
+// runSyncScopeOnboarding runs the final onboarding step: if the Brick account
+// has any top-level folders, it asks whether to sync everything or only a
+// subset, writing the folders the user picks to exclude into cfg.ExcludeDirs.
+// A no-op if the account has no folders yet.
+func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error {
+	topFolders, totalSize, err := sc.folderSummary(rootID)
+	if err != nil {
+		return err
+	}
+	if len(topFolders) == 0 {
+		return nil
+	}
+
+	fmt.Println("\nOne last decision to make:")
+	fmt.Println()
+
+	const (
+		optAll  = "all"
+		optPick = "pick"
+	)
+	var choice string
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Sync scope").
+			Options(
+				huh.NewOption(fmt.Sprintf("Sync all folders from Brick (%s)", humanSize(totalSize)), optAll),
+				huh.NewOption("Pick which folders to sync", optPick),
+			).
+			Value(&choice),
+	)).Run(); err != nil {
+		return err
+	}
+	if choice == optAll {
+		return nil
+	}
+
+	options := make([]huh.Option[string], len(topFolders))
+	for i, f := range topFolders {
+		options[i] = huh.NewOption(f.Name, f.Name)
+	}
+	var excludeDirs []string
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewMultiSelect[string]().
+			Title("Select the folders to exclude from sync").
+			Options(options...).
+			Value(&excludeDirs),
+	)).Run(); err != nil {
+		return err
+	}
+
+	cfg.ExcludeDirs = excludeDirs
+	return saveConfig(cfg)
+}
+
+// promptForSyncFolder interactively asks the user to pick a sync folder — the
+// default ~/Brick or a custom folder browsed via a huh file picker — and, if
+// that folder already contains files, how to resolve conflicts with the
+// remote copy during the first sync.
+func promptForSyncFolder() (folder string, conflictMode string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("could not determine home directory: %w", err)
+	}
+	defaultFolder := filepath.Join(home, "Brick")
+
+	fmt.Println("You have no sync folder configured (storageSyncFolder).")
+	fmt.Println()
+
+	const (
+		optDefault = "default"
+		optCustom  = "custom"
+	)
+	var choice string
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Choose a sync folder").
+			Options(
+				huh.NewOption(fmt.Sprintf("Use %s", defaultFolder), optDefault),
+				huh.NewOption("Custom folder", optCustom),
+			).
+			Value(&choice),
+	)).Run(); err != nil {
+		return "", "", err
+	}
+
+	if choice == optDefault {
+		folder = defaultFolder
+	} else {
+		var picked string
+		if err := huh.NewForm(huh.NewGroup(
+			huh.NewFilePicker().
+				Title("Pick a folder to sync").
+				CurrentDirectory(home).
+				DirAllowed(true).
+				FileAllowed(false).
+				Picking(true).
+				Value(&picked),
+		)).Run(); err != nil {
+			return "", "", err
+		}
+		folder = picked
+	}
+
+	abs, err := filepath.Abs(folder)
+	if err != nil {
+		return "", "", err
+	}
+	hasFiles, err := dirHasEntries(abs)
+	if err != nil {
+		return "", "", err
+	}
+	if hasFiles {
+		conflictMode, err = promptConflictMode()
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return abs, conflictMode, nil
+}
+
+// promptConflictMode asks how to resolve files that already exist both
+// locally (in a pre-existing, non-empty sync folder) and remotely, before any
+// sync history exists for them.
+func promptConflictMode() (string, error) {
+	fmt.Println("Your sync folder already contains files, how should we handle possible conflicts?")
+	fmt.Println()
+	var mode string
+	err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Conflict resolution").
+			Options(
+				huh.NewOption("Overwrite the file on this device.", "device"),
+				huh.NewOption("Overwrite the file on Brick.", "brick"),
+				huh.NewOption("Make a copy (so nothing is lost).", "copy"),
+			).
+			Value(&mode),
+	)).Run()
+	return mode, err
+}
+
+// dirHasEntries reports whether path exists and contains at least one entry.
+func dirHasEntries(path string) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return len(entries) > 0, nil
+}
+
+// humanSize renders bytes as a human-readable size (e.g. "12.3 GB").
+func humanSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 // --- small helpers ---
