@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/huh"
 	"github.com/google/uuid"
 )
 
@@ -273,8 +274,18 @@ func runLogin(apiURL string) error {
 		return err
 	}
 
-	// Fetch accounts and pick the first one.
-	accountID, accountName, err := fetchFirstAccount(apiURL, accessToken)
+	if userInfo.GivenName != "" && userInfo.FamilyName != "" {
+		fmt.Printf("\nHello %s %s 👋\n", userInfo.GivenName, userInfo.FamilyName)
+	} else {
+		fmt.Println("\nLogin successful 🎉.\n")
+	}
+
+	// Fetch accounts and pick one (prompting if there's more than one).
+	accounts, err := fetchAccounts(apiURL, accessToken)
+	if err != nil {
+		return err
+	}
+	accountID, accountName, err := selectAccount(accounts)
 	if err != nil {
 		return err
 	}
@@ -284,11 +295,7 @@ func runLogin(apiURL string) error {
 		return err
 	}
 
-	fmt.Println("Login successful.")
-	if userInfo.GivenName != "" && userInfo.FamilyName != "" {
-		fmt.Printf("Hello %s %s!\n", userInfo.GivenName, userInfo.FamilyName)
-	}
-	fmt.Printf("Brick now has access to your account: %s.\n  To switch account, use the --switch-accounts parameter.\n", accountName)
+	fmt.Printf("Brick now has access to your account: %s.\n  To switch account, use the --switch-accounts parameter.\n\n", accountName)
 	return nil
 }
 
@@ -324,39 +331,76 @@ func fetchUserInfo(apiURL, accessToken string) (*userInfoResponse, error) {
 	return &info, nil
 }
 
-func fetchFirstAccount(apiURL, accessToken string) (id, name string, err error) {
+type accountInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// fetchAccounts returns every account the authenticated user has access to.
+func fetchAccounts(apiURL, accessToken string) ([]accountInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(apiURL, "/")+"/v1/accounts", nil)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("accounts request failed: %w", err)
+		return nil, fmt.Errorf("accounts request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("accounts endpoint returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("accounts endpoint returned status %d", resp.StatusCode)
 	}
 
 	var body struct {
-		Accounts []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"accounts"`
+		Accounts []accountInfo `json:"accounts"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", "", fmt.Errorf("could not parse accounts response: %w", err)
+		return nil, fmt.Errorf("could not parse accounts response: %w", err)
 	}
 	if len(body.Accounts) == 0 {
-		return "", "", errors.New("no accounts found for this user")
+		return nil, errors.New("no accounts found for this user")
 	}
-	return body.Accounts[0].ID, body.Accounts[0].Name, nil
+	return body.Accounts, nil
+}
+
+// selectAccount returns the account to use: the only one if there's just one,
+// otherwise an interactive prompt to pick from the list.
+func selectAccount(accounts []accountInfo) (id, name string, err error) {
+	if len(accounts) == 1 {
+		return accounts[0].ID, accounts[0].Name, nil
+	}
+
+	fmt.Println("You have access to more than one account, which one do you want to use?")
+	fmt.Println()
+
+	options := make([]huh.Option[string], len(accounts))
+	for i, a := range accounts {
+		options[i] = huh.NewOption(a.Name, a.ID)
+	}
+	var selected string
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Select an account").
+				Options(options...).
+				Value(&selected),
+		),
+	)
+	if err := form.Run(); err != nil {
+		return "", "", err
+	}
+	for _, a := range accounts {
+		if a.ID == selected {
+			return a.ID, a.Name, nil
+		}
+	}
+	return "", "", errors.New("no account selected")
 }
 
 // refreshAccessToken uses a refresh token to obtain a new access token (and

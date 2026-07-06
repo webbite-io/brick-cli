@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -19,8 +18,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/charmbracelet/huh"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -219,6 +220,36 @@ func (sc *storageClient) createFolder(parentID, name string) (*storageNode, erro
 	return &node, nil
 }
 
+// folderSummary walks the entire remote tree under rootID and returns its
+// direct folder children (for the onboarding "pick which folders to sync"
+// prompt) along with the total size in bytes of every file in the tree.
+func (sc *storageClient) folderSummary(rootID string) (topFolders []storageNode, totalSize int64, err error) {
+	queue := []string{rootID}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		children, err := sc.listChildren(id)
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, ch := range children {
+			if ch.IsDeleted {
+				continue
+			}
+			switch ch.NodeType {
+			case "folder":
+				if id == rootID {
+					topFolders = append(topFolders, ch)
+				}
+				queue = append(queue, ch.ID)
+			case "file":
+				totalSize += ch.SizeBytes
+			}
+		}
+	}
+	return topFolders, totalSize, nil
+}
+
 // tokenMu serializes token refreshes across the goroutines that share a single
 // *Config. The sync engine's HTTP requests all refresh reactively on a
 // 401/403. The auth server issues single-use refresh tokens with no grace
@@ -390,15 +421,175 @@ type syncEngine struct {
 	folder string
 	rootID string
 
+	// excludeDirs are the configured excludeDirs entries (slash-separated,
+	// relative to folder); files under them are never uploaded or downloaded.
+	excludeDirs []string
+
+	// firstSync is true only for the very first reconcileAll call of this
+	// process. conflictMode ("device", "brick" or "copy") says how to resolve a
+	// file that already exists on both sides with no prior sync history —
+	// which can only happen during that first pass, when the sync folder was
+	// pre-populated before ever being synced. Once firstSync is cleared, the
+	// ordinary last-writer-wins-on-remote logic in reconcileFile applies to any
+	// future coincidental double-create.
+	firstSync    bool
+	conflictMode string
+
 	mu    sync.Mutex // serializes reconcile + state access
 	state *SyncState
 
-	downloaded int
-	uploaded   int
-	deleted    int
+	downloaded atomic.Int64
+	uploaded   atomic.Int64
+	deleted    atomic.Int64
 
 	recentMu        sync.Mutex
 	recentlyWritten map[string]time.Time
+
+	// paused gates reconcileAll calls from the debounce worker and poll
+	// ticker (sync.go's runStorageSync goroutines) without tearing down the
+	// fsnotify watcher, so resuming is instant rather than needing a full
+	// rescan. Controlled via the local control API's /v1/pause and /v1/resume.
+	paused atomic.Bool
+
+	// ctrlMu guards the live-status fields below, which are read by the
+	// control API's /v1/status handler from a separate goroutine. It is
+	// deliberately distinct from mu (which serializes reconcile passes) so a
+	// status read never blocks on an in-progress reconcile.
+	ctrlMu        sync.RWMutex
+	ctrlState     string // "starting" | "syncing" | "idle" | "error"
+	ctrlLastError string
+	ctrlLastSync  time.Time
+	ctrlInFlight  *controlInFlight
+	ctrlActivity  []controlActivityEvent
+}
+
+// controlInFlight describes the single file transfer in progress, if any.
+type controlInFlight struct {
+	RelPath   string `json:"relPath"`
+	Direction string `json:"direction"` // "upload" | "download"
+}
+
+// controlActivityEvent is one entry in the bounded recent-activity feed the
+// control API serves at /v1/activity.
+type controlActivityEvent struct {
+	Kind    string    `json:"kind"` // "upload" | "download" | "update" | "trash" | "remove" | "keep-both"
+	RelPath string    `json:"relPath"`
+	At      time.Time `json:"at"`
+}
+
+// controlActivityCap bounds the in-memory activity ring buffer.
+const controlActivityCap = 200
+
+// setState updates the coarse sync state reported by /v1/status. It does not
+// touch paused: the control API overlays "paused" on top of whatever state
+// is recorded here for as long as e.paused is set.
+func (e *syncEngine) setState(s string) {
+	e.ctrlMu.Lock()
+	e.ctrlState = s
+	e.ctrlMu.Unlock()
+}
+
+// setSynced records a successful reconcile pass.
+func (e *syncEngine) setSynced() {
+	e.ctrlMu.Lock()
+	e.ctrlState = "idle"
+	e.ctrlLastError = ""
+	e.ctrlLastSync = time.Now()
+	e.ctrlMu.Unlock()
+}
+
+// setSyncError records a failed reconcile pass.
+func (e *syncEngine) setSyncError(err error) {
+	e.ctrlMu.Lock()
+	e.ctrlState = "error"
+	e.ctrlLastError = err.Error()
+	e.ctrlMu.Unlock()
+}
+
+// setInFlight/clearInFlight track the single file transfer in progress, if
+// any, for /v1/status's inFlight field.
+func (e *syncEngine) setInFlight(relPath, direction string) {
+	e.ctrlMu.Lock()
+	e.ctrlInFlight = &controlInFlight{RelPath: relPath, Direction: direction}
+	e.ctrlMu.Unlock()
+}
+
+func (e *syncEngine) clearInFlight() {
+	e.ctrlMu.Lock()
+	e.ctrlInFlight = nil
+	e.ctrlMu.Unlock()
+}
+
+// publishActivity appends to the bounded recent-activity feed, dropping the
+// oldest entry once controlActivityCap is reached.
+func (e *syncEngine) publishActivity(kind, relPath string) {
+	e.ctrlMu.Lock()
+	defer e.ctrlMu.Unlock()
+	e.ctrlActivity = append(e.ctrlActivity, controlActivityEvent{Kind: kind, RelPath: relPath, At: time.Now()})
+	if len(e.ctrlActivity) > controlActivityCap {
+		e.ctrlActivity = e.ctrlActivity[len(e.ctrlActivity)-controlActivityCap:]
+	}
+}
+
+// recentActivity returns up to limit of the most recent activity events,
+// newest first.
+func (e *syncEngine) recentActivity(limit int) []controlActivityEvent {
+	e.ctrlMu.RLock()
+	defer e.ctrlMu.RUnlock()
+	n := len(e.ctrlActivity)
+	if limit > n {
+		limit = n
+	}
+	out := make([]controlActivityEvent, limit)
+	for i := 0; i < limit; i++ {
+		out[i] = e.ctrlActivity[n-1-i]
+	}
+	return out
+}
+
+// setPaused toggles whether the debounce worker in runStorageSync is allowed
+// to call reconcileAll.
+func (e *syncEngine) setPaused(p bool) {
+	e.paused.Store(p)
+}
+
+// controlStatus is the JSON shape served at /v1/status.
+type controlStatus struct {
+	State               string           `json:"state"`
+	Folder              string           `json:"folder"`
+	LastError           string           `json:"lastError,omitempty"`
+	LastSyncCompletedAt time.Time        `json:"lastSyncCompletedAt,omitempty"`
+	Counters            controlCounters  `json:"counters"`
+	InFlight            *controlInFlight `json:"inFlight"`
+}
+
+type controlCounters struct {
+	Uploaded   int64 `json:"uploaded"`
+	Downloaded int64 `json:"downloaded"`
+	Deleted    int64 `json:"deleted"`
+}
+
+// statusSnapshot builds the current /v1/status payload. paused overlays the
+// underlying reconcile-derived state, matching setState's contract above.
+func (e *syncEngine) statusSnapshot() controlStatus {
+	e.ctrlMu.RLock()
+	defer e.ctrlMu.RUnlock()
+	state := e.ctrlState
+	if e.paused.Load() {
+		state = "paused"
+	}
+	return controlStatus{
+		State:               state,
+		Folder:              e.folder,
+		LastError:           e.ctrlLastError,
+		LastSyncCompletedAt: e.ctrlLastSync,
+		Counters: controlCounters{
+			Uploaded:   e.uploaded.Load(),
+			Downloaded: e.downloaded.Load(),
+			Deleted:    e.deleted.Load(),
+		},
+		InFlight: e.ctrlInFlight,
+	}
 }
 
 func (e *syncEngine) markRecentlyWritten(abs string) {
@@ -494,9 +685,21 @@ func (e *syncEngine) buildLocalTree() (files map[string]int64, dirs map[string]b
 // removed the file to the other (a local delete trashes the file remotely; a
 // remote delete/trash removes it locally); on content conflicts (both sides
 // changed the same file), remote wins.
-func (e *syncEngine) reconcileAll() error {
+func (e *syncEngine) reconcileAll() (err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	e.setState("syncing")
+	defer func() {
+		// errSessionExpired ends the whole sync loop (see runStorageSync), so
+		// surfacing it as a lingering "error" status would be misleading —
+		// the process is shutting down, not stuck.
+		if err != nil && !errors.Is(err, errSessionExpired) {
+			e.setSyncError(err)
+		} else if err == nil {
+			e.setSynced()
+		}
+	}()
 
 	remoteFiles, remoteFolders, folderID, err := e.buildRemoteTree()
 	if err != nil {
@@ -543,8 +746,9 @@ func (e *syncEngine) reconcileAll() error {
 		}
 		handledDeletes[rel] = true
 		e.pruneRemoteSubtree(rel, remoteFolders, remoteFiles, folderID)
-		e.deleted++
+		e.deleted.Add(1)
 		log.Printf("🗑  trashed folder %s (deleted locally)", rel)
+		e.publishActivity("trash-folder", rel)
 	}
 
 	// 2. Create missing local directories for remote folders, and record every
@@ -629,8 +833,9 @@ func (e *syncEngine) reconcileAll() error {
 			}
 			continue
 		}
-		e.deleted++
+		e.deleted.Add(1)
 		log.Printf("🗑  removed folder %s (deleted on server)", rel)
+		e.publishActivity("remove-folder", rel)
 	}
 
 	e.saveStateLocked()
@@ -672,10 +877,29 @@ func isUnderAny(rel string, handled map[string]bool) bool {
 	return false
 }
 
+// isExcludedPath reports whether rel (a slash-separated path relative to the
+// sync folder) is one of excludeDirs or nested below one of them.
+func isExcludedPath(rel string, excludeDirs []string) bool {
+	for _, dir := range excludeDirs {
+		dir = strings.Trim(filepath.ToSlash(dir), "/")
+		if dir == "" {
+			continue
+		}
+		if rel == dir || strings.HasPrefix(rel, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileFile applies the per-path reconciliation rules: creates, updates and
 // deletes push from whichever side changed to the other; on a genuine content
 // conflict (both sides changed the same file), remote wins.
 func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, remoteFolders map[string]storageNode, folderID map[string]string) error {
+	if isExcludedPath(rel, e.excludeDirs) {
+		return e.reconcileExcludedFile(rel, remoteFiles, localFiles)
+	}
+
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	remoteNode, hasRemote := remoteFiles[rel]
 	_, localExists := localFiles[rel]
@@ -702,8 +926,9 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 				return err
 			}
 			delete(e.state.Entries, rel)
-			e.deleted++
+			e.deleted.Add(1)
 			log.Printf("🗑  removed %s (deleted on server)", rel)
+			e.publishActivity("remove", rel)
 			return nil
 		}
 		// Local-only new file (or locally changed after a server delete) -> upload.
@@ -719,6 +944,10 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 		switch {
 		case !remoteChanged && !localChanged:
 			return nil // in sync
+		case e.firstSync && !hasEntry:
+			// Present on both sides with no prior sync history: this is the
+			// pre-existing-folder conflict the onboarding wizard asked about.
+			return e.applyFirstSyncConflict(rel, remoteNode, remoteFolders, folderID)
 		case localChanged && !remoteChanged:
 			return e.replaceFile(rel, remoteNode.ID)
 		default:
@@ -735,7 +964,109 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 	}
 }
 
+// reconcileExcludedFile handles a path under a configured excludeDirs entry:
+// it is never uploaded or downloaded. The index entry is kept purely to
+// detect when the file changes on either side, so each change is logged once
+// rather than on every reconcile pass.
+func (e *syncEngine) reconcileExcludedFile(rel string, remoteFiles map[string]storageNode, localFiles map[string]int64) error {
+	remoteNode, hasRemote := remoteFiles[rel]
+	_, localExists := localFiles[rel]
+	entry, hasEntry := e.state.Entries[rel]
+
+	if !hasRemote && !localExists {
+		if hasEntry {
+			delete(e.state.Entries, rel)
+		}
+		return nil
+	}
+
+	var localHash string
+	if localExists {
+		abs := filepath.Join(e.folder, filepath.FromSlash(rel))
+		h, err := hashFile(abs)
+		if err != nil {
+			return err
+		}
+		localHash = h
+	}
+
+	if hasEntry && entry.LocalHash == localHash && entry.RemoteEtag == remoteNode.Etag {
+		return nil // already logged, nothing changed since
+	}
+
+	switch {
+	case localExists && !hasRemote:
+		log.Printf("⊘ ignored local change to %s (excluded directory)", rel)
+	case hasRemote && !localExists:
+		log.Printf("⊘ ignored remote change to %s (excluded directory)", rel)
+	default:
+		log.Printf("⊘ ignored change to %s (excluded directory)", rel)
+	}
+
+	e.state.Entries[rel] = SyncEntry{
+		RelPath:    rel,
+		NodeID:     remoteNode.ID,
+		RemoteEtag: remoteNode.Etag,
+		LocalHash:  localHash,
+		SyncedAt:   time.Now(),
+	}
+	return nil
+}
+
+// applyFirstSyncConflict resolves a file present on both sides with no sync
+// history, per the mode chosen in the onboarding wizard (e.conflictMode):
+// "device" downloads the remote copy over the local one, "brick" uploads the
+// local copy over the remote one, and "copy" keeps both by renaming the local
+// file aside before downloading the remote one to the original path.
+func (e *syncEngine) applyFirstSyncConflict(rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
+	switch e.conflictMode {
+	case "brick":
+		return e.replaceFile(rel, remoteNode.ID)
+	case "copy":
+		return e.keepBothFile(rel, remoteNode, remoteFolders, folderID)
+	default: // "device", or unset (folder was empty, so this case is unreachable in practice)
+		return e.downloadFile(rel, remoteNode)
+	}
+}
+
+// keepBothFile resolves a first-sync conflict by keeping both copies: the
+// local file is renamed aside and re-uploaded as a new file, and the remote
+// copy is downloaded to the original path.
+func (e *syncEngine) keepBothFile(rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
+	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
+	copyRel := dupPath(rel)
+	copyAbs := filepath.Join(e.folder, filepath.FromSlash(copyRel))
+	if err := os.Rename(abs, copyAbs); err != nil {
+		return err
+	}
+	if err := e.downloadFile(rel, remoteNode); err != nil {
+		return err
+	}
+	if err := e.uploadNewFile(copyRel, remoteFolders, folderID); err != nil {
+		return err
+	}
+	log.Printf("⧉ kept both copies of %s (as %s)", rel, copyRel)
+	e.publishActivity("keep-both", rel)
+	return nil
+}
+
+// dupPath returns rel with " (copy)" inserted before the file extension,
+// used to keep a local file's pre-sync content under a new name.
+func dupPath(rel string) string {
+	dir := parentOf(rel)
+	base := baseName(rel)
+	ext := filepath.Ext(base)
+	newBase := strings.TrimSuffix(base, ext) + " (copy)" + ext
+	if dir == "" {
+		return newBase
+	}
+	return dir + "/" + newBase
+}
+
 func (e *syncEngine) downloadFile(rel string, node storageNode) error {
+	e.setInFlight(rel, "download")
+	defer e.clearInFlight()
+
 	data, etag, err := e.sc.download(node.ID)
 	if err != nil {
 		return err
@@ -759,8 +1090,9 @@ func (e *syncEngine) downloadFile(rel string, node storageNode) error {
 		LocalSize:  int64(len(data)),
 		SyncedAt:   time.Now(),
 	}
-	e.downloaded++
+	e.downloaded.Add(1)
 	log.Printf("↓ downloaded %s", rel)
+	e.publishActivity("download", rel)
 	return nil
 }
 
@@ -771,8 +1103,9 @@ func (e *syncEngine) deleteRemoteFile(rel, nodeID string) error {
 		return err
 	}
 	delete(e.state.Entries, rel)
-	e.deleted++
+	e.deleted.Add(1)
 	log.Printf("🗑  trashed %s (deleted locally)", rel)
+	e.publishActivity("trash", rel)
 	return nil
 }
 
@@ -802,6 +1135,9 @@ func (e *syncEngine) ensureRemoteFolder(rel string, remoteFolders map[string]sto
 }
 
 func (e *syncEngine) uploadNewFile(rel string, remoteFolders map[string]storageNode, folderID map[string]string) error {
+	e.setInFlight(rel, "upload")
+	defer e.clearInFlight()
+
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	data, err := os.ReadFile(abs)
 	if err != nil {
@@ -817,10 +1153,14 @@ func (e *syncEngine) uploadNewFile(rel string, remoteFolders map[string]storageN
 	}
 	e.recordUpload(rel, node, data)
 	log.Printf("↑ uploaded %s", rel)
+	e.publishActivity("upload", rel)
 	return nil
 }
 
 func (e *syncEngine) replaceFile(rel, nodeID string) error {
+	e.setInFlight(rel, "upload")
+	defer e.clearInFlight()
+
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	data, err := os.ReadFile(abs)
 	if err != nil {
@@ -832,6 +1172,7 @@ func (e *syncEngine) replaceFile(rel, nodeID string) error {
 	}
 	e.recordUpload(rel, node, data)
 	log.Printf("↑ uploaded %s (updated)", rel)
+	e.publishActivity("update", rel)
 	return nil
 }
 
@@ -844,7 +1185,7 @@ func (e *syncEngine) recordUpload(rel string, node *storageNode, data []byte) {
 		LocalSize:  int64(len(data)),
 		SyncedAt:   time.Now(),
 	}
-	e.uploaded++
+	e.uploaded.Add(1)
 }
 
 func (e *syncEngine) saveState() {
@@ -879,9 +1220,9 @@ func (e *syncEngine) addWatchesRecursive(w *fsnotify.Watcher) {
 
 func (e *syncEngine) printSummary() {
 	fmt.Printf("\n--- Sync summary ---\n")
-	fmt.Printf("Downloaded: %d\n", e.downloaded)
-	fmt.Printf("Uploaded:   %d\n", e.uploaded)
-	fmt.Printf("Removed:    %d\n", e.deleted)
+	fmt.Printf("Downloaded: %d\n", e.downloaded.Load())
+	fmt.Printf("Uploaded:   %d\n", e.uploaded.Load())
+	fmt.Printf("Removed:    %d\n", e.deleted.Load())
 }
 
 // runStorageSync performs an initial full sync of storageSyncFolder with the
@@ -889,7 +1230,26 @@ func (e *syncEngine) printSummary() {
 // interrupted. Creates, updates and deletes all push from whichever side made
 // the change to the other; simultaneous edits of the same file are the one
 // case where the API's copy wins.
-func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
+func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool) error {
+	// Only one sync engine may run per user at a time — a second reconcileAll
+	// loop against the same folder would race the first. Acquired before
+	// anything else so a second invocation (e.g. a tray app trying to launch
+	// brick when it's already running) fails fast instead of corrupting
+	// state. Released automatically by the OS if this process dies, so a
+	// crash never leaves a stale lock behind.
+	lockPath, err := instanceLockPath()
+	if err != nil {
+		return err
+	}
+	lock, err := acquireInstanceLock(lockPath)
+	if err != nil {
+		if errors.Is(err, errInstanceLocked) {
+			return errors.New("brick is already running for this user")
+		}
+		return err
+	}
+	defer lock.Release()
+
 	cfg, err := ensureAuthenticated(apiURL)
 	if err != nil {
 		return err
@@ -898,7 +1258,8 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		return errors.New("no active account selected; run 'brick --switch-accounts' first")
 	}
 
-	folder, err := ensureStorageSyncFolder(cfg)
+	isFirstSetup := strings.TrimSpace(cfg.StorageSyncFolder) == ""
+	folder, conflictMode, err := ensureStorageSyncFolder(cfg)
 	if err != nil {
 		return err
 	}
@@ -909,13 +1270,24 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
 	}
 
+	if isFirstSetup {
+		if err := runSyncScopeOnboarding(sc, root.ID, cfg); err != nil {
+			return err
+		}
+		fmt.Println("Now, we're ready. Brick will now sync your files...\n")
+	}
+
 	eng := &syncEngine{
 		sc:              sc,
 		folder:          folder,
 		rootID:          root.ID,
+		excludeDirs:     cfg.ExcludeDirs,
+		firstSync:       isFirstSetup,
+		conflictMode:    conflictMode,
 		state:           loadSyncState(folder),
 		recentlyWritten: map[string]time.Time{},
 	}
+	eng.setState("starting")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -955,6 +1327,7 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		}
 		log.Printf("initial sync error: %v", err)
 	}
+	eng.firstSync = false
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -975,6 +1348,18 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		}
 	}
 
+	// Local status/control API: lets a local client (e.g. a tray app) read
+	// live sync status and issue pause/resume/quit without touching the
+	// terminal this process is attached to. Loopback-only (unix domain
+	// socket), token-gated; see controlapi.go for the full protocol.
+	if !noControlAPI {
+		if cs, csErr := startControlServer(eng, cancel, notify); csErr != nil {
+			log.Printf("could not start control API: %v", csErr)
+		} else {
+			defer cs.Close()
+		}
+	}
+
 	// Debounced reconcile worker.
 	go func() {
 		var timer *time.Timer
@@ -992,6 +1377,12 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 				}
 			case <-timerC:
 				timer, timerC = nil, nil
+				if eng.paused.Load() {
+					// Gate only the reconcile call itself (not the watcher or
+					// ticker) so resuming is instant: notify() below already
+					// woke this worker, so resume just needs to flip the flag.
+					continue
+				}
 				if err := eng.reconcileAll(); err != nil {
 					if errors.Is(err, errSessionExpired) {
 						log.Printf("session expired — run 'brick --login' to re-authenticate")
@@ -1053,42 +1444,204 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 
 // ensureStorageSyncFolder returns the configured sync folder, prompting the user
 // to set it if unset, expanding ~, creating it on disk, and persisting it.
-func ensureStorageSyncFolder(cfg *Config) (string, error) {
-	folder := strings.TrimSpace(cfg.StorageSyncFolder)
+// conflictMode is only meaningful the first time a folder is configured, and is
+// empty otherwise; it reports how pre-existing local files that already have a
+// remote counterpart should be reconciled during the very first sync.
+func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, err error) {
+	folder = strings.TrimSpace(cfg.StorageSyncFolder)
 	if folder == "" {
-		fmt.Println("No storage sync folder is configured (storageSyncFolder).")
-		fmt.Print("Enter the local folder to sync with the Storage API: ")
-		reader := bufio.NewReader(os.Stdin)
-		line, err := reader.ReadString('\n')
+		folder, conflictMode, err = promptForSyncFolder()
 		if err != nil {
-			return "", fmt.Errorf("could not read input: %w", err)
-		}
-		folder = strings.TrimSpace(line)
-		if folder == "" {
-			return "", errors.New("no folder provided")
+			return "", "", err
 		}
 	}
 
 	if strings.HasPrefix(folder, "~") {
-		if home, err := os.UserHomeDir(); err == nil {
+		if home, herr := os.UserHomeDir(); herr == nil {
 			folder = filepath.Join(home, strings.TrimPrefix(folder, "~"))
 		}
 	}
 	abs, err := filepath.Abs(folder)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return "", fmt.Errorf("could not create sync folder: %w", err)
+		return "", "", fmt.Errorf("could not create sync folder: %w", err)
 	}
 	if cfg.StorageSyncFolder != abs {
 		cfg.StorageSyncFolder = abs
 		if err := saveConfig(cfg); err != nil {
-			return "", err
+			return "", "", err
 		}
 		fmt.Printf("Saved storageSyncFolder = %s\n", abs)
 	}
-	return abs, nil
+	return abs, conflictMode, nil
+}
+
+// runSyncScopeOnboarding runs the final onboarding step: if the Brick account
+// has any top-level folders, it asks whether to sync everything or only a
+// subset, writing the folders the user picks to exclude into cfg.ExcludeDirs.
+// A no-op if the account has no folders yet.
+func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error {
+	topFolders, totalSize, err := sc.folderSummary(rootID)
+	if err != nil {
+		return err
+	}
+	if len(topFolders) == 0 {
+		return nil
+	}
+
+	fmt.Println("\nOne last decision to make:")
+	fmt.Println()
+
+	const (
+		optAll  = "all"
+		optPick = "pick"
+	)
+	var choice string
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Sync scope").
+			Options(
+				huh.NewOption(fmt.Sprintf("Sync all folders from Brick (%s)", humanSize(totalSize)), optAll),
+				huh.NewOption("Pick which folders to sync", optPick),
+			).
+			Value(&choice),
+	)).Run(); err != nil {
+		return err
+	}
+	if choice == optAll {
+		return nil
+	}
+
+	options := make([]huh.Option[string], len(topFolders))
+	for i, f := range topFolders {
+		options[i] = huh.NewOption(f.Name, f.Name)
+	}
+	var excludeDirs []string
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewMultiSelect[string]().
+			Title("Select the folders to exclude from sync").
+			Options(options...).
+			Value(&excludeDirs),
+	)).Run(); err != nil {
+		return err
+	}
+
+	cfg.ExcludeDirs = excludeDirs
+	return saveConfig(cfg)
+}
+
+// promptForSyncFolder interactively asks the user to pick a sync folder — the
+// default ~/Brick or a custom folder browsed via a huh file picker — and, if
+// that folder already contains files, how to resolve conflicts with the
+// remote copy during the first sync.
+func promptForSyncFolder() (folder string, conflictMode string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("could not determine home directory: %w", err)
+	}
+	defaultFolder := filepath.Join(home, "Brick")
+
+	fmt.Println("You have no sync folder configured (storageSyncFolder).")
+	fmt.Println()
+
+	const (
+		optDefault = "default"
+		optCustom  = "custom"
+	)
+	var choice string
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Choose a sync folder").
+			Options(
+				huh.NewOption(fmt.Sprintf("Use %s", defaultFolder), optDefault),
+				huh.NewOption("Custom folder", optCustom),
+			).
+			Value(&choice),
+	)).Run(); err != nil {
+		return "", "", err
+	}
+
+	if choice == optDefault {
+		folder = defaultFolder
+	} else {
+		var picked string
+		if err := huh.NewForm(huh.NewGroup(
+			huh.NewFilePicker().
+				Title("Pick a folder to sync").
+				CurrentDirectory(home).
+				DirAllowed(true).
+				FileAllowed(false).
+				Picking(true).
+				Value(&picked),
+		)).Run(); err != nil {
+			return "", "", err
+		}
+		folder = picked
+	}
+
+	abs, err := filepath.Abs(folder)
+	if err != nil {
+		return "", "", err
+	}
+	hasFiles, err := dirHasEntries(abs)
+	if err != nil {
+		return "", "", err
+	}
+	if hasFiles {
+		conflictMode, err = promptConflictMode()
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return abs, conflictMode, nil
+}
+
+// promptConflictMode asks how to resolve files that already exist both
+// locally (in a pre-existing, non-empty sync folder) and remotely, before any
+// sync history exists for them.
+func promptConflictMode() (string, error) {
+	fmt.Println("Your sync folder already contains files, how should we handle possible conflicts?")
+	fmt.Println()
+	var mode string
+	err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Conflict resolution").
+			Options(
+				huh.NewOption("Overwrite the file on this device.", "device"),
+				huh.NewOption("Overwrite the file on Brick.", "brick"),
+				huh.NewOption("Make a copy (so nothing is lost).", "copy"),
+			).
+			Value(&mode),
+	)).Run()
+	return mode, err
+}
+
+// dirHasEntries reports whether path exists and contains at least one entry.
+func dirHasEntries(path string) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return len(entries) > 0, nil
+}
+
+// humanSize renders bytes as a human-readable size (e.g. "12.3 GB").
+func humanSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 // --- small helpers ---

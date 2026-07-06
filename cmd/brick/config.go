@@ -32,6 +32,12 @@ type Config struct {
 	// Storage sync
 	StorageSyncFolder string `yaml:"storageSyncFolder,omitempty"`
 
+	// ExcludeDirs lists folder paths, relative to storageSyncFolder and
+	// slash-separated (e.g. "folder/subfolder"), whose files are never
+	// uploaded or downloaded. Changes under them are still detected and
+	// logged, just not synced.
+	ExcludeDirs []string `yaml:"excludeDirs,omitempty"`
+
 	// Remote file agent: additional directories (beyond the sync folder) that
 	// -r/--remote-control exposes to remote clients attached via the storage API.
 	AgentRoots []string `yaml:"agentRoots,omitempty"`
@@ -113,10 +119,10 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// resolveAPIURL returns the effective REQUESTBITE_API_URL, preferring (in order):
+// resolveAPIURL returns the effective ACC_API_URL, preferring (in order):
 // the runtime env var, the compile-time default, then a localhost dev fallback.
 func resolveAPIURL() string {
-	if v := getEnv("REQUESTBITE_API_URL", ""); v != "" {
+	if v := getEnv("ACC_API_URL", ""); v != "" {
 		return v
 	}
 	if DefaultAPIURL != "" {
@@ -153,6 +159,7 @@ func printHelp() {
 	fmt.Printf("      --agent-root PATH       Additional directory to expose to remote clients when remote control is enabled (repeatable)\n")
 	fmt.Println("\nOther\n=====")
 	fmt.Printf("      --no-upgrade-check      Disable automatic upgrade check\n")
+	fmt.Printf("      --no-control-api        Disable the local status/control API (used by tray apps)\n")
 	fmt.Printf("      --uninstall             Uninstall brick\n")
 	fmt.Printf("  -h, --help                  Show help information\n")
 	fmt.Printf("  -v, --version               Show version information\n")
