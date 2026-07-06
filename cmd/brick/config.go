@@ -82,44 +82,57 @@ func saveConfig(cfg *Config) error {
 // loadOrCreateConfig reads ~/.config/brick/config.yaml, creating it with a
 // fresh UUIDv4 clientId if it does not already exist.
 func loadOrCreateConfig() (*Config, error) {
-	cfgPath, err := configPath()
+	cfg, created, err := loadOrCreateConfigQuiet()
 	if err != nil {
 		return nil, err
+	}
+	if created {
+		fmt.Printf("Created default configuration file in ~/.config/brick/config.yaml\n")
+	}
+	return cfg, nil
+}
+
+// loadOrCreateConfigQuiet is loadOrCreateConfig without the "file created"
+// print, for callers (like -d --json) that must never write anything to
+// stdout beyond their own single-line output.
+func loadOrCreateConfigQuiet() (cfg *Config, created bool, err error) {
+	cfgPath, err := configPath()
+	if err != nil {
+		return nil, false, err
 	}
 	cfgDir := filepath.Dir(cfgPath)
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("could not read config file: %w", err)
+		return nil, false, fmt.Errorf("could not read config file: %w", err)
 	}
 
-	var cfg Config
+	var c Config
 	if os.IsNotExist(err) {
 		// Create directory and file with a new clientId.
 		if mkErr := os.MkdirAll(cfgDir, 0o755); mkErr != nil {
-			return nil, fmt.Errorf("could not create config directory: %w", mkErr)
+			return nil, false, fmt.Errorf("could not create config directory: %w", mkErr)
 		}
-		cfg.ClientID = uuid.New().String()
-		if saveErr := saveConfig(&cfg); saveErr != nil {
-			return nil, saveErr
+		c.ClientID = uuid.New().String()
+		if saveErr := saveConfig(&c); saveErr != nil {
+			return nil, false, saveErr
 		}
-		fmt.Printf("Created default configuration file in ~/.config/brick/config.yaml\n")
-		return &cfg, nil
+		return &c, true, nil
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("could not parse config file: %w", err)
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return nil, false, fmt.Errorf("could not parse config file: %w", err)
 	}
 
 	// Populate missing clientId and persist.
-	if cfg.ClientID == "" {
-		cfg.ClientID = uuid.New().String()
-		if saveErr := saveConfig(&cfg); saveErr != nil {
-			return nil, saveErr
+	if c.ClientID == "" {
+		c.ClientID = uuid.New().String()
+		if saveErr := saveConfig(&c); saveErr != nil {
+			return nil, false, saveErr
 		}
 	}
 
-	return &cfg, nil
+	return &c, false, nil
 }
 
 func getEnv(key, fallback string) string {

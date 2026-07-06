@@ -37,6 +37,7 @@ func main() {
 		remoteControl  bool
 		noControlAPI   bool
 		daemon         bool
+		daemonJSON     bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "")
@@ -53,6 +54,9 @@ func main() {
 	flag.BoolVar(&noControlAPI, "no-control-api", false, "")
 	flag.BoolVar(&daemon, "d", false, "")
 	flag.BoolVar(&daemon, "daemon", false, "")
+	// Undocumented: only used together with -d/--daemon, by the companion app
+	// that starts brick in daemon mode. See README for the JSON output shapes.
+	flag.BoolVar(&daemonJSON, "json", false, "")
 	flag.Var(&agentRootsFlag, "agent-root", "")
 	flag.Usage = printHelp
 	flag.Parse()
@@ -108,8 +112,10 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Storage sync: the default action, requiring no CLI options.
-	if !noUpgradeCheck && !isRunningInDevelopment() {
+	// Storage sync: the default action, requiring no CLI options. Skipped
+	// entirely under -d --json: checkForUpdates can print a prompt and read
+	// stdin, which would break the "exactly one JSON line on stdout" contract.
+	if !noUpgradeCheck && !(daemon && daemonJSON) && !isRunningInDevelopment() {
 		checkForUpdates()
 	}
 	apiURL := resolveAPIURL()
@@ -127,6 +133,10 @@ func main() {
 	}
 
 	if daemon {
+		if daemonJSON {
+			runAsDaemonJSON(apiURL, storageURL, remoteControl, noControlAPI)
+			return // unreachable: runAsDaemonJSON always exits the process itself
+		}
 		if err := runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI); err != nil {
 			log.Fatalf("Failed to start daemon: %v", err)
 		}

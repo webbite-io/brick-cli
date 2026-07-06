@@ -16,3 +16,10 @@ func runAsDaemon(apiURL, storageURL string, remoteControl, noControlAPI bool) er
 func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool, folder, conflictMode string, isFirstSetup bool) error {
 	return errDaemonUnsupported
 }
+
+// runAsDaemonJSON is the --json counterpart to runAsDaemon; daemon mode is
+// unsupported on Windows regardless, so it reports that as a JSON error and
+// exits (via emitDaemonJSON) rather than returning.
+func runAsDaemonJSON(apiURL, storageURL string, remoteControl, noControlAPI bool) {
+	emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "unsupported_platform", Message: errDaemonUnsupported.Error()})
+}

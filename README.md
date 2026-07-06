@@ -113,6 +113,43 @@ Files inside an excluded folder (or any folder below it) are never uploaded
 or downloaded; changes to them are detected and logged, but otherwise
 ignored.
 
+### Daemon mode
+
+Pass `-d`/`--daemon` to run every interactive step (login, sync-folder
+selection, first-run onboarding) attached to the current terminal as usual,
+then detach into the background once brick is logged in and the Storage API
+is reachable, handing control back to the shell. Not supported on Windows.
+
+`--json` is an additional, undocumented (not listed in `-h`) flag for
+`-d`/`--daemon`, meant for a companion app that starts `brick` in daemon mode
+itself rather than a human at a terminal. With `--json`:
+
+- Nothing interactive ever runs — login, account selection and sync-folder
+  setup must already be complete from a prior ordinary run, otherwise brick
+  reports `setup_required` instead of prompting.
+- Exactly one line of JSON is printed to stdout and brick exits; there is no
+  other output to parse around.
+
+On success:
+
+```json
+{"status":"ok","pid":12345,"logPath":"/home/user/.config/brick/daemon.log","folder":"/home/user/Brick"}
+```
+
+On failure, `status` is `"error"` and `code` is one of:
+
+| Code                  | Meaning                                                              |
+| --------------------- | --------------------------------------------------------------------- |
+| `setup_required`      | Not logged in, no active account, or no sync folder configured yet — run `brick` (or `--login`/`--switch-accounts`) interactively first. |
+| `already_running`     | brick is already running for this user (instance lock held).          |
+| `unsupported_platform`| Daemon mode was requested on Windows.                                  |
+| `start_failed`        | Setup succeeded but starting the background process failed (e.g. the Storage API is unreachable); see `message`. |
+| `internal_error`      | Reading local config failed.                                          |
+
+```json
+{"status":"error","code":"setup_required","message":"brick is not logged in; run 'brick --login' first"}
+```
+
 ## Local Status/Control API
 
 While syncing, `brick` runs a local, loopback-only control API so another
