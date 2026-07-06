@@ -104,16 +104,19 @@ the local agent refuses any such request.
 This repo uses a `Makefile` for building:
 
 ```bash
-make build       # build ./cmd/brick for the current platform, output in build/
+make build-dev   # build ./cmd/brick for the current platform, using .env.dev
+make build-prod  # build ./cmd/brick for the current platform, using .env.prod
 make build-all   # cross-compile for macOS/Linux/Windows
-make dev         # hot-reload with air (make dev ARGS="-s")
-make install     # install to ~/.local/bin
+make dev         # hot-reload with air, against .env.dev (make dev ARGS="-s")
+make install     # build using .env.prod and install to ~/.local/bin
 make release     # cross-compile + package release archives
 ```
 
-Copy `.env.example` to `.env.dev` and fill in `OAUTH_CLIENT_ID` once an OIDC
-client has been created for brick; the API URLs already point at the same
-local dev backend used by [rbite](https://github.com/requestbite/rbite).
+Copy `.env.example` to `.env.dev` (and/or `.env.prod`) and fill in
+`OAUTH_CLIENT_ID` once an OIDC client has been created for brick; the API
+URLs already point at the same local dev backend used by
+[rbite](https://github.com/requestbite/rbite). `make build-dev`/`make
+build-prod` error out if the corresponding file doesn't exist.
 
 Man page and shell completions live in `man/` and `completions/` and are
 bundled into release archives and installed by `install.sh`.

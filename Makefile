@@ -1,9 +1,15 @@
 # RequestBite brick Makefile
 # Cross-platform build automation for macOS, Linux, and Windows
 
-ENV_FILE ?= .env.dev
+# ENV_FILE is only loaded when explicitly set (e.g. via `make build-dev` /
+# `make build-prod`, or `ENV_FILE=... make build`). Left unset for targets
+# like build-all/release that expect the real values to already be in the
+# environment (e.g. from CI secrets).
+ENV_FILE ?=
+ifneq ($(strip $(ENV_FILE)),)
 -include $(ENV_FILE)
 export
+endif
 
 # Extract version from git tag (strip 'v' prefix), fallback to "dev"
 # If on exact tag like v1.2.3, VERSION = 1.2.3
@@ -54,17 +60,34 @@ COLOR_GREEN := \033[32m
 COLOR_BLUE := \033[34m
 COLOR_YELLOW := \033[33m
 
-.PHONY: all build build-all release clean install dev help
+.PHONY: all build build-dev build-prod build-all release clean install dev help
 
 # Default target
 all: build
 
-# Build for current platform (development)
+# Build for current platform, using whichever ENV_FILE is set (internal;
+# use build-dev/build-prod instead).
 build:
-	@echo "$(COLOR_BOLD)$(COLOR_BLUE)Building $(BINARY_NAME) v$(VERSION) for current platform...$(COLOR_RESET)"
+	@if [ -z "$(ENV_FILE)" ]; then \
+		echo "$(COLOR_YELLOW)No environment specified.$(COLOR_RESET) Use '$(COLOR_BOLD)make build-dev$(COLOR_RESET)' or '$(COLOR_BOLD)make build-prod$(COLOR_RESET)'."; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(ENV_FILE)" ]; then \
+		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) $(ENV_FILE) not found. Copy .env.example to $(ENV_FILE) and fill in the values."; \
+		exit 1; \
+	fi
+	@echo "$(COLOR_BOLD)$(COLOR_BLUE)Building $(BINARY_NAME) v$(VERSION) for current platform ($(ENV_FILE))...$(COLOR_RESET)"
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 go build $(BUILD_FLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/brick
 	@echo "$(COLOR_GREEN)✓ Build complete: $(BUILD_DIR)/$(BINARY_NAME)$(COLOR_RESET)"
+
+# Build using .env.dev
+build-dev:
+	@$(MAKE) build ENV_FILE=.env.dev
+
+# Build using .env.prod
+build-prod:
+	@$(MAKE) build ENV_FILE=.env.prod
 
 # Build for all platforms
 build-all: clean
@@ -145,7 +168,7 @@ clean:
 	@echo "$(COLOR_GREEN)✓ Clean complete$(COLOR_RESET)"
 
 # Install locally for testing (to ~/.local/bin)
-install: build
+install: build-prod
 	@echo "$(COLOR_BOLD)$(COLOR_BLUE)Installing $(BINARY_NAME) to ~/.local/bin...$(COLOR_RESET)"
 	@mkdir -p ~/.local/bin
 	@cp $(BUILD_DIR)/$(BINARY_NAME) ~/.local/bin/
@@ -165,13 +188,13 @@ dev:
 	@# For --help or --version, run directly without Air
 	@if echo "$(ARGS)" | grep -qE "(-h|--help|-v|--version)"; then \
 		echo "$(COLOR_BLUE)Running without hot reload (--help or --version detected)$(COLOR_RESET)"; \
-		$(MAKE) build > /dev/null 2>&1; \
+		$(MAKE) build-dev > /dev/null 2>&1; \
 		./$(BUILD_DIR)/$(BINARY_NAME) $(ARGS); \
 	elif command -v air >/dev/null; then \
 		air -- $(ARGS); \
 	else \
 		echo "Air is not installed. Install it with: go install github.com/air-verse/air@latest"; \
-		echo "Or run without hot reload using: make build && ./build/$(BINARY_NAME) $(ARGS)"; \
+		echo "Or run without hot reload using: make build-dev && ./build/$(BINARY_NAME) $(ARGS)"; \
 		exit 1; \
 	fi
 
@@ -189,18 +212,20 @@ help:
 	@echo "  make [target]"
 	@echo ""
 	@echo "$(COLOR_BOLD)Targets:$(COLOR_RESET)"
-	@echo "  build      - Build for current platform (default)"
-	@echo "  dev        - Run with hot reload using Air (for development)"
+	@echo "  build-dev  - Build for current platform using .env.dev"
+	@echo "  build-prod - Build for current platform using .env.prod"
+	@echo "  dev        - Run with hot reload using Air, against .env.dev (for development)"
 	@echo "  build-all  - Build for all platforms (darwin/amd64, darwin/arm64, linux/amd64, windows/amd64)"
 	@echo "  release    - Build all platforms and create release archives with checksums"
 	@echo "  clean      - Remove all build artifacts"
-	@echo "  install    - Install locally to ~/.local/bin (for testing)"
+	@echo "  install    - Build using .env.prod and install to ~/.local/bin (for testing)"
 	@echo "  version    - Show version information"
 	@echo "  help       - Show this help message"
 	@echo ""
 	@echo "$(COLOR_BOLD)Examples:$(COLOR_RESET)"
-	@echo "  make build                                    # Quick build for development"
-	@echo "  make dev                                      # Run with hot reload"
+	@echo "  make build-dev                                 # Quick build against .env.dev"
+	@echo "  make build-prod                                # Quick build against .env.prod"
+	@echo "  make dev                                       # Run with hot reload"
 	@echo "  make dev ARGS="-r"                             # Run with CLI arguments"
 	@echo "  make build-all                                # Build for all platforms"
 	@echo "  make release                                  # Create release archives"
