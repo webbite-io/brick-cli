@@ -22,6 +22,16 @@ var (
 	DefaultOAuthCallbackURL = "http://localhost:7332/auth/callback"
 )
 
+// Environment variables daemon mode (-d) uses to hand the outcome of the
+// interactive setup (sync folder, first-run conflict choice) from the
+// foreground process to the detached child it re-execs itself as. The
+// child's presence check is daemonFolderEnv being non-empty.
+const (
+	daemonFolderEnv       = "BRICK_DAEMON_FOLDER"
+	daemonConflictModeEnv = "BRICK_DAEMON_CONFLICT_MODE"
+	daemonFirstSetupEnv   = "BRICK_DAEMON_FIRST_SETUP"
+)
+
 type Config struct {
 	ClientID     string `yaml:"clientId"`
 	AccessToken  string `yaml:"accessToken,omitempty"`
@@ -155,6 +165,7 @@ func printHelp() {
 	fmt.Printf("      --whoami                Show logged-in user and account details\n")
 	fmt.Println("\nStorage Sync\n============")
 	fmt.Printf("  Running brick with no other options syncs storageSyncFolder with the Storage API and watches for changes\n")
+	fmt.Printf("  -d, --daemon                Detach into the background once logged in and the Storage API is reachable\n")
 	fmt.Printf("  -r, --remote-control        Allow the Storage API to remotely list/browse/transfer files on this device\n")
 	fmt.Printf("      --agent-root PATH       Additional directory to expose to remote clients when remote control is enabled (repeatable)\n")
 	fmt.Println("\nOther\n=====")

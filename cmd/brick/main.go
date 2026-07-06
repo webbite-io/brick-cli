@@ -36,6 +36,7 @@ func main() {
 		whoami         bool
 		remoteControl  bool
 		noControlAPI   bool
+		daemon         bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "")
@@ -50,6 +51,8 @@ func main() {
 	flag.BoolVar(&remoteControl, "r", false, "")
 	flag.BoolVar(&remoteControl, "remote-control", false, "")
 	flag.BoolVar(&noControlAPI, "no-control-api", false, "")
+	flag.BoolVar(&daemon, "d", false, "")
+	flag.BoolVar(&daemon, "daemon", false, "")
 	flag.Var(&agentRootsFlag, "agent-root", "")
 	flag.Usage = printHelp
 	flag.Parse()
@@ -111,6 +114,25 @@ func main() {
 	}
 	apiURL := resolveAPIURL()
 	storageURL := resolveStorageAPIURL()
+
+	// Detached daemon child: runAsDaemon re-execs the binary with this env var
+	// set, handing over the folder/conflict-mode decisions made interactively
+	// in the foreground parent so they're applied here without prompting again.
+	if folder := os.Getenv(daemonFolderEnv); folder != "" {
+		isFirstSetup := os.Getenv(daemonFirstSetupEnv) == "1"
+		if err := runDaemonChild(apiURL, storageURL, remoteControl, noControlAPI, folder, os.Getenv(daemonConflictModeEnv), isFirstSetup); err != nil {
+			log.Fatalf("Storage sync failed: %v", err)
+		}
+		os.Exit(0)
+	}
+
+	if daemon {
+		if err := runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI); err != nil {
+			log.Fatalf("Failed to start daemon: %v", err)
+		}
+		os.Exit(0)
+	}
+
 	if err := runStorageSync(apiURL, storageURL, remoteControl, noControlAPI); err != nil {
 		log.Fatalf("Storage sync failed: %v", err)
 	}

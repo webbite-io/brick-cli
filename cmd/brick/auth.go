@@ -295,7 +295,7 @@ func runLogin(apiURL string) error {
 		return err
 	}
 
-	fmt.Printf("Brick now has access to your account: %s.\n  To switch account, use the --switch-accounts parameter.\n\n", accountName)
+	fmt.Printf("Brick now has access to your account: %s.\n  To switch account, use the --switch-accounts parameter.", accountName)
 	return nil
 }
 
@@ -376,7 +376,7 @@ func selectAccount(accounts []accountInfo) (id, name string, err error) {
 		return accounts[0].ID, accounts[0].Name, nil
 	}
 
-	fmt.Println("You have access to more than one account, which one do you want to use?")
+	fmt.Println("\nYou have access to more than one account, which one do you want to use?")
 	fmt.Println()
 
 	options := make([]huh.Option[string], len(accounts))

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/huh"
@@ -1225,6 +1226,63 @@ func (e *syncEngine) printSummary() {
 	fmt.Printf("Removed:    %d\n", e.deleted.Load())
 }
 
+// syncSetup captures the outcome of the interactive part of starting a sync:
+// authentication, sync folder resolution, and (on a brand new setup) the
+// choice of how to resolve pre-existing local/remote conflicts and which
+// folders to sync. runAsDaemon computes it once in the foreground, before
+// detaching, and hands it to the detached child so the child's first
+// reconcile pass applies those decisions rather than prompting a second time.
+type syncSetup struct {
+	cfg          *Config
+	sc           *storageClient
+	folder       string
+	rootID       string
+	conflictMode string
+	isFirstSetup bool
+}
+
+// prepareSync runs the interactive setup steps needed before a sync can
+// start: authentication, sync folder resolution (prompting on first run), a
+// Storage API reachability check, and (on a brand new setup) the sync-scope
+// onboarding.
+func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
+	cfg, err := ensureAuthenticated(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.AccountID == "" {
+		return nil, errors.New("no active account selected; run 'brick --switch-accounts' first")
+	}
+
+	isFirstSetup := strings.TrimSpace(cfg.StorageSyncFolder) == ""
+	folder, conflictMode, err := ensureStorageSyncFolder(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.AccountID, cfg: cfg}
+	root, err := sc.resolveRoot()
+	if err != nil {
+		return nil, fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
+	}
+
+	if isFirstSetup {
+		if err := runSyncScopeOnboarding(sc, root.ID, cfg); err != nil {
+			return nil, err
+		}
+		fmt.Println("Now, we're ready. Brick will now sync your files...\n")
+	}
+
+	return &syncSetup{
+		cfg:          cfg,
+		sc:           sc,
+		folder:       folder,
+		rootID:       root.ID,
+		conflictMode: conflictMode,
+		isFirstSetup: isFirstSetup,
+	}, nil
+}
+
 // runStorageSync performs an initial full sync of storageSyncFolder with the
 // Storage API, then watches the folder and polls the API for changes until
 // interrupted. Creates, updates and deletes all push from whichever side made
@@ -1250,40 +1308,27 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 	}
 	defer lock.Release()
 
-	cfg, err := ensureAuthenticated(apiURL)
+	setup, err := prepareSync(apiURL, storageURL)
 	if err != nil {
 		return err
 	}
-	if cfg.AccountID == "" {
-		return errors.New("no active account selected; run 'brick --switch-accounts' first")
-	}
+	return runSyncLoop(setup, remoteControl, noControlAPI)
+}
 
-	isFirstSetup := strings.TrimSpace(cfg.StorageSyncFolder) == ""
-	folder, conflictMode, err := ensureStorageSyncFolder(cfg)
-	if err != nil {
-		return err
-	}
-
-	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.AccountID, cfg: cfg}
-	root, err := sc.resolveRoot()
-	if err != nil {
-		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
-	}
-
-	if isFirstSetup {
-		if err := runSyncScopeOnboarding(sc, root.ID, cfg); err != nil {
-			return err
-		}
-		fmt.Println("Now, we're ready. Brick will now sync your files...\n")
-	}
+// runSyncLoop builds the sync engine from setup and runs it — the initial
+// full reconciliation, then the filesystem watcher and periodic poll — until
+// interrupted (Ctrl+C/SIGTERM in the foreground case; SIGTERM when stopping a
+// detached daemon).
+func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI bool) error {
+	cfg, sc, folder := setup.cfg, setup.sc, setup.folder
 
 	eng := &syncEngine{
 		sc:              sc,
 		folder:          folder,
-		rootID:          root.ID,
+		rootID:          setup.rootID,
 		excludeDirs:     cfg.ExcludeDirs,
-		firstSync:       isFirstSetup,
-		conflictMode:    conflictMode,
+		firstSync:       setup.isFirstSetup,
+		conflictMode:    setup.conflictMode,
 		state:           loadSyncState(folder),
 		recentlyWritten: map[string]time.Time{},
 	}
@@ -1292,7 +1337,7 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		fmt.Println()
@@ -1313,8 +1358,8 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 	} else {
 		agentAddr := agentLn.Addr().String()
 		defer agentLn.Close()
-		go connectAgentWithReconnect(ctx, storageURL, apiURL, cfg, agentSecret, agentAddr, remoteControl)
-		defer deregisterAgent(storageURL, apiURL, cfg)
+		go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agentAddr, remoteControl)
+		defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)
 		if remoteControl {
 			fmt.Printf("Remote control enabled (roots: %s)\n", strings.Join(agentRoots, ", "))
 		}
@@ -1543,7 +1588,7 @@ func promptForSyncFolder() (folder string, conflictMode string, err error) {
 	}
 	defaultFolder := filepath.Join(home, "Brick")
 
-	fmt.Println("You have no sync folder configured (storageSyncFolder).")
+	fmt.Println("\n\nYou have no sync folder configured (storageSyncFolder).")
 	fmt.Println()
 
 	const (
