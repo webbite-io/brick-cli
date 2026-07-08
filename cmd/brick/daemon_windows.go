@@ -9,6 +9,11 @@ import "errors"
 // is unsupported there.
 var errDaemonUnsupported = errors.New("daemon mode (-d) is not supported on Windows; run brick without -d instead")
 
+// daemonSupported reports whether this platform can run brick as a detached
+// background daemon; used to decide whether the interactive sync banner
+// advertises the 'D' detach shortcut at all.
+const daemonSupported = false
+
 func runAsDaemon(apiURL, storageURL string, remoteControl, noControlAPI bool) error {
 	return errDaemonUnsupported
 }

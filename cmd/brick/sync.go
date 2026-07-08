@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/x/term"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -1314,13 +1315,26 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 		}
 		return err
 	}
-	defer lock.Release()
 
 	setup, err := prepareSync(apiURL, storageURL)
 	if err != nil {
+		lock.Release()
 		return err
 	}
-	return runSyncLoop(setup, remoteControl, noControlAPI, false)
+
+	// The lock is released as soon as the loop stops, rather than deferred to
+	// function exit, because the detach case below needs it free before
+	// startDaemonProcess (via runAsDaemon) tries to acquire its own copy.
+	detach, err := runSyncLoop(setup, remoteControl, noControlAPI, false)
+	lock.Release()
+	if err != nil {
+		return err
+	}
+	if detach {
+		fmt.Println("Detaching sync into a background daemon...")
+		return runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI)
+	}
+	return nil
 }
 
 // runSyncLoop builds the sync engine from setup and runs it — the initial
@@ -1330,7 +1344,13 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 // child (as opposed to a foreground run), and is recorded in the control
 // discovery file so a later 'brick --switch-accounts' knows whether it's
 // safe to relaunch a replacement daemon after stopping this one.
-func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool) error {
+//
+// The returned bool is true when the loop stopped because the user pressed
+// 'D' to detach into a background daemon (only possible when background is
+// false and stdin/stdout are a terminal); the caller is then responsible for
+// actually starting that daemon, since this function has no daemon-mode
+// knowledge of its own.
+func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool) (detach bool, err error) {
 	cfg, sc, folder := setup.cfg, setup.sc, setup.folder
 	// cfg.RemoteControl, set during onboarding (see promptForRemoteControl),
 	// makes remote control the default without needing -r on every run; -r
@@ -1361,7 +1381,36 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		cancel()
 	}()
 
-	fmt.Printf("Syncing %s with the Storage API. Press Ctrl+C to stop.\n", folder)
+	// Interactive mode (foreground run attached to a real terminal) gets the
+	// colored banner, a fixed-height scrolling window for log output, and
+	// raw-mode keyboard shortcuts (Ctrl+C, and D to detach). Anything else —
+	// the detached daemon child, or output/input that isn't a terminal —
+	// keeps the plain one-line banner and ordinary scrolling log output.
+	interactive := !background && term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
+	printSyncBanner(folder, interactive)
+
+	var detachRequested atomic.Bool
+	var rawState *term.State
+	var cleanupOnce sync.Once
+	cleanupInteractive := func() {
+		cleanupOnce.Do(func() {
+			if rawState != nil {
+				_ = term.Restore(os.Stdin.Fd(), rawState)
+			}
+			if interactive {
+				log.SetOutput(os.Stderr)
+			}
+		})
+	}
+	defer cleanupInteractive()
+
+	if interactive {
+		if state, rawErr := term.MakeRaw(os.Stdin.Fd()); rawErr == nil {
+			rawState = state
+			log.SetOutput(newLiveWindow(liveWindowSize))
+			go readSyncKeys(os.Stdin, cancel, &detachRequested)
+		}
+	}
 
 	// Remote file agent: register this device with the storage API. When
 	// remoteControl is enabled, the allowed roots are also exposed so the same
@@ -1385,7 +1434,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 	// Initial full reconciliation (pulls everything, pushes local-only files).
 	if err := eng.reconcileAll(); err != nil {
 		if errors.Is(err, errSessionExpired) {
-			return err
+			return false, err
 		}
 		log.Printf("initial sync error: %v", err)
 	}
@@ -1396,7 +1445,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		// Typically EMFILE when the system's inotify instance limit
 		// (fs.inotify.max_user_instances) is exhausted; keep the surfaced
 		// message vague since it lands in the user's console.
-		return errors.New("could not create a filesystem watcher")
+		return false, errors.New("could not create a filesystem watcher")
 	}
 	defer watcher.Close()
 	eng.addWatchesRecursive(watcher)
@@ -1500,8 +1549,16 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 
 	<-ctx.Done()
 	eng.saveState()
-	eng.printSummary()
-	return nil
+	// Restore the terminal and log output before printing the summary (or,
+	// on detach, before runStorageSync's "Detaching..." message), rather than
+	// leaving it to the deferred call below: raw mode disables output
+	// post-processing, so anything printed with a plain "\n" while it's still
+	// active renders as a staircase instead of ordinary lines.
+	cleanupInteractive()
+	if !detachRequested.Load() {
+		eng.printSummary()
+	}
+	return detachRequested.Load(), nil
 }
 
 // ensureStorageSyncFolder returns the configured sync folder, prompting the user

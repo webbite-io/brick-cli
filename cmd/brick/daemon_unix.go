@@ -12,6 +12,11 @@ import (
 	"syscall"
 )
 
+// daemonSupported reports whether this platform can run brick as a detached
+// background daemon (see runAsDaemon); used to decide whether the
+// interactive sync banner advertises the 'D' detach shortcut at all.
+const daemonSupported = true
+
 // daemonLogPath returns the file the detached daemon child's stdout/stderr
 // are redirected to, since it no longer has a controlling terminal.
 func daemonLogPath() (string, error) {
@@ -221,7 +226,10 @@ func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool,
 		conflictMode: conflictMode,
 		isFirstSetup: isFirstSetup,
 	}
-	return runSyncLoop(setup, remoteControl, noControlAPI, true)
+	// background is true here, so runSyncLoop never enables interactive mode
+	// and detach (its bool return) is always false.
+	_, err = runSyncLoop(setup, remoteControl, noControlAPI, true)
+	return err
 }
 
 // relaunchDaemon starts a fresh detached daemon reusing the remoteControl and
