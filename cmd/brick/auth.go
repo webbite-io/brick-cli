@@ -289,7 +289,7 @@ func runLogin(apiURL string) error {
 	if err != nil {
 		return err
 	}
-	cfg.AccountID = accountID
+	cfg.ActiveAccountID = accountID
 
 	if err := saveConfig(cfg); err != nil {
 		return err
@@ -579,8 +579,12 @@ func authedPost(apiURL, path, accessToken string, body []byte, cfg *Config) (*ht
 	return resp, nil
 }
 
-// runSwitchAccounts lists the user's accounts and lets them pick one to store as active.
-func runSwitchAccounts(apiURL string) error {
+// runSwitchAccounts lists the user's accounts and lets them pick one to store
+// as active. If the picked account has never been synced before, it runs the
+// same sync-folder/scope onboarding as a brand-new setup. Finally, if a brick
+// daemon is currently running, it's stopped and (if it was a background
+// daemon) relaunched so it picks up the new account without a manual restart.
+func runSwitchAccounts(apiURL, storageURL string) error {
 	cfg, err := ensureAuthenticated(apiURL)
 	if err != nil {
 		return err
@@ -631,13 +635,46 @@ func runSwitchAccounts(apiURL string) error {
 			continue
 		}
 		selected := payload.Accounts[choice-1]
-		cfg.AccountID = selected.ID
+		isNewAccount := cfg.Accounts[selected.ID] == nil
+		cfg.ActiveAccountID = selected.ID
 		if err := saveConfig(cfg); err != nil {
 			return err
 		}
 		fmt.Printf("Active account set to: %s\n", selected.Name)
-		return nil
+
+		if isNewAccount {
+			if err := onboardNewAccount(apiURL, storageURL, cfg); err != nil {
+				return err
+			}
+		}
+
+		return restartDaemonIfRunning(apiURL, storageURL)
 	}
+}
+
+// onboardNewAccount runs the same sync-folder and sync-scope onboarding a
+// brand-new setup goes through, for an account picked via --switch-accounts
+// that has never been synced on this device before.
+func onboardNewAccount(apiURL, storageURL string, cfg *Config) error {
+	fmt.Println("\nThis account hasn't been synced on this device before — let's set it up.")
+
+	folder, _, err := ensureStorageSyncFolder(cfg)
+	if err != nil {
+		return err
+	}
+
+	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
+	root, err := sc.resolveRoot()
+	if err != nil {
+		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
+	}
+
+	if err := runSyncScopeOnboarding(sc, root.ID, cfg); err != nil {
+		return err
+	}
+
+	fmt.Printf("Now, we're ready. Brick will sync %s the next time it runs.\n", folder)
+	return nil
 }
 
 // runWhoami prints the authenticated user's name, email, and active account.
@@ -696,8 +733,8 @@ func runWhoami(apiURL string) error {
 
 	// Fetch account name if an account is selected.
 	var accountName string
-	if cfg.AccountID != "" {
-		acctResp, acctErr := authedGet(apiURL, "/v1/accounts/"+cfg.AccountID, cfg.AccessToken, cfg)
+	if cfg.ActiveAccountID != "" {
+		acctResp, acctErr := authedGet(apiURL, "/v1/accounts/"+cfg.ActiveAccountID, cfg.AccessToken, cfg)
 		if acctErr == nil {
 			defer acctResp.Body.Close()
 			if acctResp.StatusCode == http.StatusOK {

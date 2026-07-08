@@ -29,7 +29,7 @@ func daemonLogPath() (string, error) {
 // re-exec itself as a detached background process to perform the actual
 // sync, then return control to the caller's shell.
 func runAsDaemon(apiURL, storageURL string, remoteControl, noControlAPI bool) error {
-	pid, logPath, _, err := startDaemonProcess(apiURL, storageURL, remoteControl, noControlAPI)
+	pid, logPath, _, err := startDaemonProcess(apiURL, storageURL, remoteControl, noControlAPI, filterDaemonArgs(os.Args[1:]))
 	if err != nil {
 		if errors.Is(err, errInstanceLocked) {
 			return errors.New("brick is already running for this user")
@@ -59,16 +59,17 @@ func runAsDaemonJSON(apiURL, storageURL string, remoteControl, noControlAPI bool
 		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "brick is not logged in; run 'brick --login' first"})
 		return
 	}
-	if cfg.AccountID == "" {
+	if cfg.ActiveAccountID == "" {
 		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "no active account selected; run 'brick --switch-accounts' first"})
 		return
 	}
-	if strings.TrimSpace(cfg.StorageSyncFolder) == "" {
+	ac := cfg.activeAccount()
+	if ac == nil || strings.TrimSpace(ac.StorageSyncFolder) == "" {
 		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "no sync folder configured; run 'brick' interactively first to complete setup"})
 		return
 	}
 
-	pid, logPath, folder, err := startDaemonProcess(apiURL, storageURL, remoteControl, noControlAPI)
+	pid, logPath, folder, err := startDaemonProcess(apiURL, storageURL, remoteControl, noControlAPI, filterDaemonArgs(os.Args[1:]))
 	if err != nil {
 		if errors.Is(err, errInstanceLocked) {
 			emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "already_running", Message: "brick is already running for this user"})
@@ -89,7 +90,12 @@ func runAsDaemonJSON(apiURL, storageURL string, remoteControl, noControlAPI bool
 // The instance lock is acquired here and handed to the detached child via
 // ExtraFiles (inherited as fd 3) rather than released and re-acquired, so no
 // other brick invocation can slip in and grab it during the handoff.
-func startDaemonProcess(apiURL, storageURL string, remoteControl, noControlAPI bool) (pid int, logPath, folder string, err error) {
+//
+// cliArgs is the argument list the detached child re-execs itself with (see
+// filterDaemonArgs); callers starting a daemon from the current process's own
+// invocation pass filterDaemonArgs(os.Args[1:]), while relaunchDaemon builds
+// an explicit list from previously persisted flags instead.
+func startDaemonProcess(apiURL, storageURL string, remoteControl, noControlAPI bool, cliArgs []string) (pid int, logPath, folder string, err error) {
 	lockPath, err := instanceLockPath()
 	if err != nil {
 		return 0, "", "", err
@@ -123,7 +129,7 @@ func startDaemonProcess(apiURL, storageURL string, remoteControl, noControlAPI b
 	}
 	defer logFile.Close()
 
-	cmd := exec.Command(execPath, filterDaemonArgs(os.Args[1:])...)
+	cmd := exec.Command(execPath, cliArgs...)
 	cmd.Stdin = nil
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -197,11 +203,11 @@ func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool,
 	if err != nil {
 		return err
 	}
-	if cfg.AccountID == "" {
+	if cfg.ActiveAccountID == "" {
 		return errors.New("no active account selected; run 'brick --switch-accounts' first")
 	}
 
-	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.AccountID, cfg: cfg}
+	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
 	root, err := sc.resolveRoot()
 	if err != nil {
 		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
@@ -215,5 +221,30 @@ func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool,
 		conflictMode: conflictMode,
 		isFirstSetup: isFirstSetup,
 	}
-	return runSyncLoop(setup, remoteControl, noControlAPI)
+	return runSyncLoop(setup, remoteControl, noControlAPI, true)
+}
+
+// relaunchDaemon starts a fresh detached daemon reusing the remoteControl and
+// agentRoots flags a previous instance was running with, used by
+// restartDaemonIfRunning after 'brick --switch-accounts' stops a background
+// daemon so syncing resumes automatically under the new account.
+func relaunchDaemon(apiURL, storageURL string, remoteControl bool, agentRoots []string) error {
+	args := []string{"--no-upgrade-check"}
+	if remoteControl {
+		args = append(args, "-r")
+	}
+	for _, root := range agentRoots {
+		args = append(args, "--agent-root", root)
+	}
+
+	pid, logPath, _, err := startDaemonProcess(apiURL, storageURL, remoteControl, false, args)
+	if err != nil {
+		if errors.Is(err, errInstanceLocked) {
+			return errors.New("brick is already running for this user")
+		}
+		return err
+	}
+	fmt.Printf("brick is syncing in the background again (pid %d).\n", pid)
+	fmt.Printf("Logs: %s\n", logPath)
+	return nil
 }

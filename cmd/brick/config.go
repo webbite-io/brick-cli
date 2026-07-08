@@ -37,20 +37,60 @@ type Config struct {
 	AccessToken  string `yaml:"accessToken,omitempty"`
 	RefreshToken string `yaml:"refreshToken,omitempty"`
 	IDToken      string `yaml:"idToken,omitempty"`
-	AccountID    string `yaml:"accountId,omitempty"`
 
-	// Storage sync
+	// ActiveAccountID is the account currently in effect; it always keys into
+	// Accounts. Switched via 'brick --switch-accounts'.
+	ActiveAccountID string `yaml:"activeAccountId,omitempty"`
+
+	// Accounts holds one entry per account the user has ever synced, keyed by
+	// account ID, so each remembers its own sync folder/scope independently of
+	// which account is currently active.
+	Accounts map[string]*AccountConfig `yaml:"accounts,omitempty"`
+
+	// Remote file agent: additional directories that -r/--remote-control
+	// exposes to remote clients attached via the storage API. Global rather
+	// than per-account: which extra directories a device shares isn't tied to
+	// any one Brick account.
+	AgentRoots []string `yaml:"agentRoots,omitempty"`
+}
+
+// AccountConfig holds the per-account settings for one entry in Config.Accounts.
+type AccountConfig struct {
 	StorageSyncFolder string `yaml:"storageSyncFolder,omitempty"`
 
-	// ExcludeDirs lists folder paths, relative to storageSyncFolder and
+	// ExcludeDirs lists folder paths, relative to StorageSyncFolder and
 	// slash-separated (e.g. "folder/subfolder"), whose files are never
 	// uploaded or downloaded. Changes under them are still detected and
 	// logged, just not synced.
 	ExcludeDirs []string `yaml:"excludeDirs,omitempty"`
+}
 
-	// Remote file agent: additional directories (beyond the sync folder) that
-	// -r/--remote-control exposes to remote clients attached via the storage API.
-	AgentRoots []string `yaml:"agentRoots,omitempty"`
+// activeAccount returns the AccountConfig for cfg.ActiveAccountID, or nil if
+// there is no active account or no entry for it yet.
+func (c *Config) activeAccount() *AccountConfig {
+	if c.ActiveAccountID == "" {
+		return nil
+	}
+	return c.Accounts[c.ActiveAccountID]
+}
+
+// ensureActiveAccount returns the AccountConfig for cfg.ActiveAccountID,
+// creating an empty entry (and the Accounts map itself, if needed) when one
+// doesn't exist yet. Panics if ActiveAccountID is unset, since callers are
+// expected to have one selected (e.g. via --switch-accounts) beforehand.
+func (c *Config) ensureActiveAccount() *AccountConfig {
+	if c.ActiveAccountID == "" {
+		panic("ensureActiveAccount called with no active account set")
+	}
+	if c.Accounts == nil {
+		c.Accounts = map[string]*AccountConfig{}
+	}
+	ac, ok := c.Accounts[c.ActiveAccountID]
+	if !ok {
+		ac = &AccountConfig{}
+		c.Accounts[c.ActiveAccountID] = ac
+	}
+	return ac
 }
 
 // configPath returns the absolute path to ~/.config/brick/config.yaml.

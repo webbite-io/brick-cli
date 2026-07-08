@@ -34,7 +34,7 @@ func newTestControlServer(t *testing.T) (*controlServer, *syncEngine, func()) {
 		}
 	}
 
-	cs, err := startControlServer(eng, cancel, notify)
+	cs, err := startControlServer(eng, cancel, notify, false, false, nil)
 	if err != nil {
 		t.Fatalf("startControlServer: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestControlServerQuitCancelsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	notify := func() {}
 
-	cs, err := startControlServer(eng, cancel, notify)
+	cs, err := startControlServer(eng, cancel, notify, false, false, nil)
 	if err != nil {
 		t.Fatalf("startControlServer: %v", err)
 	}

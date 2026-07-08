@@ -381,19 +381,21 @@ type SyncState struct {
 	Folders map[string]bool `json:"folders"`
 }
 
-func syncStatePath(folder string) (string, error) {
+// syncStatePath returns the state file for one account, keyed by its account
+// ID (a UUID) rather than the sync folder, so each account keeps its own
+// synced-state bookkeeping even if two accounts share the same local folder.
+func syncStatePath(accountID string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	h := sha256.Sum256([]byte(folder))
-	name := fmt.Sprintf("sync-state-%s.json", hex.EncodeToString(h[:8]))
+	name := fmt.Sprintf("sync-state-%s.json", accountID)
 	return filepath.Join(home, ".config", "brick", name), nil
 }
 
-func loadSyncState(folder string) *SyncState {
+func loadSyncState(accountID, folder string) *SyncState {
 	st := &SyncState{Folder: folder, Entries: map[string]SyncEntry{}, Folders: map[string]bool{}}
-	path, err := syncStatePath(folder)
+	path, err := syncStatePath(accountID)
 	if err != nil {
 		return st
 	}
@@ -418,9 +420,10 @@ func loadSyncState(folder string) *SyncState {
 // --- Sync engine ---
 
 type syncEngine struct {
-	sc     *storageClient
-	folder string
-	rootID string
+	sc        *storageClient
+	folder    string
+	accountID string
+	rootID    string
 
 	// excludeDirs are the configured excludeDirs entries (slash-separated,
 	// relative to folder); files under them are never uploaded or downloaded.
@@ -1196,7 +1199,7 @@ func (e *syncEngine) saveState() {
 }
 
 func (e *syncEngine) saveStateLocked() {
-	path, err := syncStatePath(e.folder)
+	path, err := syncStatePath(e.accountID)
 	if err != nil {
 		return
 	}
@@ -1250,17 +1253,18 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.AccountID == "" {
+	if cfg.ActiveAccountID == "" {
 		return nil, errors.New("no active account selected; run 'brick --switch-accounts' first")
 	}
 
-	isFirstSetup := strings.TrimSpace(cfg.StorageSyncFolder) == ""
+	ac := cfg.activeAccount()
+	isFirstSetup := ac == nil || strings.TrimSpace(ac.StorageSyncFolder) == ""
 	folder, conflictMode, err := ensureStorageSyncFolder(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.AccountID, cfg: cfg}
+	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
 	root, err := sc.resolveRoot()
 	if err != nil {
 		return nil, fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
@@ -1312,24 +1316,29 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 	if err != nil {
 		return err
 	}
-	return runSyncLoop(setup, remoteControl, noControlAPI)
+	return runSyncLoop(setup, remoteControl, noControlAPI, false)
 }
 
 // runSyncLoop builds the sync engine from setup and runs it — the initial
 // full reconciliation, then the filesystem watcher and periodic poll — until
 // interrupted (Ctrl+C/SIGTERM in the foreground case; SIGTERM when stopping a
-// detached daemon).
-func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI bool) error {
+// detached daemon). background is true when this is the detached daemon
+// child (as opposed to a foreground run), and is recorded in the control
+// discovery file so a later 'brick --switch-accounts' knows whether it's
+// safe to relaunch a replacement daemon after stopping this one.
+func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool) error {
 	cfg, sc, folder := setup.cfg, setup.sc, setup.folder
+	ac := cfg.ensureActiveAccount()
 
 	eng := &syncEngine{
 		sc:              sc,
 		folder:          folder,
+		accountID:       cfg.ActiveAccountID,
 		rootID:          setup.rootID,
-		excludeDirs:     cfg.ExcludeDirs,
+		excludeDirs:     ac.ExcludeDirs,
 		firstSync:       setup.isFirstSetup,
 		conflictMode:    setup.conflictMode,
-		state:           loadSyncState(folder),
+		state:           loadSyncState(cfg.ActiveAccountID, folder),
 		recentlyWritten: map[string]time.Time{},
 	}
 	eng.setState("starting")
@@ -1351,7 +1360,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI bool) error {
 	// user can browse/list/transfer files remotely; otherwise the storage API is
 	// refused if it tries to call that functionality. Runs alongside sync;
 	// failures here are non-fatal to syncing.
-	agentRoots := resolveAgentRoots(cfg, folder)
+	agentRoots := resolveAgentRoots(cfg)
 	agentSecret := newAgentSecret()
 	if _, agentLn, aerr := startAgentServer(agentRoots, agentSecret, sc, remoteControl); aerr != nil {
 		log.Printf("could not start remote file agent: %v", aerr)
@@ -1398,7 +1407,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI bool) error {
 	// terminal this process is attached to. Loopback-only (unix domain
 	// socket), token-gated; see controlapi.go for the full protocol.
 	if !noControlAPI {
-		if cs, csErr := startControlServer(eng, cancel, notify); csErr != nil {
+		if cs, csErr := startControlServer(eng, cancel, notify, background, remoteControl, agentRootsFlag); csErr != nil {
 			log.Printf("could not start control API: %v", csErr)
 		} else {
 			defer cs.Close()
@@ -1493,7 +1502,8 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI bool) error {
 // empty otherwise; it reports how pre-existing local files that already have a
 // remote counterpart should be reconciled during the very first sync.
 func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, err error) {
-	folder = strings.TrimSpace(cfg.StorageSyncFolder)
+	ac := cfg.ensureActiveAccount()
+	folder = strings.TrimSpace(ac.StorageSyncFolder)
 	if folder == "" {
 		folder, conflictMode, err = promptForSyncFolder()
 		if err != nil {
@@ -1513,8 +1523,8 @@ func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, e
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return "", "", fmt.Errorf("could not create sync folder: %w", err)
 	}
-	if cfg.StorageSyncFolder != abs {
-		cfg.StorageSyncFolder = abs
+	if ac.StorageSyncFolder != abs {
+		ac.StorageSyncFolder = abs
 		if err := saveConfig(cfg); err != nil {
 			return "", "", err
 		}
@@ -1525,8 +1535,8 @@ func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, e
 
 // runSyncScopeOnboarding runs the final onboarding step: if the Brick account
 // has any top-level folders, it asks whether to sync everything or only a
-// subset, writing the folders the user picks to exclude into cfg.ExcludeDirs.
-// A no-op if the account has no folders yet.
+// subset, writing the folders the user picks to exclude into the active
+// account's ExcludeDirs. A no-op if the account has no folders yet.
 func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error {
 	topFolders, totalSize, err := sc.folderSummary(rootID)
 	if err != nil {
@@ -1573,7 +1583,7 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error
 		return err
 	}
 
-	cfg.ExcludeDirs = excludeDirs
+	cfg.ensureActiveAccount().ExcludeDirs = excludeDirs
 	return saveConfig(cfg)
 }
 

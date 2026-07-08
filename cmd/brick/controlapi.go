@@ -38,6 +38,18 @@ type controlDiscovery struct {
 	Address         string    `json:"address"`
 	Token           string    `json:"token"`
 	StartedAt       time.Time `json:"startedAt"`
+
+	// Background is true when this process is a detached daemon (started via
+	// -d/--daemon) rather than a foreground run. Only background instances
+	// are safe to relaunch unattended after 'brick --switch-accounts' stops
+	// them — a foreground run is attached to someone's terminal and is left
+	// stopped instead.
+	Background bool `json:"background"`
+	// RemoteControl and AgentRoots mirror the flags this instance was
+	// started with, so a later restart (see restartDaemonIfRunning) can
+	// relaunch it identically.
+	RemoteControl bool     `json:"remoteControl"`
+	AgentRoots    []string `json:"agentRoots,omitempty"`
 }
 
 // controlRuntimeDir returns the per-user directory that holds the control
@@ -104,7 +116,7 @@ type controlServer struct {
 // called to trigger the same graceful shutdown path SIGINT uses; notify is
 // called to wake the debounced reconcile worker immediately (used by
 // /v1/resume so resuming doesn't wait for the next watcher event or poll).
-func startControlServer(eng *syncEngine, cancel context.CancelFunc, notify func()) (*controlServer, error) {
+func startControlServer(eng *syncEngine, cancel context.CancelFunc, notify func(), background, remoteControl bool, agentRoots []string) (*controlServer, error) {
 	dir, err := controlRuntimeDir()
 	if err != nil {
 		return nil, err
@@ -145,6 +157,9 @@ func startControlServer(eng *syncEngine, cancel context.CancelFunc, notify func(
 		Address:         socketPath,
 		Token:           token,
 		StartedAt:       time.Now().UTC(),
+		Background:      background,
+		RemoteControl:   remoteControl,
+		AgentRoots:      agentRoots,
 	}
 	discJSON, err := json.MarshalIndent(disc, "", "  ")
 	if err != nil {
@@ -208,7 +223,7 @@ func (cs *controlServer) handler(eng *syncEngine, cancel context.CancelFunc, not
 	mux.HandleFunc("/v1/account", authed(func(w http.ResponseWriter, r *http.Request) {
 		accountID, clientID := "", ""
 		if eng.sc != nil && eng.sc.cfg != nil {
-			accountID = eng.sc.cfg.AccountID
+			accountID = eng.sc.cfg.ActiveAccountID
 			clientID = eng.sc.cfg.ClientID
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"accountId": accountID, "clientId": clientID})
@@ -254,4 +269,87 @@ func parsePositiveInt(s string) (int, error) {
 		return 0, errors.New("must be positive")
 	}
 	return n, nil
+}
+
+// controlClientFor returns an http.Client that dials the control socket at
+// address regardless of the URL host/scheme passed to it.
+func controlClientFor(address string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", address)
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+}
+
+// restartDaemonIfRunning is called after 'brick --switch-accounts' picks a
+// new account. It looks for a currently running brick instance via the
+// control discovery file, and if one is found, stops it gracefully (so it
+// isn't left syncing under the just-replaced account) and, if it was a
+// background daemon, relaunches it so syncing resumes under the new account
+// without the user needing to do it by hand. A foreground instance is left
+// stopped, since it's attached to someone's terminal and can't be relaunched
+// unattended. If no instance is running, this is a no-op.
+func restartDaemonIfRunning(apiURL, storageURL string) error {
+	discPath, err := controlDiscoveryPath()
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(discPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("could not read control discovery file: %w", err)
+	}
+	var disc controlDiscovery
+	if err := json.Unmarshal(data, &disc); err != nil {
+		// Corrupt/foreign file — nothing reliable to act on.
+		return nil
+	}
+
+	client := controlClientFor(disc.Address)
+
+	healthReq, err := http.NewRequest(http.MethodGet, "http://unix/v1/health", nil)
+	if err != nil {
+		return err
+	}
+	healthResp, err := client.Do(healthReq)
+	if err != nil {
+		// Stale discovery file left behind by a process that didn't exit
+		// cleanly (e.g. a crash or kill -9) — nothing is actually running.
+		_ = os.Remove(discPath)
+		return nil
+	}
+	healthResp.Body.Close()
+
+	fmt.Println("\nStopping the running brick instance so it picks up the new account...")
+	quitReq, err := http.NewRequest(http.MethodPost, "http://unix/v1/quit", nil)
+	if err != nil {
+		return err
+	}
+	quitReq.Header.Set(controlSecretHeader, disc.Token)
+	quitResp, err := client.Do(quitReq)
+	if err != nil {
+		return fmt.Errorf("could not stop the running brick instance: %w", err)
+	}
+	quitResp.Body.Close()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(discPath); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	if !disc.Background {
+		fmt.Println("Stopped. It was running in the foreground — restart it manually to resume syncing.")
+		return nil
+	}
+
+	fmt.Println("Restarting brick in the background with the new account...")
+	return relaunchDaemon(apiURL, storageURL, disc.RemoteControl, disc.AgentRoots)
 }

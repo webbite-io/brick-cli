@@ -685,7 +685,7 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 	q.Set("os", runtime.GOOS)
 	q.Set("arch", runtime.GOARCH)
 	q.Set("remoteControl", strconv.FormatBool(remoteControl))
-	muxURL := toWSURL(storageURL) + "/v1/accounts/" + url.PathEscape(cfg.AccountID) + "/agent/connect?" + q.Encode()
+	muxURL := toWSURL(storageURL) + "/v1/accounts/" + url.PathEscape(cfg.ActiveAccountID) + "/agent/connect?" + q.Encode()
 
 	presented := currentAccessToken(cfg)
 	hdr := http.Header{}
@@ -792,15 +792,17 @@ func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, c
 // deregisterAgent best-effort removes this client from the storage API on clean
 // shutdown. An unclean exit is handled server-side when the connection drops.
 func deregisterAgent(storageURL, apiURL string, cfg *Config) {
-	path := "/v1/accounts/" + cfg.AccountID + "/clients/" + cfg.ClientID
+	path := "/v1/accounts/" + cfg.ActiveAccountID + "/clients/" + cfg.ClientID
 	if resp, err := authedRequest(storageURL, apiURL, "DELETE", path, nil, nil, cfg); err == nil {
 		resp.Body.Close()
 	}
 }
 
 // resolveAgentRoots returns the absolute, de-duplicated set of roots the agent
-// may access: the CLI/config roots plus the sync folder (always included).
-func resolveAgentRoots(cfg *Config, syncFolder string) []string {
+// may access: the --agent-root CLI flags plus cfg.AgentRoots. The sync folder
+// itself is not implicitly included — only directories explicitly configured
+// for remote control are exposed.
+func resolveAgentRoots(cfg *Config) []string {
 	raw := append([]string{}, agentRootsFlag...)
 	raw = append(raw, cfg.AgentRoots...)
 
@@ -825,7 +827,6 @@ func resolveAgentRoots(cfg *Config, syncFolder string) []string {
 	for _, r := range raw {
 		add(r)
 	}
-	add(syncFolder)
 	return out
 }
 

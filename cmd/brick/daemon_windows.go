@@ -23,3 +23,12 @@ func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool,
 func runAsDaemonJSON(apiURL, storageURL string, remoteControl, noControlAPI bool) {
 	emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "unsupported_platform", Message: errDaemonUnsupported.Error()})
 }
+
+// relaunchDaemon mirrors runAsDaemon's Windows unsupported-ness: since -d is
+// never available here, a control discovery file can never report
+// Background: true on this platform, so this should be unreachable in
+// practice — but restartDaemonIfRunning is cross-platform code, so it needs
+// a symbol to call.
+func relaunchDaemon(apiURL, storageURL string, remoteControl bool, agentRoots []string) error {
+	return errDaemonUnsupported
+}

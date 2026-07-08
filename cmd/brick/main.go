@@ -97,7 +97,8 @@ func main() {
 	// Switch accounts
 	if switchAccounts {
 		apiURL := resolveAPIURL()
-		if err := runWithAutoRelogin(apiURL, func() error { return runSwitchAccounts(apiURL) }); err != nil {
+		storageURL := resolveStorageAPIURL()
+		if err := runWithAutoRelogin(apiURL, func() error { return runSwitchAccounts(apiURL, storageURL) }); err != nil {
 			log.Fatalf("Switch accounts failed: %v", err)
 		}
 		os.Exit(0)
