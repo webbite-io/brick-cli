@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -1605,7 +1606,7 @@ func promptForSyncFolder() (folder string, conflictMode string, err error) {
 	}
 	defaultFolder := filepath.Join(home, "Brick")
 
-	fmt.Println("\nYou have no sync folder configured (storageSyncFolder).")
+	fmt.Println("\n\nYou have no sync folder configured (storageSyncFolder).")
 	fmt.Println()
 
 	const (
@@ -1667,17 +1668,10 @@ func promptForSyncFolder() (folder string, conflictMode string, err error) {
 // without needing -r; declining here just means -r can still be used to
 // force it on for a single invocation later.
 func promptForRemoteControl(cfg *Config) error {
-	enable := true
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Do you want to remotely access files on this device via Brick?").
-			Affirmative("Yes").
-			Negative("No").
-			Value(&enable),
-	)).Run(); err != nil {
-		return err
-	}
-	if !enable {
+	fmt.Print("\nDo you want to remotely access files on this device via Brick? (Y/n): ")
+	reader := bufio.NewReader(os.Stdin)
+	response, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(strings.ToLower(response)) == "n" {
 		return nil
 	}
 
@@ -1740,7 +1734,7 @@ func promptForRemoteControl(cfg *Config) error {
 		return err
 	}
 
-	fmt.Println("\nRemote file access is now ON by default. Disable via remoteControl flag in config file.\n")
+	fmt.Println("\nRemote file access is now ON by default. Disable via remoteControl flag in config file.")
 	return nil
 }
 

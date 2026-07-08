@@ -450,6 +450,11 @@ func refreshAccessToken(apiURL, refreshToken, clientID string) (accessToken, new
 	return tokenResp.AccessToken, tokenResp.RefreshToken, tokenResp.IDToken, nil
 }
 
+// errLoginDeclined signals that the user was prompted to log in on first run
+// and said no — a deliberate exit, not a failure, so callers should terminate
+// quietly instead of reporting an error.
+var errLoginDeclined = errors.New("login declined")
+
 // ensureAuthenticated ensures the config has a valid access token, refreshing or
 // prompting login as needed. Returns the (possibly updated) config.
 func ensureAuthenticated(apiURL string) (*Config, error) {
@@ -460,11 +465,11 @@ func ensureAuthenticated(apiURL string) (*Config, error) {
 
 	// No credentials at all — ask user to log in.
 	if cfg.AccessToken == "" && cfg.RefreshToken == "" {
-		fmt.Print("You are not logged in. Do you want to log in? (Y/n): ")
+		fmt.Print("Do you want to log in to get started? (Y/n): ")
 		reader := bufio.NewReader(os.Stdin)
 		response, err := reader.ReadString('\n')
 		if err != nil || strings.TrimSpace(strings.ToLower(response)) == "n" {
-			return nil, errors.New("login required")
+			return nil, errLoginDeclined
 		}
 		if err := runLogin(apiURL); err != nil {
 			return nil, err

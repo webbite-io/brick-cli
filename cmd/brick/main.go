@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,6 +36,7 @@ func main() {
 		loginMode      bool
 		switchAccounts bool
 		whoami         bool
+		restart        bool
 		remoteControl  bool
 		noControlAPI   bool
 		daemon         bool
@@ -49,6 +52,7 @@ func main() {
 	flag.BoolVar(&loginMode, "login", false, "")
 	flag.BoolVar(&switchAccounts, "switch-accounts", false, "")
 	flag.BoolVar(&whoami, "whoami", false, "")
+	flag.BoolVar(&restart, "restart", false, "")
 	flag.BoolVar(&remoteControl, "r", false, "")
 	flag.BoolVar(&remoteControl, "remote-control", false, "")
 	flag.BoolVar(&noControlAPI, "no-control-api", false, "")
@@ -113,6 +117,19 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Restart: wipe local settings and sync folders, then fall through into
+	// the normal flow below so setup runs again as if this were a fresh
+	// install.
+	if restart {
+		proceed, err := runRestart()
+		if err != nil {
+			log.Fatalf("Restart failed: %v", err)
+		}
+		if !proceed {
+			os.Exit(0)
+		}
+	}
+
 	// Storage sync: the default action, requiring no CLI options. Skipped
 	// entirely under -d --json: checkForUpdates can print a prompt and read
 	// stdin, which would break the "exactly one JSON line on stdout" contract.
@@ -128,6 +145,9 @@ func main() {
 	if folder := os.Getenv(daemonFolderEnv); folder != "" {
 		isFirstSetup := os.Getenv(daemonFirstSetupEnv) == "1"
 		if err := runDaemonChild(apiURL, storageURL, remoteControl, noControlAPI, folder, os.Getenv(daemonConflictModeEnv), isFirstSetup); err != nil {
+			if errors.Is(err, errLoginDeclined) {
+				os.Exit(0)
+			}
 			log.Fatalf("Storage sync failed: %v", err)
 		}
 		os.Exit(0)
@@ -139,12 +159,18 @@ func main() {
 			return // unreachable: runAsDaemonJSON always exits the process itself
 		}
 		if err := runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI); err != nil {
+			if errors.Is(err, errLoginDeclined) {
+				os.Exit(0)
+			}
 			log.Fatalf("Failed to start daemon: %v", err)
 		}
 		os.Exit(0)
 	}
 
 	if err := runStorageSync(apiURL, storageURL, remoteControl, noControlAPI); err != nil {
+		if errors.Is(err, errLoginDeclined) {
+			os.Exit(0)
+		}
 		log.Fatalf("Storage sync failed: %v", err)
 	}
 }
@@ -368,4 +394,122 @@ func runUninstall() {
 	}
 
 	fmt.Println("\nUninstall complete.")
+}
+
+// runRestart clears brick's local settings so it can be configured from
+// scratch: it stops any running instance, offers to wipe each known
+// account's sync folder, then removes ~/.config/brick entirely. The bool
+// return is false if the user backed out at the initial confirmation, in
+// which case the caller should stop rather than fall through into setup.
+func runRestart() (bool, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Print("This will clear existing settings and configure Brick from scratch. Continue (Y/n): ")
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		return false, fmt.Errorf("could not read input: %w", err)
+	}
+	resp = strings.TrimSpace(strings.ToLower(resp))
+	if resp == "n" || resp == "no" {
+		fmt.Println("Restart cancelled.")
+		return false, nil
+	}
+
+	if _, err := stopRunningInstance("\nStopping the running brick instance..."); err != nil {
+		return false, err
+	}
+
+	cfg, err := loadOrCreateConfig()
+	if err != nil {
+		return false, err
+	}
+
+	accountIDs := make([]string, 0, len(cfg.Accounts))
+	for id := range cfg.Accounts {
+		accountIDs = append(accountIDs, id)
+	}
+	sort.Strings(accountIDs)
+
+	for _, id := range accountIDs {
+		folder := cfg.Accounts[id].StorageSyncFolder
+		if folder == "" {
+			continue
+		}
+		if _, statErr := os.Stat(folder); os.IsNotExist(statErr) {
+			continue
+		}
+
+		size, sizeErr := dirSize(folder)
+		if sizeErr != nil {
+			fmt.Printf("\033[31mCould not read %s: %v\033[0m\n", folder, sizeErr)
+			continue
+		}
+
+		fmt.Printf("\nDo you want to remove the files in sync folder %s (%s) (y/N): ", folder, humanSize(size))
+		resp, _ = reader.ReadString('\n')
+		resp = strings.TrimSpace(strings.ToLower(resp))
+		if resp != "y" && resp != "yes" {
+			continue
+		}
+		if rmErr := removeDirContents(folder); rmErr != nil {
+			fmt.Printf("\033[31mFailed to remove files in %s: %v\033[0m\n", folder, rmErr)
+			continue
+		}
+		fmt.Println("\033[32mFiles removed.\033[0m")
+
+		fmt.Printf("Do you want to remove the folder %s (y/N): ", folder)
+		resp, _ = reader.ReadString('\n')
+		resp = strings.TrimSpace(strings.ToLower(resp))
+		if resp == "y" || resp == "yes" {
+			if rmErr := os.Remove(folder); rmErr != nil {
+				fmt.Printf("\033[31mFailed to remove folder %s: %v\033[0m\n", folder, rmErr)
+			} else {
+				fmt.Println("\033[32mFolder removed.\033[0m")
+			}
+		}
+	}
+
+	cfgPath, err := configPath()
+	if err != nil {
+		return false, err
+	}
+	if err := os.RemoveAll(filepath.Dir(cfgPath)); err != nil {
+		return false, fmt.Errorf("could not remove config directory: %w", err)
+	}
+
+	fmt.Println("\nSettings cleared. Setting up Brick from scratch...")
+	return true, nil
+}
+
+// dirSize returns the total size in bytes of all regular files under dir.
+func dirSize(dir string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			info, infoErr := d.Info()
+			if infoErr != nil {
+				return infoErr
+			}
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
+}
+
+// removeDirContents removes every entry inside dir, leaving dir itself in place.
+func removeDirContents(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }

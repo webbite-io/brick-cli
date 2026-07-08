@@ -133,7 +133,8 @@ func loadOrCreateConfig() (*Config, error) {
 		return nil, err
 	}
 	if created {
-		fmt.Printf("Created default configuration file in ~/.config/brick/config.yaml\n")
+		fmt.Println("\n👋 Hello and welcome to Brick - storage for all your devices!\n")
+		fmt.Println("Created default configuration file in ~/.config/brick/config.yaml\n")
 	}
 	return cfg, nil
 }
@@ -222,6 +223,7 @@ func printHelp() {
 	fmt.Printf("      --login                 Log in via browser\n")
 	fmt.Printf("      --switch-accounts       Switch the active account\n")
 	fmt.Printf("      --whoami                Show logged-in user and account details\n")
+	fmt.Printf("      --restart               Clear existing settings and configure Brick from scratch\n")
 	fmt.Println("\nStorage Sync\n============")
 	fmt.Printf("  Running brick with no other options syncs storageSyncFolder with the Storage API and watches for changes\n")
 	fmt.Printf("  -d, --daemon                Detach into the background once logged in and the Storage API is reachable\n")

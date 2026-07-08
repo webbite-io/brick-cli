@@ -284,56 +284,60 @@ func controlClientFor(address string) *http.Client {
 	}
 }
 
-// restartDaemonIfRunning is called after 'brick --switch-accounts' picks a
-// new account. It looks for a currently running brick instance via the
-// control discovery file, and if one is found, stops it gracefully (so it
-// isn't left syncing under the just-replaced account) and, if it was a
-// background daemon, relaunches it so syncing resumes under the new account
-// without the user needing to do it by hand. A foreground instance is left
-// stopped, since it's attached to someone's terminal and can't be relaunched
-// unattended. If no instance is running, this is a no-op.
-func restartDaemonIfRunning(apiURL, storageURL string) error {
+// stoppedInstance describes a running brick instance that stopRunningInstance
+// found and stopped, so callers can decide whether/how to relaunch it.
+type stoppedInstance struct {
+	Background    bool
+	RemoteControl bool
+	AgentRoots    []string
+}
+
+// stopRunningInstance looks for a currently running brick instance via the
+// control discovery file, and if one is found, stops it gracefully via the
+// control API's /v1/quit endpoint. Returns nil, nil if no instance is
+// running (or the discovery file is stale/corrupt) — a no-op in that case.
+func stopRunningInstance(printPrefix string) (*stoppedInstance, error) {
 	discPath, err := controlDiscoveryPath()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data, err := os.ReadFile(discPath)
 	if os.IsNotExist(err) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("could not read control discovery file: %w", err)
+		return nil, fmt.Errorf("could not read control discovery file: %w", err)
 	}
 	var disc controlDiscovery
 	if err := json.Unmarshal(data, &disc); err != nil {
 		// Corrupt/foreign file — nothing reliable to act on.
-		return nil
+		return nil, nil
 	}
 
 	client := controlClientFor(disc.Address)
 
 	healthReq, err := http.NewRequest(http.MethodGet, "http://unix/v1/health", nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	healthResp, err := client.Do(healthReq)
 	if err != nil {
 		// Stale discovery file left behind by a process that didn't exit
 		// cleanly (e.g. a crash or kill -9) — nothing is actually running.
 		_ = os.Remove(discPath)
-		return nil
+		return nil, nil
 	}
 	healthResp.Body.Close()
 
-	fmt.Println("\nStopping the running brick instance so it picks up the new account...")
+	fmt.Println(printPrefix)
 	quitReq, err := http.NewRequest(http.MethodPost, "http://unix/v1/quit", nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	quitReq.Header.Set(controlSecretHeader, disc.Token)
 	quitResp, err := client.Do(quitReq)
 	if err != nil {
-		return fmt.Errorf("could not stop the running brick instance: %w", err)
+		return nil, fmt.Errorf("could not stop the running brick instance: %w", err)
 	}
 	quitResp.Body.Close()
 
@@ -345,11 +349,35 @@ func restartDaemonIfRunning(apiURL, storageURL string) error {
 		time.Sleep(150 * time.Millisecond)
 	}
 
-	if !disc.Background {
+	return &stoppedInstance{
+		Background:    disc.Background,
+		RemoteControl: disc.RemoteControl,
+		AgentRoots:    disc.AgentRoots,
+	}, nil
+}
+
+// restartDaemonIfRunning is called after 'brick --switch-accounts' picks a
+// new account. It looks for a currently running brick instance and, if one
+// is found, stops it gracefully (so it isn't left syncing under the
+// just-replaced account) and, if it was a background daemon, relaunches it
+// so syncing resumes under the new account without the user needing to do it
+// by hand. A foreground instance is left stopped, since it's attached to
+// someone's terminal and can't be relaunched unattended. If no instance is
+// running, this is a no-op.
+func restartDaemonIfRunning(apiURL, storageURL string) error {
+	stopped, err := stopRunningInstance("\nStopping the running brick instance so it picks up the new account...")
+	if err != nil {
+		return err
+	}
+	if stopped == nil {
+		return nil
+	}
+
+	if !stopped.Background {
 		fmt.Println("Stopped. It was running in the foreground — restart it manually to resume syncing.")
 		return nil
 	}
 
 	fmt.Println("Restarting brick in the background with the new account...")
-	return relaunchDaemon(apiURL, storageURL, disc.RemoteControl, disc.AgentRoots)
+	return relaunchDaemon(apiURL, storageURL, stopped.RemoteControl, stopped.AgentRoots)
 }
