@@ -1274,7 +1274,10 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 		if err := runSyncScopeOnboarding(sc, root.ID, cfg); err != nil {
 			return nil, err
 		}
-		fmt.Println("Now, we're ready. Brick will now sync your files...\n")
+		if err := promptForRemoteControl(cfg); err != nil {
+			return nil, err
+		}
+		fmt.Println("\nNow, we're ready. Brick will now sync your files...")
 	}
 
 	return &syncSetup{
@@ -1328,6 +1331,10 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 // safe to relaunch a replacement daemon after stopping this one.
 func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool) error {
 	cfg, sc, folder := setup.cfg, setup.sc, setup.folder
+	// cfg.RemoteControl, set during onboarding (see promptForRemoteControl),
+	// makes remote control the default without needing -r on every run; -r
+	// still forces it on for this invocation even if the config default is off.
+	remoteControl = remoteControl || cfg.RemoteControl
 	ac := cfg.ensureActiveAccount()
 
 	eng := &syncEngine{
@@ -1598,7 +1605,7 @@ func promptForSyncFolder() (folder string, conflictMode string, err error) {
 	}
 	defaultFolder := filepath.Join(home, "Brick")
 
-	fmt.Println("\n\nYou have no sync folder configured (storageSyncFolder).")
+	fmt.Println("\nYou have no sync folder configured (storageSyncFolder).")
 	fmt.Println()
 
 	const (
@@ -1651,6 +1658,90 @@ func promptForSyncFolder() (folder string, conflictMode string, err error) {
 		}
 	}
 	return abs, conflictMode, nil
+}
+
+// promptForRemoteControl asks, during first-time onboarding, whether to
+// enable remote file access (-r/--remote-control) by default and, if so,
+// which folder to expose as its root. The choice is persisted to
+// cfg.RemoteControl/cfg.AgentRoots so it takes effect on every future run
+// without needing -r; declining here just means -r can still be used to
+// force it on for a single invocation later.
+func promptForRemoteControl(cfg *Config) error {
+	enable := true
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Do you want to remotely access files on this device via Brick?").
+			Affirmative("Yes").
+			Negative("No").
+			Value(&enable),
+	)).Run(); err != nil {
+		return err
+	}
+	if !enable {
+		return nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("could not determine home directory: %w", err)
+	}
+
+	const (
+		optHome   = "home"
+		optCustom = "custom"
+	)
+	choice := optHome
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Which folder should be accessible remotely?").
+			Options(
+				huh.NewOption(fmt.Sprintf("Home folder (%s)", home), optHome),
+				huh.NewOption("Custom folder", optCustom),
+			).
+			Value(&choice),
+	)).Run(); err != nil {
+		return err
+	}
+
+	root := home
+	if choice == optCustom {
+		var picked string
+		if err := huh.NewForm(huh.NewGroup(
+			huh.NewFilePicker().
+				Title("Pick a folder to expose remotely").
+				CurrentDirectory("/").
+				DirAllowed(true).
+				FileAllowed(false).
+				Picking(true).
+				Value(&picked),
+		)).Run(); err != nil {
+			return err
+		}
+		root = picked
+	}
+
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+
+	cfg.RemoteControl = true
+	present := false
+	for _, r := range cfg.AgentRoots {
+		if r == abs {
+			present = true
+			break
+		}
+	}
+	if !present {
+		cfg.AgentRoots = append(cfg.AgentRoots, abs)
+	}
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
+
+	fmt.Println("\nRemote file access is now ON by default. Disable via remoteControl flag in config file.\n")
+	return nil
 }
 
 // promptConflictMode asks how to resolve files that already exist both

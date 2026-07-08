@@ -52,6 +52,12 @@ type Config struct {
 	// than per-account: which extra directories a device shares isn't tied to
 	// any one Brick account.
 	AgentRoots []string `yaml:"agentRoots,omitempty"`
+
+	// RemoteControl, when true, enables remote file access (equivalent to
+	// always passing -r/--remote-control) without needing the flag on every
+	// run. Set during first-time onboarding if the user opts in; -r still
+	// forces it on for a single invocation if the user declined here.
+	RemoteControl bool `yaml:"remoteControl,omitempty"`
 }
 
 // AccountConfig holds the per-account settings for one entry in Config.Accounts.
@@ -219,7 +225,7 @@ func printHelp() {
 	fmt.Println("\nStorage Sync\n============")
 	fmt.Printf("  Running brick with no other options syncs storageSyncFolder with the Storage API and watches for changes\n")
 	fmt.Printf("  -d, --daemon                Detach into the background once logged in and the Storage API is reachable\n")
-	fmt.Printf("  -r, --remote-control        Allow the Storage API to remotely list/browse/transfer files on this device\n")
+	fmt.Printf("  -r, --remote-control        Allow the Storage API to remotely list/browse/transfer files on this device (also enabled by default if remoteControl: true in config file)\n")
 	fmt.Printf("      --agent-root PATH       Additional directory to expose to remote clients when remote control is enabled (repeatable)\n")
 	fmt.Println("\nOther\n=====")
 	fmt.Printf("      --no-upgrade-check      Disable automatic upgrade check\n")

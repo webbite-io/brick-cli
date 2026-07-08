@@ -277,7 +277,7 @@ func runLogin(apiURL string) error {
 	if userInfo.GivenName != "" && userInfo.FamilyName != "" {
 		fmt.Printf("\nHello %s %s 👋\n", userInfo.GivenName, userInfo.FamilyName)
 	} else {
-		fmt.Println("\nLogin successful 🎉.\n")
+		fmt.Println("\nLogin successful 🎉.")
 	}
 
 	// Fetch accounts and pick one (prompting if there's more than one).
