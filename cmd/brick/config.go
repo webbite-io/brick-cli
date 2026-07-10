@@ -215,7 +215,7 @@ func resolveStorageAPIURL() string {
 }
 
 func printHelp() {
-	fmt.Printf("\n\033[38;5;208mRequestBite Brick CLI\033[0m ⚡ v%s\n\n", Version)
+	fmt.Printf("\n\033[38;5;208mWebbite Brick CLI\033[0m ⚡ v%s\n\n", Version)
 	fmt.Println("Usage:")
 	fmt.Printf("  brick [options]\n\n")
 	fmt.Println("Options:")

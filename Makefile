@@ -1,4 +1,4 @@
-# RequestBite brick Makefile
+# Webbite Brick Makefile
 # Cross-platform build automation for macOS, Linux, and Windows
 
 # ENV_FILE is only loaded when explicitly set (e.g. via `make build-dev` /
@@ -206,7 +206,7 @@ version:
 
 # Show help
 help:
-	@echo "$(COLOR_BOLD)RequestBite brick - Build System$(COLOR_RESET)"
+	@echo "$(COLOR_BOLD)Webbite Brick - Build System$(COLOR_RESET)"
 	@echo ""
 	@echo "$(COLOR_BOLD)Usage:$(COLOR_RESET)"
 	@echo "  make [target]"

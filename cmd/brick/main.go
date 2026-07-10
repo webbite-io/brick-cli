@@ -234,7 +234,7 @@ func checkForUpdates() {
 		return
 	}
 
-	fmt.Printf("\n\033[33mThere is a new version of RequestBite Brick CLI available.\033[0m\n")
+	fmt.Printf("\n\033[33mThere is a new version of Webbite Brick CLI available.\033[0m\n")
 	fmt.Printf("You're running v%s and the new version is v%s.\n\n", Version, remoteVersion)
 
 	if runtime.GOOS == "windows" {

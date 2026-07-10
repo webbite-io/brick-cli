@@ -1,11 +1,11 @@
 [![Release](https://github.com/requestbite/brick/actions/workflows/release.yml/badge.svg)](https://github.com/requestbite/brick/actions/workflows/release.yml)
 
-# RequestBite Brick CLI
+# Webbite Brick CLI
 
 ## About
 
-This repository hosts the RequestBite Brick CLI, the command-line client for
-[RequestBite][rb]'s Storage Sync feature. `brick` keeps a local folder in
+This repository hosts the Webbite Brick CLI, the command-line client for
+[Webbite][rb]'s Storage Sync feature. `brick` keeps a local folder in
 two-way sync with the Storage API: it uploads local-only files, downloads
 remote-only files, and propagates deletions in either direction — deleting a
 file or folder locally moves it to trash on the server, and a file or folder

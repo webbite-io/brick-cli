@@ -738,7 +738,7 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 		}
 	}()
 
-	log.Printf("Remote file agent connected to storage API (clientId=%s)", cfg.ClientID)
+	log.Printf("Remote file agent connected to Brick (clientId=%s)", cfg.ClientID)
 
 	streamCh := make(chan net.Conn)
 	errCh := make(chan error, 1)
