@@ -34,6 +34,20 @@ import (
 // loopback port cannot use it.
 const agentSecretHeader = "X-RBite-Agent-Secret"
 
+// yamuxConfig returns the yamux configuration used for the agent tunnel. It
+// starts from yamux's defaults but raises ConnectionWriteTimeout: the default
+// (10s) is the window yamux's own internal keepalive ping has to get a pong
+// back before it kills the whole session with "keepalive timeout" — too tight
+// for a public-internet WAN link, especially since we already run our own
+// WebSocket-level ping (see wsConn.ping and the storage API's equivalent) to
+// keep idle proxies alive. A brief latency spike shouldn't tear down the
+// tunnel and force a full reconnect.
+func yamuxConfig() *yamux.Config {
+	cfg := yamux.DefaultConfig()
+	cfg.ConnectionWriteTimeout = 30 * time.Second
+	return cfg
+}
+
 // stringList is a repeatable / comma-separated string flag (e.g. --agent-root).
 type stringList []string
 
@@ -717,7 +731,7 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 	defer ws.Close()
 
 	conn := newWSConn(ws)
-	session, err := yamux.Server(conn, nil)
+	session, err := yamux.Server(conn, yamuxConfig())
 	if err != nil {
 		return fmt.Errorf("yamux session failed: %w", err)
 	}

@@ -339,7 +339,17 @@ func authedRequest(reqBaseURL, refreshAPIURL, method, path string, body []byte, 
 	presented := currentAccessToken(cfg)
 	resp, err := doRequest(presented)
 	if err != nil {
-		return nil, err
+		// Transport-level errors (connection reset, EOF) are common on a
+		// pooled keep-alive connection that the server or an intermediate
+		// proxy closed while idle — the pool doesn't know it's dead until a
+		// request tries to use it. That's distinct from an HTTP-level auth
+		// failure below, so it doesn't need a token refresh, just a retry:
+		// the broken connection is evicted from the pool automatically and
+		// the retry opens a fresh one.
+		resp, err = doRequest(presented)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// The Storage API may report an expired token as 403 (it proxies token
 	// validation to the auth API and historically collapsed a 401 there into a
