@@ -29,18 +29,20 @@ func main() {
 	}
 
 	var (
-		showVersion    bool
-		showHelp       bool
-		noUpgradeCheck bool
-		uninstall      bool
-		loginMode      bool
-		switchAccounts bool
-		whoami         bool
-		restart        bool
-		remoteControl  bool
-		noControlAPI   bool
-		daemon         bool
-		daemonJSON     bool
+		showVersion       bool
+		showHelp          bool
+		noUpgradeCheck    bool
+		uninstall         bool
+		loginMode         bool
+		switchAccounts    bool
+		whoami            bool
+		restart           bool
+		remoteControl     bool
+		noControlAPI      bool
+		daemon            bool
+		daemonJSON        bool
+		selectiveSync     bool
+		listSelectiveSync bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "")
@@ -58,6 +60,9 @@ func main() {
 	flag.BoolVar(&noControlAPI, "no-control-api", false, "")
 	flag.BoolVar(&daemon, "d", false, "")
 	flag.BoolVar(&daemon, "daemon", false, "")
+	flag.BoolVar(&selectiveSync, "s", false, "")
+	flag.BoolVar(&selectiveSync, "selective-sync", false, "")
+	flag.BoolVar(&listSelectiveSync, "list-selective-sync", false, "")
 	// Undocumented: only used together with -d/--daemon, by the companion app
 	// that starts brick in daemon mode. See README for the JSON output shapes.
 	flag.BoolVar(&daemonJSON, "json", false, "")
@@ -113,6 +118,24 @@ func main() {
 		apiURL := resolveAPIURL()
 		if err := runWhoami(apiURL); err != nil {
 			log.Fatalf("whoami failed: %v", err)
+		}
+		os.Exit(0)
+	}
+
+	// Selective sync: update which folders are excluded from sync.
+	if selectiveSync {
+		apiURL := resolveAPIURL()
+		storageURL := resolveStorageAPIURL()
+		if err := runWithAutoRelogin(apiURL, func() error { return runSelectiveSync(apiURL, storageURL) }); err != nil {
+			log.Fatalf("Selective sync failed: %v", err)
+		}
+		os.Exit(0)
+	}
+
+	// List selective sync: print the folders currently excluded from sync.
+	if listSelectiveSync {
+		if err := runListSelectiveSync(); err != nil {
+			log.Fatalf("List selective sync failed: %v", err)
 		}
 		os.Exit(0)
 	}

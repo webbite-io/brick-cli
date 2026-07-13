@@ -1662,6 +1662,103 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error
 	return saveConfig(cfg)
 }
 
+// runSelectiveSync lets the user update which top-level folders are excluded
+// from sync, pre-ticking whichever ones are already excluded. Folders newly
+// excluded by this run are deleted from local disk immediately (they're no
+// longer supposed to live on this device); the updated exclude list is
+// persisted to the active account's config, and any currently running brick
+// instance is stopped, restarting it in the background if it was a daemon.
+func runSelectiveSync(apiURL, storageURL string) error {
+	cfg, err := ensureAuthenticated(apiURL)
+	if err != nil {
+		return err
+	}
+	if cfg.ActiveAccountID == "" {
+		return errors.New("no active account selected; run 'brick --switch-accounts' first")
+	}
+	ac := cfg.ensureActiveAccount()
+	folder := strings.TrimSpace(ac.StorageSyncFolder)
+	if folder == "" {
+		return errors.New("no sync folder configured yet; run 'brick' first to set one up")
+	}
+
+	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
+	root, err := sc.resolveRoot()
+	if err != nil {
+		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
+	}
+	topFolders, _, err := sc.folderSummary(root.ID)
+	if err != nil {
+		return err
+	}
+	if len(topFolders) == 0 {
+		fmt.Println("No folders to exclude — this account has no top-level folders yet.")
+		return nil
+	}
+
+	options := make([]huh.Option[string], len(topFolders))
+	for i, f := range topFolders {
+		options[i] = huh.NewOption(f.Name, f.Name)
+	}
+	// Pre-populated before Options()/Value() are chained below, so huh ticks
+	// every option already present in ac.ExcludeDirs.
+	excludeDirs := append([]string(nil), ac.ExcludeDirs...)
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewMultiSelect[string]().
+			Title("Select the folders to exclude from sync").
+			Options(options...).
+			Value(&excludeDirs),
+	)).Run(); err != nil {
+		return err
+	}
+
+	wasExcluded := map[string]bool{}
+	for _, d := range ac.ExcludeDirs {
+		wasExcluded[d] = true
+	}
+	for _, name := range excludeDirs {
+		if wasExcluded[name] {
+			continue
+		}
+		abs := filepath.Join(folder, filepath.FromSlash(name))
+		if err := os.RemoveAll(abs); err != nil {
+			fmt.Printf("\033[31mCould not remove %s: %v\033[0m\n", abs, err)
+			continue
+		}
+		fmt.Printf("Removed local copy of %s\n", name)
+	}
+
+	ac.ExcludeDirs = excludeDirs
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
+	fmt.Println("Saved selective sync settings.")
+
+	return restartDaemonIfRunning(apiURL, storageURL)
+}
+
+// runListSelectiveSync prints the folders currently excluded from sync for
+// the active account.
+func runListSelectiveSync() error {
+	cfg, err := loadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.ActiveAccountID == "" {
+		return errors.New("no active account selected; run 'brick --switch-accounts' first")
+	}
+	ac := cfg.activeAccount()
+	if ac == nil || len(ac.ExcludeDirs) == 0 {
+		fmt.Println("No folders are excluded from sync.")
+		return nil
+	}
+	fmt.Println("Folders excluded from sync:")
+	for _, d := range ac.ExcludeDirs {
+		fmt.Printf("  %s\n", d)
+	}
+	return nil
+}
+
 // promptForSyncFolder interactively asks the user to pick a sync folder — the
 // default ~/Brick or a custom folder browsed via a huh file picker — and, if
 // that folder already contains files, how to resolve conflicts with the

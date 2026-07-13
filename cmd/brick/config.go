@@ -229,6 +229,8 @@ func printHelp() {
 	fmt.Printf("  -d, --daemon                Detach into the background once logged in and the Storage API is reachable\n")
 	fmt.Printf("  -r, --remote-control        Allow the Storage API to remotely list/browse/transfer files on this device (also enabled by default if remoteControl: true in config file)\n")
 	fmt.Printf("      --agent-root PATH       Additional directory to expose to remote clients when remote control is enabled (repeatable)\n")
+	fmt.Printf("  -s, --selective-sync         Choose which folders to exclude from sync (deletes their local copies)\n")
+	fmt.Printf("      --list-selective-sync    List the folders currently excluded from sync\n")
 	fmt.Println("\nOther\n=====")
 	fmt.Printf("      --no-upgrade-check      Disable automatic upgrade check\n")
 	fmt.Printf("      --no-control-api        Disable the local status/control API (used by tray apps)\n")
