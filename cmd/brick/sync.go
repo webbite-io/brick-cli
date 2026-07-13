@@ -391,6 +391,13 @@ type SyncState struct {
 	// files: it lets reconcile tell a brand-new local folder (push) apart from
 	// one that was synced and later deleted on the server (remove locally).
 	Folders map[string]bool `json:"folders"`
+	// FolderIDs maps a synced folder's path to its server node ID. Kept as a
+	// separate map (rather than changing Folders' value type) so old state
+	// files still parse cleanly. Node IDs are stable across a server-side
+	// move/rename, which is what lets reconcile recognize "this is the same
+	// folder at a new path" and mirror it with a local rename instead of
+	// deleting and redownloading everything underneath it.
+	FolderIDs map[string]string `json:"folderIds"`
 }
 
 // syncStatePath returns the state file for one account, keyed by its account
@@ -406,7 +413,7 @@ func syncStatePath(accountID string) (string, error) {
 }
 
 func loadSyncState(accountID, folder string) *SyncState {
-	st := &SyncState{Folder: folder, Entries: map[string]SyncEntry{}, Folders: map[string]bool{}}
+	st := &SyncState{Folder: folder, Entries: map[string]SyncEntry{}, Folders: map[string]bool{}, FolderIDs: map[string]string{}}
 	path, err := syncStatePath(accountID)
 	if err != nil {
 		return st
@@ -424,6 +431,9 @@ func loadSyncState(accountID, folder string) *SyncState {
 	}
 	if loaded.Folders == nil {
 		loaded.Folders = map[string]bool{}
+	}
+	if loaded.FolderIDs == nil {
+		loaded.FolderIDs = map[string]string{}
 	}
 	loaded.Folder = folder
 	return &loaded
@@ -457,6 +467,7 @@ type syncEngine struct {
 	downloaded atomic.Int64
 	uploaded   atomic.Int64
 	deleted    atomic.Int64
+	moved      atomic.Int64
 
 	recentMu        sync.Mutex
 	recentlyWritten map[string]time.Time
@@ -583,6 +594,7 @@ type controlCounters struct {
 	Uploaded   int64 `json:"uploaded"`
 	Downloaded int64 `json:"downloaded"`
 	Deleted    int64 `json:"deleted"`
+	Moved      int64 `json:"moved"`
 }
 
 // statusSnapshot builds the current /v1/status payload. paused overlays the
@@ -603,6 +615,7 @@ func (e *syncEngine) statusSnapshot() controlStatus {
 			Uploaded:   e.uploaded.Load(),
 			Downloaded: e.downloaded.Load(),
 			Deleted:    e.deleted.Load(),
+			Moved:      e.moved.Load(),
 		},
 		InFlight: e.ctrlInFlight,
 	}
@@ -695,6 +708,191 @@ func (e *syncEngine) buildLocalTree() (files map[string]int64, dirs map[string]b
 	return files, dirs, err
 }
 
+// applyRemoteFolderMoves detects folders that were renamed or moved on the
+// server (same node ID, a different path) and mirrors that with a single
+// local os.Rename, instead of letting the normal reconcile passes tear down
+// the old path and redownload every file underneath the new one. Candidates
+// are processed shallowest-first; after each rename, any not-yet-processed
+// candidate nested under it has its oldRel adjusted to the location the
+// rename just carried it to, so a folder and one of its subfolders both being
+// renamed in the same poll cycle still resolves to two renames rather than
+// losing the inner one.
+func (e *syncEngine) applyRemoteFolderMoves(remoteFolders map[string]storageNode, localDirs map[string]bool, localFiles map[string]int64) {
+	oldRelByID := map[string]string{}
+	for rel, id := range e.state.FolderIDs {
+		oldRelByID[id] = rel
+	}
+
+	type move struct{ oldRel, newRel string }
+	var moves []move
+	for newRel, node := range remoteFolders {
+		if oldRel, ok := oldRelByID[node.ID]; ok && oldRel != newRel {
+			moves = append(moves, move{oldRel, newRel})
+		}
+	}
+	sort.Slice(moves, func(i, j int) bool {
+		return strings.Count(moves[i].newRel, "/") < strings.Count(moves[j].newRel, "/")
+	})
+
+	for i := range moves {
+		m := moves[i]
+		if m.oldRel == m.newRel {
+			continue // already carried into place by an ancestor's rename above
+		}
+		if !localDirs[m.oldRel] || localDirs[m.newRel] {
+			// Nothing to move locally, or the destination is already occupied
+			// by an unrelated local directory -> fall back to the normal
+			// create/remove passes rather than risk clobbering content.
+			continue
+		}
+		oldAbs := filepath.Join(e.folder, filepath.FromSlash(m.oldRel))
+		newAbs := filepath.Join(e.folder, filepath.FromSlash(m.newRel))
+		if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+			log.Printf("move folder %s -> %s: %v", m.oldRel, m.newRel, err)
+			continue
+		}
+		if err := os.Rename(oldAbs, newAbs); err != nil {
+			log.Printf("move folder %s -> %s: %v", m.oldRel, m.newRel, err)
+			continue
+		}
+		e.rewritePrefix(m.oldRel, m.newRel, localDirs, localFiles)
+		oldPrefix := m.oldRel + "/"
+		for j := i + 1; j < len(moves); j++ {
+			if moves[j].oldRel == m.oldRel || strings.HasPrefix(moves[j].oldRel, oldPrefix) {
+				moves[j].oldRel = m.newRel + moves[j].oldRel[len(m.oldRel):]
+			}
+		}
+		e.moved.Add(1)
+		log.Printf("→ moved %s to %s", m.oldRel, m.newRel)
+		e.publishActivity("move-folder", m.newRel)
+	}
+}
+
+// applyRemoteFileMoves detects files that were moved or renamed on the server
+// independently of their containing folder (same node ID, a different path)
+// and mirrors that with a local os.Rename instead of a delete-and-download.
+// Runs after applyRemoteFolderMoves, so files already relocated by a folder
+// move show no discrepancy here (their index entry already matches the new
+// path).
+func (e *syncEngine) applyRemoteFileMoves(remoteFiles map[string]storageNode, localFiles map[string]int64) {
+	oldRelByID := map[string]string{}
+	for rel, entry := range e.state.Entries {
+		oldRelByID[entry.NodeID] = rel
+	}
+
+	for newRel, node := range remoteFiles {
+		oldRel, ok := oldRelByID[node.ID]
+		if !ok || oldRel == newRel {
+			continue
+		}
+		if _, stillLocal := localFiles[oldRel]; !stillLocal {
+			continue // nothing to move locally
+		}
+		if _, occupied := localFiles[newRel]; occupied {
+			continue // destination already exists locally -> let normal conflict handling take over
+		}
+		oldAbs := filepath.Join(e.folder, filepath.FromSlash(oldRel))
+		newAbs := filepath.Join(e.folder, filepath.FromSlash(newRel))
+		if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+			log.Printf("move %s -> %s: %v", oldRel, newRel, err)
+			continue
+		}
+		if err := os.Rename(oldAbs, newAbs); err != nil {
+			log.Printf("move %s -> %s: %v", oldRel, newRel, err)
+			continue
+		}
+		size := localFiles[oldRel]
+		delete(localFiles, oldRel)
+		localFiles[newRel] = size
+		entry := e.state.Entries[oldRel]
+		delete(e.state.Entries, oldRel)
+		entry.RelPath = newRel
+		entry.RemoteEtag = node.Etag
+		e.state.Entries[newRel] = entry
+		e.moved.Add(1)
+		log.Printf("→ moved %s to %s", oldRel, newRel)
+		e.publishActivity("move", newRel)
+	}
+}
+
+// rewritePrefix moves every index entry and in-memory local-tree entry rooted
+// at oldRel (itself, plus anything nested under it) to the equivalent path
+// under newRel. Called after a folder has already been renamed on disk, so
+// this only fixes up bookkeeping: the persisted sync index (so future
+// reconciles see these paths as already synced) and the buildLocalTree
+// snapshots the current reconcile pass is still working from.
+func (e *syncEngine) rewritePrefix(oldRel, newRel string, localDirs map[string]bool, localFiles map[string]int64) {
+	matches := func(rel string) bool {
+		return rel == oldRel || strings.HasPrefix(rel, oldRel+"/")
+	}
+	rewrite := func(rel string) string {
+		if rel == oldRel {
+			return newRel
+		}
+		return newRel + rel[len(oldRel):]
+	}
+
+	var dirKeys []string
+	for rel := range localDirs {
+		if matches(rel) {
+			dirKeys = append(dirKeys, rel)
+		}
+	}
+	for _, rel := range dirKeys {
+		delete(localDirs, rel)
+		localDirs[rewrite(rel)] = true
+	}
+
+	var fileKeys []string
+	for rel := range localFiles {
+		if matches(rel) {
+			fileKeys = append(fileKeys, rel)
+		}
+	}
+	for _, rel := range fileKeys {
+		size := localFiles[rel]
+		delete(localFiles, rel)
+		localFiles[rewrite(rel)] = size
+	}
+
+	var folderKeys []string
+	for rel := range e.state.Folders {
+		if matches(rel) {
+			folderKeys = append(folderKeys, rel)
+		}
+	}
+	for _, rel := range folderKeys {
+		delete(e.state.Folders, rel)
+		e.state.Folders[rewrite(rel)] = true
+	}
+
+	var folderIDKeys []string
+	for rel := range e.state.FolderIDs {
+		if matches(rel) {
+			folderIDKeys = append(folderIDKeys, rel)
+		}
+	}
+	for _, rel := range folderIDKeys {
+		id := e.state.FolderIDs[rel]
+		delete(e.state.FolderIDs, rel)
+		e.state.FolderIDs[rewrite(rel)] = id
+	}
+
+	var entryKeys []string
+	for rel := range e.state.Entries {
+		if matches(rel) {
+			entryKeys = append(entryKeys, rel)
+		}
+	}
+	for _, rel := range entryKeys {
+		entry := e.state.Entries[rel]
+		delete(e.state.Entries, rel)
+		newKey := rewrite(rel)
+		entry.RelPath = newKey
+		e.state.Entries[newKey] = entry
+	}
+}
+
 // reconcileAll performs a full two-way reconciliation between the remote tree and
 // the local folder. It is idempotent and safe to call repeatedly; the sync index
 // ensures already-synced files do no work. Deletions push from whichever side
@@ -725,6 +923,14 @@ func (e *syncEngine) reconcileAll() (err error) {
 	if err != nil {
 		return err
 	}
+
+	// 0. Mirror server-side moves/renames (same node ID, different path) with a
+	//    local os.Rename instead of letting the passes below tear down the old
+	//    path and redownload everything at the new one. Mutates localFiles/
+	//    localDirs and the sync index in place so every later pass sees a tree
+	//    that already agrees on the new paths.
+	e.applyRemoteFolderMoves(remoteFolders, localDirs, localFiles)
+	e.applyRemoteFileMoves(remoteFiles, localFiles)
 
 	// 1. Detect previously-synced folders that are now missing locally -> the
 	//    user deleted them -> push the removal to the server as a soft-delete
@@ -770,11 +976,12 @@ func (e *syncEngine) reconcileAll() (err error) {
 	// 2. Create missing local directories for remote folders, and record every
 	//    remote folder in the index so later passes can recognise which local
 	//    folders were once synced.
-	for rel := range remoteFolders {
+	for rel, node := range remoteFolders {
 		if err := os.MkdirAll(filepath.Join(e.folder, filepath.FromSlash(rel)), 0o755); err != nil {
 			log.Printf("mkdir %s: %v", rel, err)
 		}
 		e.state.Folders[rel] = true
+		e.state.FolderIDs[rel] = node.ID
 	}
 
 	// 3. Reconcile every file across the union of remote, local and index keys.
@@ -833,6 +1040,7 @@ func (e *syncEngine) reconcileAll() (err error) {
 	})
 	for _, rel := range goneDirs {
 		delete(e.state.Folders, rel)
+		delete(e.state.FolderIDs, rel)
 		abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 		info, err := os.Stat(abs)
 		if err != nil {
@@ -868,11 +1076,13 @@ func (e *syncEngine) pruneRemoteSubtree(rel string, remoteFolders, remoteFiles m
 	delete(remoteFolders, rel)
 	delete(folderID, rel)
 	delete(e.state.Folders, rel)
+	delete(e.state.FolderIDs, rel)
 	for k := range remoteFolders {
 		if strings.HasPrefix(k, prefix) {
 			delete(remoteFolders, k)
 			delete(folderID, k)
 			delete(e.state.Folders, k)
+			delete(e.state.FolderIDs, k)
 		}
 	}
 	for k := range remoteFiles {
@@ -1147,6 +1357,7 @@ func (e *syncEngine) ensureRemoteFolder(rel string, remoteFolders map[string]sto
 	folderID[rel] = node.ID
 	remoteFolders[rel] = *node
 	e.state.Folders[rel] = true
+	e.state.FolderIDs[rel] = node.ID
 	return node.ID, nil
 }
 
@@ -1239,6 +1450,7 @@ func (e *syncEngine) printSummary() {
 	fmt.Printf("Downloaded: %d\n", e.downloaded.Load())
 	fmt.Printf("Uploaded:   %d\n", e.uploaded.Load())
 	fmt.Printf("Removed:    %d\n", e.deleted.Load())
+	fmt.Printf("Moved:      %d\n", e.moved.Load())
 }
 
 // syncSetup captures the outcome of the interactive part of starting a sync:
