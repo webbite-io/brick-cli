@@ -943,6 +943,9 @@ func (e *syncEngine) reconcileAll() (err error) {
 	//    cascade in this same pass.
 	var deletedDirs []string
 	for rel := range e.state.Folders {
+		if isExcludedPath(rel, e.excludeDirs) {
+			continue // missing locally because it's excluded, not because the user deleted it
+		}
 		if _, ok := remoteFolders[rel]; !ok {
 			continue // already gone remotely; handled by the gone-folder pass below
 		}
@@ -1928,10 +1931,26 @@ func runSelectiveSync(apiURL, storageURL string) error {
 	for _, d := range ac.ExcludeDirs {
 		wasExcluded[d] = true
 	}
+	var newlyExcluded []string
 	for _, name := range excludeDirs {
-		if wasExcluded[name] {
-			continue
+		if !wasExcluded[name] {
+			newlyExcluded = append(newlyExcluded, name)
 		}
+	}
+
+	if len(newlyExcluded) > 0 {
+		// Pause any already-running daemon before touching local files: it
+		// still has the old (pre-exclusion) config in memory, so a reconcile
+		// pass racing against the removal below could mistake the deletion
+		// for a real local delete and push it to the storage API as a
+		// soft-delete. /v1/pause blocks until any in-flight pass finishes and
+		// prevents a new one starting until the daemon is stopped/restarted
+		// below with the updated config.
+		if _, err := pauseRunningInstance(); err != nil {
+			fmt.Printf("\033[33mWarning: could not pause the running brick instance: %v\033[0m\n", err)
+		}
+	}
+	for _, name := range newlyExcluded {
 		abs := filepath.Join(folder, filepath.FromSlash(name))
 		if err := os.RemoveAll(abs); err != nil {
 			fmt.Printf("\033[31mCould not remove %s: %v\033[0m\n", abs, err)

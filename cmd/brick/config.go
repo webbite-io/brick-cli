@@ -133,8 +133,8 @@ func loadOrCreateConfig() (*Config, error) {
 		return nil, err
 	}
 	if created {
-		fmt.Println("\n👋 Hello and welcome to Brick - storage for all your devices!\n")
-		fmt.Println("Created default configuration file in ~/.config/brick/config.yaml\n")
+		fmt.Println("\n👋 Hello and welcome to Brick - storage for all your devices!")
+		fmt.Println("Created default configuration file in ~/.config/brick/config.yaml")
 	}
 	return cfg, nil
 }

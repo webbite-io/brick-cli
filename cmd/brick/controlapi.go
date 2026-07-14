@@ -235,6 +235,12 @@ func (cs *controlServer) handler(eng *syncEngine, cancel context.CancelFunc, not
 			return
 		}
 		eng.setPaused(true)
+		// Block until any reconcile pass already in flight finishes, so a 200
+		// here is a genuine guarantee that no reconcile is running or will
+		// start until resume — callers that are about to touch the sync
+		// folder out-of-band (e.g. runSelectiveSync) rely on that.
+		eng.mu.Lock()   //nolint:staticcheck // used as a barrier, not to guard data
+		eng.mu.Unlock() //nolint:staticcheck
 		writeJSON(w, http.StatusOK, eng.statusSnapshot())
 	}))
 
@@ -274,13 +280,20 @@ func parsePositiveInt(s string) (int, error) {
 // controlClientFor returns an http.Client that dials the control socket at
 // address regardless of the URL host/scheme passed to it.
 func controlClientFor(address string) *http.Client {
+	return controlClientForTimeout(address, 5*time.Second)
+}
+
+// controlClientForTimeout is controlClientFor with a caller-chosen timeout,
+// for requests that may legitimately take longer than the 5s default (e.g.
+// /v1/pause, which can block behind an in-flight reconcile pass).
+func controlClientForTimeout(address string, timeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 				return net.Dial("unix", address)
 			},
 		},
-		Timeout: 5 * time.Second,
+		Timeout: timeout,
 	}
 }
 
@@ -354,6 +367,47 @@ func stopRunningInstance(printPrefix string) (*stoppedInstance, error) {
 		RemoteControl: disc.RemoteControl,
 		AgentRoots:    disc.AgentRoots,
 	}, nil
+}
+
+// pauseRunningInstance looks for a currently running brick instance via the
+// control discovery file and, if found, pauses its reconcile loop over the
+// control API's /v1/pause endpoint, which blocks until any in-flight
+// reconcile pass has finished before responding. Callers use this to make
+// sure no reconcile can be running or start while they modify the sync
+// folder out-of-band (e.g. runSelectiveSync removing a newly-excluded
+// folder). Returns false if no instance is running (a no-op in that case).
+func pauseRunningInstance() (bool, error) {
+	discPath, err := controlDiscoveryPath()
+	if err != nil {
+		return false, err
+	}
+	data, err := os.ReadFile(discPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("could not read control discovery file: %w", err)
+	}
+	var disc controlDiscovery
+	if err := json.Unmarshal(data, &disc); err != nil {
+		// Corrupt/foreign file — nothing reliable to act on.
+		return false, nil
+	}
+
+	client := controlClientForTimeout(disc.Address, 2*time.Minute)
+	pauseReq, err := http.NewRequest(http.MethodPost, "http://unix/v1/pause", nil)
+	if err != nil {
+		return false, err
+	}
+	pauseReq.Header.Set(controlSecretHeader, disc.Token)
+	resp, err := client.Do(pauseReq)
+	if err != nil {
+		// Stale discovery file left behind by a process that didn't exit
+		// cleanly — nothing is actually running.
+		return false, nil
+	}
+	resp.Body.Close()
+	return true, nil
 }
 
 // restartDaemonIfRunning is called after 'brick --switch-accounts' picks a
