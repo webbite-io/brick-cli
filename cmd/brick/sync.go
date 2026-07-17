@@ -575,9 +575,18 @@ func (e *syncEngine) recentActivity(limit int) []controlActivityEvent {
 }
 
 // setPaused toggles whether the debounce worker in runStorageSync is allowed
-// to call reconcileAll.
+// to call reconcileAll. Logs the transition, but only when it actually
+// changes state, so a redundant pause/resume call (e.g. two control-API
+// clients pausing at once) doesn't print twice.
 func (e *syncEngine) setPaused(p bool) {
-	e.paused.Store(p)
+	if !e.paused.CompareAndSwap(!p, p) {
+		return
+	}
+	if p {
+		log.Printf("⏸ sync paused")
+	} else {
+		log.Printf("▶ sync resumed")
+	}
 }
 
 // controlStatus is the JSON shape served at /v1/status.
@@ -1606,11 +1615,24 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		cancel()
 	}()
 
+	// Coalesce reconcile requests from the watcher and the poll ticker.
+	// Defined ahead of the interactive keyboard-shortcut setup below so 'P'
+	// (pause/resume) can wake the debounce worker immediately on resume, the
+	// same way /v1/resume does.
+	trigger := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case trigger <- struct{}{}:
+		default:
+		}
+	}
+
 	// Interactive mode (foreground run attached to a real terminal) gets the
 	// colored banner, a fixed-height scrolling window for log output, and
-	// raw-mode keyboard shortcuts (Ctrl+C, and D to detach). Anything else —
-	// the detached daemon child, or output/input that isn't a terminal —
-	// keeps the plain one-line banner and ordinary scrolling log output.
+	// raw-mode keyboard shortcuts (Ctrl+C, D to detach, P to pause/resume).
+	// Anything else — the detached daemon child, or output/input that isn't a
+	// terminal — keeps the plain one-line banner and ordinary scrolling log
+	// output.
 	interactive := !background && term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
 	printSyncBanner(folder, interactive)
 
@@ -1629,11 +1651,19 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 	}
 	defer cleanupInteractive()
 
+	togglePause := func() {
+		paused := !eng.paused.Load()
+		eng.setPaused(paused)
+		if !paused {
+			notify() // wake the debounce worker immediately, as /v1/resume does
+		}
+	}
+
 	if interactive {
 		if state, rawErr := term.MakeRaw(os.Stdin.Fd()); rawErr == nil {
 			rawState = state
 			log.SetOutput(newLiveWindow(liveWindowSize))
-			go readSyncKeys(os.Stdin, cancel, &detachRequested)
+			go readSyncKeys(os.Stdin, cancel, &detachRequested, togglePause)
 		}
 	}
 
@@ -1674,15 +1704,6 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 	}
 	defer watcher.Close()
 	eng.addWatchesRecursive(watcher)
-
-	// Coalesce reconcile requests from the watcher and the poll ticker.
-	trigger := make(chan struct{}, 1)
-	notify := func() {
-		select {
-		case trigger <- struct{}{}:
-		default:
-		}
-	}
 
 	// Local status/control API: lets a local client (e.g. a tray app) read
 	// live sync status and issue pause/resume/quit without touching the

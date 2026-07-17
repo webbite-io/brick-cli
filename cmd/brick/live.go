@@ -41,6 +41,8 @@ func printSyncBanner(folder string, interactive bool) {
 		plain += " • D: Detach as daemon"
 		colored += " • " + ansiDarkGreen + "D" + ansiReset + ": Detach as daemon"
 	}
+	plain += " • P: Pause/resume"
+	colored += " • " + ansiDarkGreen + "P" + ansiReset + ": Pause/resume"
 
 	const prefix = "Commands: "
 	fmt.Printf("%sCommands:%s %s\n", ansiPurple, ansiReset, colored)
@@ -51,10 +53,13 @@ func printSyncBanner(folder string, interactive bool) {
 // by the caller) and reacts to the shortcuts advertised by printSyncBanner:
 // Ctrl+C stops the loop the same way SIGINT normally would (raw mode
 // disables the terminal's own SIGINT-on-Ctrl+C handling, so this is the only
-// way it's caught), and — where daemon mode is supported — 'd'/'D' requests
-// a detach. Returns once the context is cancelled by any means or the read
-// fails (e.g. stdin closed as the process exits).
-func readSyncKeys(r io.Reader, cancel context.CancelFunc, detachRequested *atomic.Bool) {
+// way it's caught); where daemon mode is supported, 'd'/'D' requests a
+// detach; and 'p'/'P' calls togglePause to flip the sync engine's paused
+// state (unlike the other two shortcuts, this doesn't end the loop — reading
+// continues so the same key can toggle back). Returns once the context is
+// cancelled by any means or the read fails (e.g. stdin closed as the process
+// exits).
+func readSyncKeys(r io.Reader, cancel context.CancelFunc, detachRequested *atomic.Bool, togglePause func()) {
 	buf := make([]byte, 1)
 	for {
 		n, err := r.Read(buf)
@@ -73,6 +78,8 @@ func readSyncKeys(r io.Reader, cancel context.CancelFunc, detachRequested *atomi
 			detachRequested.Store(true)
 			cancel()
 			return
+		case 'p', 'P':
+			togglePause()
 		}
 	}
 }
