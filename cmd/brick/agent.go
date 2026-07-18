@@ -655,36 +655,36 @@ func proxyAgentStream(stream net.Conn, agentAddr string) {
 
 	req, err := http.ReadRequest(bufio.NewReader(stream))
 	if err != nil {
-		log.Printf("agent: failed to read request: %v", err)
+		log.Printf("Failed to read request: %v", err)
 		return
 	}
 
 	localConn, err := net.Dial("tcp", agentAddr)
 	if err != nil {
-		log.Printf("agent: local dial failed (%s): %v", agentAddr, err)
+		log.Printf("Local dial failed (%s): %v", agentAddr, err)
 		return
 	}
 	defer localConn.Close()
 
 	req.Host = agentAddr
 	if err := req.Write(localConn); err != nil {
-		log.Printf("agent: failed to forward request: %v", err)
+		log.Printf("Failed to forward request: %v", err)
 		return
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(localConn), req)
 	if err != nil {
-		log.Printf("agent: failed to read response: %v", err)
+		log.Printf("Failed to read response: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if err := resp.Write(stream); err != nil {
-		log.Printf("agent: failed to write response: %v", err)
+		log.Printf("Failed to write response: %v", err)
 		return
 	}
 
-	log.Printf("agent: %s %s %d %s", req.Method, req.URL.RequestURI(), resp.StatusCode, time.Since(start).Round(time.Millisecond))
+	log.Printf("Brick CLI: %s %s %d %s", req.Method, req.URL.RequestURI(), resp.StatusCode, time.Since(start).Round(time.Millisecond))
 }
 
 // connectAgentOnce dials the storage API, takes the yamux server role, and
@@ -721,19 +721,19 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 		// if another goroutine already rotated it, this adopts the new token.
 		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && cfg.RefreshToken != "" {
 			_, _ = rotateAccessToken(apiURL, cfg, presented)
-			return fmt.Errorf("agent dial rejected (HTTP %d); refreshed token, will retry", resp.StatusCode)
+			return fmt.Errorf("Dial rejected (HTTP %d); refreshed token, will retry", resp.StatusCode)
 		}
 		if resp != nil {
-			return fmt.Errorf("agent dial failed (HTTP %d): %w", resp.StatusCode, err)
+			return fmt.Errorf("Dial failed (HTTP %d): %w", resp.StatusCode, err)
 		}
-		return fmt.Errorf("agent dial failed: %w", err)
+		return fmt.Errorf("Dial failed: %w", err)
 	}
 	defer ws.Close()
 
 	conn := newWSConn(ws)
 	session, err := yamux.Server(conn, yamuxConfig())
 	if err != nil {
-		return fmt.Errorf("yamux session failed: %w", err)
+		return fmt.Errorf("Connection session failed: %w", err)
 	}
 	defer session.Close()
 
@@ -752,7 +752,7 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 		}
 	}()
 
-	log.Printf("Remote file agent connected to Brick (clientId=%s)", cfg.ClientID)
+	log.Printf("Brick CLI connected to Brick Online (clientId=%s)", cfg.ClientID)
 
 	streamCh := make(chan net.Conn)
 	errCh := make(chan error, 1)
@@ -772,7 +772,7 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 		case <-ctx.Done():
 			return nil
 		case err := <-errCh:
-			return fmt.Errorf("agent session closed: %w", err)
+			return fmt.Errorf("Session closed: %w", err)
 		case stream := <-streamCh:
 			go proxyAgentStream(stream, agentAddr)
 		}
@@ -793,7 +793,7 @@ func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, c
 			return
 		}
 		delay := reconnectBackoff[min(attempt, len(reconnectBackoff)-1)]
-		log.Printf("Remote file agent disconnected (%v); reconnecting in %v...", err, delay)
+		log.Printf("Brick CLI disconnected (%v); reconnecting in %v...", err, delay)
 		select {
 		case <-ctx.Done():
 			return
