@@ -124,6 +124,75 @@ func (sc *storageClient) listChildren(parentID string) ([]storageNode, error) {
 	return all, nil
 }
 
+// checkUpdatesPageLimit is the page size for the incremental-sync feed. Large
+// enough that the common no-change poll is a single request, while any page
+// that does carry a change short-circuits the walk immediately.
+const checkUpdatesPageLimit = 500
+
+// checkUpdates reports whether anything the caller can see changed at or after
+// `since`, and returns the server clock to adopt as the next `since`. It is the
+// one-request replacement for walking every folder's children just to notice
+// there was nothing to do.
+//
+// It stops at the first change found — the sync loop only needs to know
+// *whether* to run a full reconcile, not the specifics — so a quiet account
+// costs exactly one request. It must, however, follow nextCursor while a page
+// comes back empty: an empty page with a non-empty cursor means the only
+// changes on it were ones this user can't see (filtered out server-side), and a
+// change they *can* see may still sit on a later page. The returned serverTime
+// is always the first page's, the earliest snapshot, so adopting it as the
+// cursor can never skip a change that lands during pagination.
+func (sc *storageClient) checkUpdates(since int64) (changed bool, serverTime int64, err error) {
+	cursor := ""
+	haveServerTime := false
+	for {
+		path := fmt.Sprintf("/check-updates?since=%d&limit=%d", since, checkUpdatesPageLimit)
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		resp, reqErr := sc.request("GET", path, nil, nil)
+		if reqErr != nil {
+			return false, 0, reqErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			e := sc.errFrom(resp)
+			resp.Body.Close()
+			return false, 0, e
+		}
+		var out struct {
+			Data       []storageNode `json:"data"`
+			ServerTime int64         `json:"serverTime"`
+			NextCursor string        `json:"nextCursor"`
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if decErr != nil {
+			return false, 0, decErr
+		}
+		if !haveServerTime {
+			serverTime = out.ServerTime
+			haveServerTime = true
+		}
+		if len(out.Data) > 0 {
+			return true, serverTime, nil
+		}
+		if out.NextCursor == "" {
+			return false, serverTime, nil
+		}
+		cursor = out.NextCursor
+	}
+}
+
+// serverNow returns the server's current clock (unix seconds) via a
+// /check-updates probe with a far-future `since`, so it comes back with an
+// empty change set in a single request. Used to seed the incremental cursor
+// (at startup, and after the periodic backstop reconcile) without walking the
+// tree.
+func (sc *storageClient) serverNow() (int64, error) {
+	_, serverTime, err := sc.checkUpdates(int64(1) << 62)
+	return serverTime, err
+}
+
 func (sc *storageClient) download(nodeID string) ([]byte, string, error) {
 	resp, err := sc.request("GET", "/files/"+nodeID, nil, nil)
 	if err != nil {
@@ -398,6 +467,13 @@ type SyncState struct {
 	// folder at a new path" and mirror it with a local rename instead of
 	// deleting and redownloading everything underneath it.
 	FolderIDs map[string]string `json:"folderIds"`
+	// ServerTime is the server clock (unix seconds) as of the last successful
+	// remote-change poll — the cursor handed to GET /check-updates so each poll
+	// only asks what changed since the previous one, instead of walking every
+	// folder's children. Zero on a fresh state file; the first poll after
+	// startup seeds it. Persisted so a restart resumes incremental polling
+	// rather than re-scanning the whole tree on every tick.
+	ServerTime int64 `json:"serverTime"`
 }
 
 // syncStatePath returns the state file for one account, keyed by its account
@@ -1078,6 +1154,72 @@ func (e *syncEngine) reconcileAll() (err error) {
 	return nil
 }
 
+// cursor returns the incremental-sync cursor (server clock of the last
+// successful poll), read under the same lock reconcileAll uses so it never
+// races a state save.
+func (e *syncEngine) cursor() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.state.ServerTime
+}
+
+// setCursor advances the incremental-sync cursor and persists it. The cursor
+// only ever moves forward: a stale value from a concurrent path can't rewind
+// it and cause the next poll to re-scan work already applied.
+func (e *syncEngine) setCursor(serverTime int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if serverTime > e.state.ServerTime {
+		e.state.ServerTime = serverTime
+		e.saveStateLocked()
+	}
+}
+
+// pollRemoteChanges is the periodic remote check. In one request it asks whether
+// anything the caller can see changed since the last poll; only when something
+// did does it run a full reconcile — whose *complete* remote snapshot is what
+// safely resolves deletions, which a partial delta can't. The cursor is
+// advanced to the server clock the check observed, but only after a triggered
+// reconcile succeeds, so a failed reconcile is simply retried on the next tick
+// rather than silently skipping the changes. reconciled reports whether a
+// reconcile ran, so the caller can refresh filesystem watches for any new dirs.
+func (e *syncEngine) pollRemoteChanges() (reconciled bool, err error) {
+	changed, serverTime, err := e.sc.checkUpdates(e.cursor())
+	if err != nil {
+		return false, err
+	}
+	if !changed {
+		e.setCursor(serverTime)
+		return false, nil
+	}
+	if err := e.reconcileAll(); err != nil {
+		return false, err
+	}
+	e.setCursor(serverTime)
+	return true, nil
+}
+
+// forceReconcile runs a full reconcile unconditionally — the periodic backstop
+// that catches hard-deletes the incremental feed can't report (a permanently
+// deleted or purged node leaves no row to surface as changed). The cursor is
+// seeded from the server clock captured just before the walk, so a change that
+// lands mid-walk still has a timestamp at or after it and is caught next poll.
+func (e *syncEngine) forceReconcile() error {
+	serverTime, stErr := e.sc.serverNow()
+	if stErr != nil {
+		// Non-fatal: reconcile anyway, just don't advance the cursor. The next
+		// poll continues from the existing cursor.
+		serverTime = 0
+	}
+	if err := e.reconcileAll(); err != nil {
+		return err
+	}
+	if serverTime > 0 {
+		e.setCursor(serverTime)
+	}
+	return nil
+}
+
 // pruneRemoteSubtree removes rel (a folder) and everything nested under it from
 // the in-memory remote tree and the sync index, after the server has soft-
 // deleted that folder (which cascades to its descendants). This keeps the rest
@@ -1686,6 +1828,16 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		}
 	}
 
+	// Capture the server clock before the initial full reconcile so the first
+	// incremental poll asks only for what changed after startup. Read before
+	// (not after) the walk on purpose: anything that changes while the walk runs
+	// still carries a timestamp at or after this cursor and so is caught by the
+	// next poll rather than falling into a gap.
+	bootstrapTime, btErr := eng.sc.serverNow()
+	if btErr != nil {
+		log.Printf("could not read server time for incremental sync: %v", btErr)
+	}
+
 	// Initial full reconciliation (pulls everything, pushes local-only files).
 	if err := eng.reconcileAll(); err != nil {
 		if errors.Is(err, errSessionExpired) {
@@ -1694,6 +1846,9 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		log.Printf("initial sync error: %v", err)
 	}
 	eng.firstSync = false
+	if bootstrapTime > 0 {
+		eng.setCursor(bootstrapTime)
+	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -1753,16 +1908,51 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		}
 	}()
 
-	// Periodic remote poll.
+	// Periodic remote poll. Instead of walking every folder each tick, a single
+	// /check-updates request asks whether anything the user can see changed
+	// since the last poll; only then do we run a full reconcile. Every
+	// fullReconcileEvery ticks we force a full reconcile regardless, as the
+	// backstop for hard-deletes the incremental feed can't report (permanently
+	// deleted / purged nodes leave no row to surface). Local changes still reach
+	// reconcile immediately via the watcher + debounce worker above, untouched
+	// by this.
 	go func() {
+		const fullReconcileEvery = 90 // 90 * 20s ≈ every 30 minutes
 		t := time.NewTicker(20 * time.Second)
 		defer t.Stop()
+		ticks := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				notify()
+				if eng.paused.Load() {
+					continue
+				}
+				ticks++
+
+				var reconciled bool
+				var pollErr error
+				if ticks >= fullReconcileEvery {
+					ticks = 0
+					pollErr = eng.forceReconcile()
+					reconciled = pollErr == nil
+				} else {
+					reconciled, pollErr = eng.pollRemoteChanges()
+				}
+
+				if pollErr != nil {
+					if errors.Is(pollErr, errSessionExpired) {
+						log.Printf("session expired — run 'brick --login' to re-authenticate")
+						cancel()
+						return
+					}
+					log.Printf("remote poll error: %v", pollErr)
+					continue
+				}
+				if reconciled {
+					eng.addWatchesRecursive(watcher)
+				}
 			}
 		}
 	}()
