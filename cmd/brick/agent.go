@@ -528,7 +528,7 @@ func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = filepath.Base(abs)
 	}
-	node, err := a.sc.upload(req.ParentID, name, data)
+	node, err := a.sc.upload(r.Context(), req.ParentID, name, data)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
@@ -552,7 +552,7 @@ func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	data, _, err := a.sc.download(req.NodeID)
+	data, _, err := a.sc.download(r.Context(), req.NodeID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
@@ -805,9 +805,12 @@ func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, c
 
 // deregisterAgent best-effort removes this client from the storage API on clean
 // shutdown. An unclean exit is handled server-side when the connection drops.
+// Deliberately uses a fresh context rather than the sync loop's — that one is
+// already cancelled by the time this deferred call runs, and this request
+// must still go out for the shutdown to be clean.
 func deregisterAgent(storageURL, apiURL string, cfg *Config) {
 	path := "/v1/accounts/" + cfg.ActiveAccountID + "/clients/" + cfg.ClientID
-	if resp, err := authedRequest(storageURL, apiURL, "DELETE", path, nil, nil, cfg); err == nil {
+	if resp, err := authedRequest(context.Background(), storageURL, apiURL, "DELETE", path, nil, nil, cfg); err == nil {
 		resp.Body.Close()
 	}
 }

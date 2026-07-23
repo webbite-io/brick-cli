@@ -669,7 +669,7 @@ func onboardNewAccount(apiURL, storageURL string, cfg *Config) error {
 	}
 
 	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
-	root, err := sc.resolveRoot()
+	root, err := sc.resolveRoot(context.Background())
 	if err != nil {
 		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
 	}

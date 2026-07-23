@@ -67,10 +67,13 @@ type storageClient struct {
 }
 
 // request performs an authenticated request against /v1/accounts/{accountId}{path},
-// transparently refreshing the access token once on a 401.
-func (sc *storageClient) request(method, path string, body []byte, headers map[string]string) (*http.Response, error) {
+// transparently refreshing the access token once on a 401. It aborts early —
+// without even dialing out, if ctx is already done — and any in-flight
+// request is cancelled the moment ctx is done, rather than running to
+// completion (or the 10-minute client timeout) regardless of cancellation.
+func (sc *storageClient) request(ctx context.Context, method, path string, body []byte, headers map[string]string) (*http.Response, error) {
 	full := "/v1/accounts/" + sc.accountID + path
-	return authedRequest(sc.baseURL, sc.apiURL, method, full, body, headers, sc.cfg)
+	return authedRequest(ctx, sc.baseURL, sc.apiURL, method, full, body, headers, sc.cfg)
 }
 
 func (sc *storageClient) errFrom(resp *http.Response) error {
@@ -78,8 +81,8 @@ func (sc *storageClient) errFrom(resp *http.Response) error {
 	return fmt.Errorf("storage API %s: %s", resp.Status, strings.TrimSpace(string(body)))
 }
 
-func (sc *storageClient) resolveRoot() (*storageNode, error) {
-	resp, err := sc.request("GET", "/resolve", nil, nil)
+func (sc *storageClient) resolveRoot(ctx context.Context) (*storageNode, error) {
+	resp, err := sc.request(ctx, "GET", "/resolve", nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -94,13 +97,16 @@ func (sc *storageClient) resolveRoot() (*storageNode, error) {
 	return &node, nil
 }
 
-func (sc *storageClient) listChildren(parentID string) ([]storageNode, error) {
+func (sc *storageClient) listChildren(ctx context.Context, parentID string) ([]storageNode, error) {
 	var all []storageNode
 	const limit = 200
 	offset := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		path := fmt.Sprintf("/nodes/%s/children?limit=%d&offset=%d", parentID, limit, offset)
-		resp, err := sc.request("GET", path, nil, nil)
+		resp, err := sc.request(ctx, "GET", path, nil, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -142,15 +148,18 @@ const checkUpdatesPageLimit = 500
 // change they *can* see may still sit on a later page. The returned serverTime
 // is always the first page's, the earliest snapshot, so adopting it as the
 // cursor can never skip a change that lands during pagination.
-func (sc *storageClient) checkUpdates(since int64) (changed bool, serverTime int64, err error) {
+func (sc *storageClient) checkUpdates(ctx context.Context, since int64) (changed bool, serverTime int64, err error) {
 	cursor := ""
 	haveServerTime := false
 	for {
+		if err := ctx.Err(); err != nil {
+			return false, 0, err
+		}
 		path := fmt.Sprintf("/check-updates?since=%d&limit=%d", since, checkUpdatesPageLimit)
 		if cursor != "" {
 			path += "&cursor=" + cursor
 		}
-		resp, reqErr := sc.request("GET", path, nil, nil)
+		resp, reqErr := sc.request(ctx, "GET", path, nil, nil)
 		if reqErr != nil {
 			return false, 0, reqErr
 		}
@@ -188,13 +197,13 @@ func (sc *storageClient) checkUpdates(since int64) (changed bool, serverTime int
 // empty change set in a single request. Used to seed the incremental cursor
 // (at startup, and after the periodic backstop reconcile) without walking the
 // tree.
-func (sc *storageClient) serverNow() (int64, error) {
-	_, serverTime, err := sc.checkUpdates(int64(1) << 62)
+func (sc *storageClient) serverNow(ctx context.Context) (int64, error) {
+	_, serverTime, err := sc.checkUpdates(ctx, int64(1)<<62)
 	return serverTime, err
 }
 
-func (sc *storageClient) download(nodeID string) ([]byte, string, error) {
-	resp, err := sc.request("GET", "/files/"+nodeID, nil, nil)
+func (sc *storageClient) download(ctx context.Context, nodeID string) ([]byte, string, error) {
+	resp, err := sc.request(ctx, "GET", "/files/"+nodeID, nil, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -209,13 +218,13 @@ func (sc *storageClient) download(nodeID string) ([]byte, string, error) {
 	return data, strings.Trim(resp.Header.Get("ETag"), `"`), nil
 }
 
-func (sc *storageClient) upload(parentID, name string, data []byte) (*storageNode, error) {
+func (sc *storageClient) upload(ctx context.Context, parentID, name string, data []byte) (*storageNode, error) {
 	headers := map[string]string{
 		"Content-Type": "application/octet-stream",
 		"X-Parent-ID":  parentID,
 		"X-Filename":   name,
 	}
-	resp, err := sc.request("POST", "/files", data, headers)
+	resp, err := sc.request(ctx, "POST", "/files", data, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -230,9 +239,9 @@ func (sc *storageClient) upload(parentID, name string, data []byte) (*storageNod
 	return &result.Node, nil
 }
 
-func (sc *storageClient) replace(nodeID string, data []byte) (*storageNode, error) {
+func (sc *storageClient) replace(ctx context.Context, nodeID string, data []byte) (*storageNode, error) {
 	headers := map[string]string{"Content-Type": "application/octet-stream"}
-	resp, err := sc.request("PUT", "/files/"+nodeID, data, headers)
+	resp, err := sc.request(ctx, "PUT", "/files/"+nodeID, data, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -249,8 +258,8 @@ func (sc *storageClient) replace(nodeID string, data []byte) (*storageNode, erro
 
 // delete soft-deletes a node (file or folder), moving it to trash. A 404 means
 // it's already gone remotely, which is treated as success.
-func (sc *storageClient) delete(nodeID string) error {
-	resp, err := sc.request("DELETE", "/nodes/"+nodeID, nil, nil)
+func (sc *storageClient) delete(ctx context.Context, nodeID string) error {
+	resp, err := sc.request(ctx, "DELETE", "/nodes/"+nodeID, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -261,16 +270,16 @@ func (sc *storageClient) delete(nodeID string) error {
 	return nil
 }
 
-func (sc *storageClient) createFolder(parentID, name string) (*storageNode, error) {
+func (sc *storageClient) createFolder(ctx context.Context, parentID, name string) (*storageNode, error) {
 	body, _ := json.Marshal(map[string]string{"parentId": parentID, "name": name})
-	resp, err := sc.request("POST", "/nodes", body, map[string]string{"Content-Type": "application/json"})
+	resp, err := sc.request(ctx, "POST", "/nodes", body, map[string]string{"Content-Type": "application/json"})
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusConflict {
 		// Folder already exists remotely — find and reuse it.
-		children, err := sc.listChildren(parentID)
+		children, err := sc.listChildren(ctx, parentID)
 		if err != nil {
 			return nil, err
 		}
@@ -295,12 +304,15 @@ func (sc *storageClient) createFolder(parentID, name string) (*storageNode, erro
 // folderSummary walks the entire remote tree under rootID and returns its
 // direct folder children (for the onboarding "pick which folders to sync"
 // prompt) along with the total size in bytes of every file in the tree.
-func (sc *storageClient) folderSummary(rootID string) (topFolders []storageNode, totalSize int64, err error) {
+func (sc *storageClient) folderSummary(ctx context.Context, rootID string) (topFolders []storageNode, totalSize int64, err error) {
 	queue := []string{rootID}
 	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
 		id := queue[0]
 		queue = queue[1:]
-		children, err := sc.listChildren(id)
+		children, err := sc.listChildren(ctx, id)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -387,14 +399,14 @@ func rotateAccessToken(refreshAPIURL string, cfg *Config, presentedAccessToken s
 // access tokens (introspected for their brick/brick:manage scopes) — not the
 // OIDC ID token, which that endpoint rejects. So this helper sends
 // cfg.AccessToken as the bearer, same as the rest of the CLI.
-func authedRequest(reqBaseURL, refreshAPIURL, method, path string, body []byte, headers map[string]string, cfg *Config) (*http.Response, error) {
+func authedRequest(ctx context.Context, reqBaseURL, refreshAPIURL, method, path string, body []byte, headers map[string]string, cfg *Config) (*http.Response, error) {
 	client := &http.Client{Timeout: 10 * time.Minute}
 	doRequest := func(token string) (*http.Response, error) {
 		var r io.Reader
 		if body != nil {
 			r = bytes.NewReader(body)
 		}
-		req, err := http.NewRequest(method, strings.TrimRight(reqBaseURL, "/")+path, r)
+		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(reqBaseURL, "/")+path, r)
 		if err != nil {
 			return nil, err
 		}
@@ -728,7 +740,7 @@ func (e *syncEngine) isRecentlyWritten(abs string) bool {
 
 // buildRemoteTree walks the remote node tree and returns files and folders keyed
 // by slash-separated path relative to the root, plus a folderID lookup ("" = root).
-func (e *syncEngine) buildRemoteTree() (files, folders map[string]storageNode, folderID map[string]string, err error) {
+func (e *syncEngine) buildRemoteTree(ctx context.Context) (files, folders map[string]storageNode, folderID map[string]string, err error) {
 	files = map[string]storageNode{}
 	folders = map[string]storageNode{}
 	folderID = map[string]string{"": e.rootID}
@@ -736,9 +748,12 @@ func (e *syncEngine) buildRemoteTree() (files, folders map[string]storageNode, f
 	type item struct{ id, rel string }
 	queue := []item{{e.rootID, ""}}
 	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
 		cur := queue[0]
 		queue = queue[1:]
-		children, listErr := e.sc.listChildren(cur.id)
+		children, listErr := e.sc.listChildren(ctx, cur.id)
 		if listErr != nil {
 			return nil, nil, nil, listErr
 		}
@@ -984,23 +999,29 @@ func (e *syncEngine) rewritePrefix(oldRel, newRel string, localDirs map[string]b
 // removed the file to the other (a local delete trashes the file remotely; a
 // remote delete/trash removes it locally); on content conflicts (both sides
 // changed the same file), remote wins.
-func (e *syncEngine) reconcileAll() (err error) {
+func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	e.setState("syncing")
 	defer func() {
 		// errSessionExpired ends the whole sync loop (see runStorageSync), so
 		// surfacing it as a lingering "error" status would be misleading —
-		// the process is shutting down, not stuck.
-		if err != nil && !errors.Is(err, errSessionExpired) {
+		// the process is shutting down, not stuck. A context cancellation
+		// (Ctrl+C/SIGTERM interrupting mid-reconcile) is shutting down for the
+		// same reason, so it gets the same treatment.
+		if err != nil && !errors.Is(err, errSessionExpired) && ctx.Err() == nil {
 			e.setSyncError(err)
 		} else if err == nil {
 			e.setSynced()
 		}
 	}()
 
-	remoteFiles, remoteFolders, folderID, err := e.buildRemoteTree()
+	remoteFiles, remoteFolders, folderID, err := e.buildRemoteTree(ctx)
 	if err != nil {
 		return err
 	}
@@ -1044,10 +1065,13 @@ func (e *syncEngine) reconcileAll() (err error) {
 	})
 	handledDeletes := map[string]bool{}
 	for _, rel := range deletedDirs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if isUnderAny(rel, handledDeletes) {
 			continue
 		}
-		if err := e.sc.delete(remoteFolders[rel].ID); err != nil {
+		if err := e.sc.delete(ctx, remoteFolders[rel].ID); err != nil {
 			if errors.Is(err, errSessionExpired) {
 				return err
 			}
@@ -1086,7 +1110,10 @@ func (e *syncEngine) reconcileAll() (err error) {
 		keys[k] = struct{}{}
 	}
 	for rel := range keys {
-		if err := e.reconcileFile(rel, remoteFiles, localFiles, remoteFolders, folderID); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := e.reconcileFile(ctx, rel, remoteFiles, localFiles, remoteFolders, folderID); err != nil {
 			if errors.Is(err, errSessionExpired) {
 				return err
 			}
@@ -1098,13 +1125,16 @@ func (e *syncEngine) reconcileAll() (err error) {
 	//    This is what carries up empty directories the user just created; folders
 	//    that hold new files were already created during the file pass.
 	for rel := range localDirs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, ok := remoteFolders[rel]; ok {
 			continue
 		}
 		if e.state.Folders[rel] {
 			continue // was synced before -> server deletion, handled in pass 5
 		}
-		if _, err := e.ensureRemoteFolder(rel, remoteFolders, folderID); err != nil {
+		if _, err := e.ensureRemoteFolder(ctx, rel, remoteFolders, folderID); err != nil {
 			if errors.Is(err, errSessionExpired) {
 				return err
 			}
@@ -1183,8 +1213,8 @@ func (e *syncEngine) setCursor(serverTime int64) {
 // reconcile succeeds, so a failed reconcile is simply retried on the next tick
 // rather than silently skipping the changes. reconciled reports whether a
 // reconcile ran, so the caller can refresh filesystem watches for any new dirs.
-func (e *syncEngine) pollRemoteChanges() (reconciled bool, err error) {
-	changed, serverTime, err := e.sc.checkUpdates(e.cursor())
+func (e *syncEngine) pollRemoteChanges(ctx context.Context) (reconciled bool, err error) {
+	changed, serverTime, err := e.sc.checkUpdates(ctx, e.cursor())
 	if err != nil {
 		return false, err
 	}
@@ -1192,7 +1222,7 @@ func (e *syncEngine) pollRemoteChanges() (reconciled bool, err error) {
 		e.setCursor(serverTime)
 		return false, nil
 	}
-	if err := e.reconcileAll(); err != nil {
+	if err := e.reconcileAll(ctx); err != nil {
 		return false, err
 	}
 	e.setCursor(serverTime)
@@ -1204,14 +1234,14 @@ func (e *syncEngine) pollRemoteChanges() (reconciled bool, err error) {
 // deleted or purged node leaves no row to surface as changed). The cursor is
 // seeded from the server clock captured just before the walk, so a change that
 // lands mid-walk still has a timestamp at or after it and is caught next poll.
-func (e *syncEngine) forceReconcile() error {
-	serverTime, stErr := e.sc.serverNow()
+func (e *syncEngine) forceReconcile(ctx context.Context) error {
+	serverTime, stErr := e.sc.serverNow(ctx)
 	if stErr != nil {
 		// Non-fatal: reconcile anyway, just don't advance the cursor. The next
 		// poll continues from the existing cursor.
 		serverTime = 0
 	}
-	if err := e.reconcileAll(); err != nil {
+	if err := e.reconcileAll(ctx); err != nil {
 		return err
 	}
 	if serverTime > 0 {
@@ -1275,7 +1305,7 @@ func isExcludedPath(rel string, excludeDirs []string) bool {
 // reconcileFile applies the per-path reconciliation rules: creates, updates and
 // deletes push from whichever side changed to the other; on a genuine content
 // conflict (both sides changed the same file), remote wins.
-func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, remoteFolders map[string]storageNode, folderID map[string]string) error {
+func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, remoteFolders map[string]storageNode, folderID map[string]string) error {
 	if isExcludedPath(rel, e.excludeDirs) {
 		return e.reconcileExcludedFile(rel, remoteFiles, localFiles)
 	}
@@ -1290,10 +1320,10 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 		if hasEntry {
 			// Was synced before and is now gone locally -> the user deleted it ->
 			// push that removal to the server as a soft-delete (trash).
-			return e.deleteRemoteFile(rel, remoteNode.ID)
+			return e.deleteRemoteFile(ctx, rel, remoteNode.ID)
 		}
 		// Remote-only, never synced locally -> download.
-		return e.downloadFile(rel, remoteNode)
+		return e.downloadFile(ctx, rel, remoteNode)
 
 	case !hasRemote && localExists:
 		localHash, err := hashFile(abs)
@@ -1312,7 +1342,7 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 			return nil
 		}
 		// Local-only new file (or locally changed after a server delete) -> upload.
-		return e.uploadNewFile(rel, remoteFolders, folderID)
+		return e.uploadNewFile(ctx, rel, remoteFolders, folderID)
 
 	case hasRemote && localExists:
 		localHash, err := hashFile(abs)
@@ -1327,12 +1357,12 @@ func (e *syncEngine) reconcileFile(rel string, remoteFiles map[string]storageNod
 		case e.firstSync && !hasEntry:
 			// Present on both sides with no prior sync history: this is the
 			// pre-existing-folder conflict the onboarding wizard asked about.
-			return e.applyFirstSyncConflict(rel, remoteNode, remoteFolders, folderID)
+			return e.applyFirstSyncConflict(ctx, rel, remoteNode, remoteFolders, folderID)
 		case localChanged && !remoteChanged:
-			return e.replaceFile(rel, remoteNode.ID)
+			return e.replaceFile(ctx, rel, remoteNode.ID)
 		default:
 			// remote changed (with or without a local change) -> remote wins.
-			return e.downloadFile(rel, remoteNode)
+			return e.downloadFile(ctx, rel, remoteNode)
 		}
 
 	default:
@@ -1398,31 +1428,31 @@ func (e *syncEngine) reconcileExcludedFile(rel string, remoteFiles map[string]st
 // "device" downloads the remote copy over the local one, "brick" uploads the
 // local copy over the remote one, and "copy" keeps both by renaming the local
 // file aside before downloading the remote one to the original path.
-func (e *syncEngine) applyFirstSyncConflict(rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
+func (e *syncEngine) applyFirstSyncConflict(ctx context.Context, rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
 	switch e.conflictMode {
 	case "brick":
-		return e.replaceFile(rel, remoteNode.ID)
+		return e.replaceFile(ctx, rel, remoteNode.ID)
 	case "copy":
-		return e.keepBothFile(rel, remoteNode, remoteFolders, folderID)
+		return e.keepBothFile(ctx, rel, remoteNode, remoteFolders, folderID)
 	default: // "device", or unset (folder was empty, so this case is unreachable in practice)
-		return e.downloadFile(rel, remoteNode)
+		return e.downloadFile(ctx, rel, remoteNode)
 	}
 }
 
 // keepBothFile resolves a first-sync conflict by keeping both copies: the
 // local file is renamed aside and re-uploaded as a new file, and the remote
 // copy is downloaded to the original path.
-func (e *syncEngine) keepBothFile(rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
+func (e *syncEngine) keepBothFile(ctx context.Context, rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	copyRel := dupPath(rel)
 	copyAbs := filepath.Join(e.folder, filepath.FromSlash(copyRel))
 	if err := os.Rename(abs, copyAbs); err != nil {
 		return err
 	}
-	if err := e.downloadFile(rel, remoteNode); err != nil {
+	if err := e.downloadFile(ctx, rel, remoteNode); err != nil {
 		return err
 	}
-	if err := e.uploadNewFile(copyRel, remoteFolders, folderID); err != nil {
+	if err := e.uploadNewFile(ctx, copyRel, remoteFolders, folderID); err != nil {
 		return err
 	}
 	log.Printf("⧉ kept both copies of %s (as %s)", rel, copyRel)
@@ -1443,11 +1473,11 @@ func dupPath(rel string) string {
 	return dir + "/" + newBase
 }
 
-func (e *syncEngine) downloadFile(rel string, node storageNode) error {
+func (e *syncEngine) downloadFile(ctx context.Context, rel string, node storageNode) error {
 	e.setInFlight(rel, "download")
 	defer e.clearInFlight()
 
-	data, etag, err := e.sc.download(node.ID)
+	data, etag, err := e.sc.download(ctx, node.ID)
 	if err != nil {
 		return err
 	}
@@ -1478,8 +1508,8 @@ func (e *syncEngine) downloadFile(rel string, node storageNode) error {
 
 // deleteRemoteFile pushes a local file removal to the server as a soft-delete
 // (trash), the mirror image of downloadFile pushing a remote removal to local.
-func (e *syncEngine) deleteRemoteFile(rel, nodeID string) error {
-	if err := e.sc.delete(nodeID); err != nil {
+func (e *syncEngine) deleteRemoteFile(ctx context.Context, rel, nodeID string) error {
+	if err := e.sc.delete(ctx, nodeID); err != nil {
 		return err
 	}
 	delete(e.state.Entries, rel)
@@ -1493,18 +1523,18 @@ func (e *syncEngine) deleteRemoteFile(rel, nodeID string) error {
 // it (and any missing ancestors) on demand. It records every folder it touches
 // in folderID, remoteFolders and the sync index so the rest of reconcile sees a
 // consistent tree. rel == "" resolves to the sync root.
-func (e *syncEngine) ensureRemoteFolder(rel string, remoteFolders map[string]storageNode, folderID map[string]string) (string, error) {
+func (e *syncEngine) ensureRemoteFolder(ctx context.Context, rel string, remoteFolders map[string]storageNode, folderID map[string]string) (string, error) {
 	if rel == "" {
 		return e.rootID, nil
 	}
 	if id, ok := folderID[rel]; ok {
 		return id, nil
 	}
-	parentID, err := e.ensureRemoteFolder(parentOf(rel), remoteFolders, folderID)
+	parentID, err := e.ensureRemoteFolder(ctx, parentOf(rel), remoteFolders, folderID)
 	if err != nil {
 		return "", err
 	}
-	node, err := e.sc.createFolder(parentID, baseName(rel))
+	node, err := e.sc.createFolder(ctx, parentID, baseName(rel))
 	if err != nil {
 		return "", err
 	}
@@ -1515,7 +1545,7 @@ func (e *syncEngine) ensureRemoteFolder(rel string, remoteFolders map[string]sto
 	return node.ID, nil
 }
 
-func (e *syncEngine) uploadNewFile(rel string, remoteFolders map[string]storageNode, folderID map[string]string) error {
+func (e *syncEngine) uploadNewFile(ctx context.Context, rel string, remoteFolders map[string]storageNode, folderID map[string]string) error {
 	e.setInFlight(rel, "upload")
 	defer e.clearInFlight()
 
@@ -1524,11 +1554,11 @@ func (e *syncEngine) uploadNewFile(rel string, remoteFolders map[string]storageN
 	if err != nil {
 		return err
 	}
-	parentID, err := e.ensureRemoteFolder(parentOf(rel), remoteFolders, folderID)
+	parentID, err := e.ensureRemoteFolder(ctx, parentOf(rel), remoteFolders, folderID)
 	if err != nil {
 		return err
 	}
-	node, err := e.sc.upload(parentID, baseName(rel), data)
+	node, err := e.sc.upload(ctx, parentID, baseName(rel), data)
 	if err != nil {
 		return err
 	}
@@ -1538,7 +1568,7 @@ func (e *syncEngine) uploadNewFile(rel string, remoteFolders map[string]storageN
 	return nil
 }
 
-func (e *syncEngine) replaceFile(rel, nodeID string) error {
+func (e *syncEngine) replaceFile(ctx context.Context, rel, nodeID string) error {
 	e.setInFlight(rel, "upload")
 	defer e.clearInFlight()
 
@@ -1547,7 +1577,7 @@ func (e *syncEngine) replaceFile(rel, nodeID string) error {
 	if err != nil {
 		return err
 	}
-	node, err := e.sc.replace(nodeID, data)
+	node, err := e.sc.replace(ctx, nodeID, data)
 	if err != nil {
 		return err
 	}
@@ -1643,7 +1673,7 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 	}
 
 	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
-	root, err := sc.resolveRoot()
+	root, err := sc.resolveRoot(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
 	}
@@ -1833,17 +1863,19 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 	// (not after) the walk on purpose: anything that changes while the walk runs
 	// still carries a timestamp at or after this cursor and so is caught by the
 	// next poll rather than falling into a gap.
-	bootstrapTime, btErr := eng.sc.serverNow()
-	if btErr != nil {
+	bootstrapTime, btErr := eng.sc.serverNow(ctx)
+	if btErr != nil && ctx.Err() == nil {
 		log.Printf("could not read server time for incremental sync: %v", btErr)
 	}
 
 	// Initial full reconciliation (pulls everything, pushes local-only files).
-	if err := eng.reconcileAll(); err != nil {
+	if err := eng.reconcileAll(ctx); err != nil {
 		if errors.Is(err, errSessionExpired) {
 			return false, err
 		}
-		log.Printf("initial sync error: %v", err)
+		if ctx.Err() == nil {
+			log.Printf("initial sync error: %v", err)
+		}
 	}
 	eng.firstSync = false
 	if bootstrapTime > 0 {
@@ -1895,13 +1927,15 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 					// woke this worker, so resume just needs to flip the flag.
 					continue
 				}
-				if err := eng.reconcileAll(); err != nil {
+				if err := eng.reconcileAll(ctx); err != nil {
 					if errors.Is(err, errSessionExpired) {
 						log.Printf("session expired — run 'brick --login' to re-authenticate")
 						cancel()
 						return
 					}
-					log.Printf("sync error: %v", err)
+					if ctx.Err() == nil {
+						log.Printf("sync error: %v", err)
+					}
 				}
 				eng.addWatchesRecursive(watcher)
 			}
@@ -1935,10 +1969,10 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 				var pollErr error
 				if ticks >= fullReconcileEvery {
 					ticks = 0
-					pollErr = eng.forceReconcile()
+					pollErr = eng.forceReconcile(ctx)
 					reconciled = pollErr == nil
 				} else {
-					reconciled, pollErr = eng.pollRemoteChanges()
+					reconciled, pollErr = eng.pollRemoteChanges(ctx)
 				}
 
 				if pollErr != nil {
@@ -1947,7 +1981,9 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 						cancel()
 						return
 					}
-					log.Printf("remote poll error: %v", pollErr)
+					if ctx.Err() == nil {
+						log.Printf("remote poll error: %v", pollErr)
+					}
 					continue
 				}
 				if reconciled {
@@ -2039,7 +2075,7 @@ func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, e
 // subset, writing the folders the user picks to exclude into the active
 // account's ExcludeDirs. A no-op if the account has no folders yet.
 func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error {
-	topFolders, totalSize, err := sc.folderSummary(rootID)
+	topFolders, totalSize, err := sc.folderSummary(context.Background(), rootID)
 	if err != nil {
 		return err
 	}
@@ -2109,11 +2145,11 @@ func runSelectiveSync(apiURL, storageURL string) error {
 	}
 
 	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
-	root, err := sc.resolveRoot()
+	root, err := sc.resolveRoot(context.Background())
 	if err != nil {
 		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
 	}
-	topFolders, _, err := sc.folderSummary(root.ID)
+	topFolders, _, err := sc.folderSummary(context.Background(), root.ID)
 	if err != nil {
 		return err
 	}

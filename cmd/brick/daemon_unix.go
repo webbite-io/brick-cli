@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -213,7 +214,7 @@ func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool,
 	}
 
 	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
-	root, err := sc.resolveRoot()
+	root, err := sc.resolveRoot(context.Background())
 	if err != nil {
 		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
 	}

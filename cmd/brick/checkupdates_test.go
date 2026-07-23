@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -41,7 +42,7 @@ func TestCheckUpdates_NoChangesIsSingleRequest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	changed, serverTime, err := newCheckUpdatesClient(srv).checkUpdates(1000)
+	changed, serverTime, err := newCheckUpdatesClient(srv).checkUpdates(context.Background(), 1000)
 	if err != nil {
 		t.Fatalf("checkUpdates: %v", err)
 	}
@@ -66,7 +67,7 @@ func TestCheckUpdates_ShortCircuitsOnFirstChange(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	changed, serverTime, err := newCheckUpdatesClient(srv).checkUpdates(500)
+	changed, serverTime, err := newCheckUpdatesClient(srv).checkUpdates(context.Background(), 500)
 	if err != nil {
 		t.Fatalf("checkUpdates: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestCheckUpdates_FollowsCursorPastFilteredPages(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	changed, serverTime, err := newCheckUpdatesClient(srv).checkUpdates(100)
+	changed, serverTime, err := newCheckUpdatesClient(srv).checkUpdates(context.Background(), 100)
 	if err != nil {
 		t.Fatalf("checkUpdates: %v", err)
 	}
@@ -136,7 +137,7 @@ func TestCheckUpdates_PropagatesHTTPError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, _, err := newCheckUpdatesClient(srv).checkUpdates(0); err == nil {
+	if _, _, err := newCheckUpdatesClient(srv).checkUpdates(context.Background(), 0); err == nil {
 		t.Fatal("expected an error on a 500 response, got nil")
 	}
 }
@@ -149,7 +150,7 @@ func TestServerNow_ProbesWithFutureSince(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := newCheckUpdatesClient(srv).serverNow()
+	got, err := newCheckUpdatesClient(srv).serverNow(context.Background())
 	if err != nil {
 		t.Fatalf("serverNow: %v", err)
 	}
