@@ -72,10 +72,11 @@ func TestSyncHeaderLines(t *testing.T) {
 	if !strings.Contains(withQuota[1], "50.9 GB of 500.0 GB used total (your share 28.0 GB)") {
 		t.Errorf("storage line = %q, missing the expected usage figures", withQuota[1])
 	}
-	// The separator closes the block, and the storage line slots in above it
-	// without changing its width.
-	if withQuota[2] != withoutQuota[1] {
-		t.Errorf("separator changed with a quota present: %q vs %q", withQuota[2], withoutQuota[1])
+	// The separator closes the block and is sized to the line directly above
+	// it — the storage line once a quota is present, rather than the
+	// commands line above that.
+	if want := strings.Repeat("─", visibleWidth(withQuota[1])); withQuota[2] != want {
+		t.Errorf("separator = %q, want %q (storage line width)", withQuota[2], want)
 	}
 }
 
@@ -108,6 +109,25 @@ func TestTruncateLine(t *testing.T) {
 					tc.line, tc.width, got, visibleWidth(got))
 			}
 		})
+	}
+}
+
+// availableLines caps the log lines a redraw prints to whatever fits below
+// the header in the terminal's height, so a redraw never runs past the
+// bottom of the screen and forces a scroll — see the comment on
+// liveWindow.redrawLocked for why that scroll is unrecoverable.
+func TestAvailableLines(t *testing.T) {
+	if got := availableLines(0, 3, 10); got != 10 {
+		t.Errorf("availableLines(unknown height) = %d, want all 10 lines kept", got)
+	}
+	if got := availableLines(20, 3, 10); got != 10 {
+		t.Errorf("availableLines(plenty of room) = %d, want all 10 lines kept", got)
+	}
+	if got := availableLines(8, 3, 10); got != 4 {
+		t.Errorf("availableLines(short terminal) = %d, want 4 (8 - 1 banner - 3 header)", got)
+	}
+	if got := availableLines(2, 3, 10); got != 0 {
+		t.Errorf("availableLines(terminal shorter than the header) = %d, want 0, not negative", got)
 	}
 }
 

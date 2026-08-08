@@ -17,11 +17,11 @@ import (
 const liveWindowSize = 10
 
 const (
-	ansiReset     = "\033[0m"
-	ansiPurple    = "\033[38;5;135m"
-	ansiDarkGreen = "\033[38;5;22m"
-	ansiOrange    = "\033[38;5;208m"
-	ansiRed       = "\033[38;5;196m"
+	ansiReset      = "\033[0m"
+	ansiPurple     = "\033[38;5;135m"
+	ansiLightGreen = "\033[38;5;120m"
+	ansiOrange     = "\033[38;5;208m"
+	ansiRed        = "\033[38;5;196m"
 )
 
 // quotaWarnRatio and quotaCriticalRatio are the fractions of the account's
@@ -50,22 +50,22 @@ func printSyncBanner(folder string, interactive bool) {
 // a separator sized to match. q is nil until the first quota fetch succeeds,
 // in which case the storage line is simply left out.
 func syncHeaderLines(q *storageQuota) []string {
-	plain := "Ctrl+C: Stop"
-	colored := ansiDarkGreen + "Ctrl+C" + ansiReset + ": Stop"
+	colored := ansiLightGreen + "Ctrl+C" + ansiReset + ": Stop"
 	if daemonSupported {
-		plain += " • D: Detach as daemon"
-		colored += " • " + ansiDarkGreen + "D" + ansiReset + ": Detach as daemon"
+		colored += " • " + ansiLightGreen + "D" + ansiReset + ": Detach as daemon"
 	}
-	plain += " • P: Pause/resume"
-	colored += " • " + ansiDarkGreen + "P" + ansiReset + ": Pause/resume"
+	colored += " • " + ansiLightGreen + "P" + ansiReset + ": Pause/resume"
 
-	const prefix = "Commands: "
-	lines := []string{fmt.Sprintf("%sCommands:%s %s", ansiPurple, ansiReset, colored)}
+	commandsLine := fmt.Sprintf("%sCommands:%s %s", ansiPurple, ansiReset, colored)
+	lines := []string{commandsLine}
+	// Sized to the storage line when present, since it's drawn directly above
+	// the separator; otherwise falls back to the commands line.
+	sepWidth := visibleWidth(commandsLine)
 	if line := quotaLine(q); line != "" {
 		lines = append(lines, line)
+		sepWidth = visibleWidth(line)
 	}
-	// Sized to the commands line, which is always the widest of the block.
-	return append(lines, strings.Repeat("=", len(prefix)+len(plain)))
+	return append(lines, strings.Repeat("─", sepWidth))
 }
 
 // quotaLine renders the banner's storage usage line, e.g.
@@ -88,7 +88,7 @@ func quotaLine(q *storageQuota) string {
 	case ratio > quotaWarnRatio:
 		used = ansiOrange + used + ansiReset
 	}
-	return fmt.Sprintf("%sStorage:%s %s (your share %s)", ansiPurple, ansiReset, used, humanSize(q.CallingUser.UsedBytes))
+	return fmt.Sprintf("%sStorage: %s %s (your share %s)", ansiPurple, ansiReset, used, humanSize(q.CallingUser.UsedBytes))
 }
 
 // readSyncKeys reads single-byte keypresses from r (stdin, put into raw mode
@@ -172,24 +172,37 @@ func (w *liveWindow) Write(p []byte) (int, error) {
 // buffer. Raw terminal mode (enabled by runSyncLoop while this is in use)
 // disables output post-processing, so every line ends in "\r\n" rather than
 // a bare "\n" to keep the cursor at column 0.
+//
+// The log lines shown are additionally capped to whatever fits below the
+// header within the terminal's height (see availableLines): printing more
+// than that would run past the bottom of the screen and force it to scroll,
+// and once that happens the rows already written are gone from the
+// addressable viewport — ANSI cursor-up can no longer reach them to erase
+// them on the next redraw, so they're left behind as stale duplicates in
+// the scrollback rather than being replaced in place.
 func (w *liveWindow) redrawLocked() {
-	width := 0
-	if wd, _, err := term.GetSize(os.Stdout.Fd()); err == nil {
-		width = wd
+	width, height := 0, 0
+	if wd, ht, err := term.GetSize(os.Stdout.Fd()); err == nil {
+		width, height = wd, ht
+	}
+
+	lines := w.lines
+	if n := availableLines(height, len(w.header), len(lines)); n < len(lines) {
+		lines = lines[len(lines)-n:]
 	}
 
 	var b strings.Builder
 	if w.drawn > 0 {
 		fmt.Fprintf(&b, "\033[%dA", w.drawn)
 	}
-	for _, lines := range [][]string{w.header, w.lines} {
-		for _, line := range lines {
+	for _, ls := range [][]string{w.header, lines} {
+		for _, line := range ls {
 			b.WriteString("\033[2K\r")
 			b.WriteString(truncateLine(line, width))
 			b.WriteString("\r\n")
 		}
 	}
-	w.drawn = len(w.header) + len(w.lines)
+	w.drawn = len(w.header) + len(lines)
 	os.Stdout.WriteString(b.String())
 }
 
@@ -249,4 +262,23 @@ func visibleWidth(line string) int {
 		}
 	}
 	return n
+}
+
+// availableLines returns how many of the window's total log lines fit below
+// its header without the block running past the bottom of a height-row
+// terminal — accounting for the one-line "Syncing ..." banner printed above
+// it. height <= 0 means the terminal's size couldn't be determined, in which
+// case every line is kept as-is rather than guessing.
+func availableLines(height, header, total int) int {
+	if height <= 0 {
+		return total
+	}
+	avail := height - 1 - header
+	if avail < 0 {
+		avail = 0
+	}
+	if avail > total {
+		avail = total
+	}
+	return avail
 }
