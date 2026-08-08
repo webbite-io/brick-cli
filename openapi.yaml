@@ -108,6 +108,50 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /v1/quota:
+    get:
+      operationId: getQuota
+      summary: Account storage quota and usage
+      description: >-
+        The Storage API's own quota payload, relayed verbatim so a local
+        client can show storage usage without holding Storage API credentials
+        of its own.
+
+
+        `brick` refreshes this on startup and after every remote change it
+        applies, and serves the cached snapshot here; `fetchedAt` says how old
+        the figures are. Pass `refresh=1` to force a live call to the Storage
+        API instead — if that call fails but a cached snapshot exists, the
+        cached one is returned rather than an error.
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: >-
+            Set to `1` or `true` to fetch from the Storage API rather than
+            serving the cached snapshot.
+          schema:
+            type: string
+            enum: ["1", "true"]
+      responses:
+        "200":
+          description: Current quota and usage.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: >-
+            No quota has been fetched yet and the Storage API call failed
+            (unreachable, or the session needs re-authentication).
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: storage quota unavailable
+
   /v1/pause:
     post:
       operationId: pauseSync
@@ -306,3 +350,50 @@ components:
         clientId:
           type: string
       required: [accountId, clientId]
+
+    QuotaCallingUser:
+      type: object
+      description: >-
+        The share of the account's usage owned by the user this device is
+        logged in as, broken down by media type.
+      properties:
+        usedBytes:
+          type: integer
+          format: int64
+        usedVideoBytes:
+          type: integer
+          format: int64
+        usedImageBytes:
+          type: integer
+          format: int64
+        usedOtherBytes:
+          type: integer
+          format: int64
+      required: [usedBytes, usedVideoBytes, usedImageBytes, usedOtherBytes]
+
+    QuotaResponse:
+      type: object
+      description: >-
+        The Storage API's quota payload plus `fetchedAt`. Every other field is
+        passed through unchanged, so a client reads the same values it would
+        get by calling the Storage API's own quota endpoint.
+      properties:
+        quotaBytes:
+          type: integer
+          format: int64
+          description: Total storage the account is entitled to.
+        usedBytes:
+          type: integer
+          format: int64
+          description: Storage used across the whole account, by every user in it.
+        remainingBytes:
+          type: integer
+          format: int64
+        callingUser:
+          $ref: "#/components/schemas/QuotaCallingUser"
+        fetchedAt:
+          type: string
+          format: date-time
+          description: >-
+            When this process last fetched these figures from the Storage API.
+      required: [quotaBytes, usedBytes, remainingBytes, callingUser, fetchedAt]

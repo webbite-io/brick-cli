@@ -208,6 +208,7 @@ this user" instead of racing the first.
 | GET    | `/v1/status`    | Current sync state, counters, in-flight transfer, last error.       |
 | GET    | `/v1/activity`  | Recent upload/download/delete events (`?limit=`, default 50).      |
 | GET    | `/v1/account`   | The logged-in account/client ID.                                   |
+| GET    | `/v1/quota`     | Account storage quota and usage (`?refresh=1` to force a live fetch). |
 | POST   | `/v1/pause`     | Stop reconciling until resumed (the filesystem watcher keeps running). |
 | POST   | `/v1/resume`    | Resume reconciling immediately.                                     |
 | POST   | `/v1/quit`      | Gracefully shut down `brick` (same path as Ctrl+C).                 |

@@ -229,6 +229,30 @@ func (cs *controlServer) handler(eng *syncEngine, cancel context.CancelFunc, not
 		writeJSON(w, http.StatusOK, map[string]any{"accountId": accountID, "clientId": clientID})
 	}))
 
+	// The Storage API's own quota payload, relayed so a local client can show
+	// storage usage without holding Storage API credentials of its own.
+	// Served from the snapshot brick already refreshes on startup and after
+	// every remote change; `?refresh=1` forces a live fetch instead, and
+	// fetchedAt always says how old the returned figures are.
+	mux.HandleFunc("/v1/quota", authed(func(w http.ResponseWriter, r *http.Request) {
+		quota, fetchedAt := eng.quotaSnapshot()
+		if refresh := r.URL.Query().Get("refresh"); quota == nil || refresh == "1" || refresh == "true" {
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			defer cancel()
+			if _, err := eng.refreshQuota(ctx); err != nil {
+				if quota == nil {
+					http.Error(w, "storage quota unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				// Otherwise fall through and serve what we already have —
+				// fetchedAt tells the client how stale it is.
+			} else {
+				quota, fetchedAt = eng.quotaSnapshot()
+			}
+		}
+		writeJSON(w, http.StatusOK, controlQuota{storageQuota: *quota, FetchedAt: fetchedAt})
+	}))
+
 	mux.HandleFunc("/v1/pause", authed(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

@@ -55,6 +55,24 @@ type storageUploadResult struct {
 	Node storageNode `json:"node"`
 }
 
+// storageQuota is the account's storage usage as reported by
+// GET /v1/accounts/{accountId}/quota. UsedBytes covers the whole account
+// (every user in it); CallingUser breaks out the share owned by the user this
+// device is logged in as.
+type storageQuota struct {
+	QuotaBytes     int64            `json:"quotaBytes"`
+	UsedBytes      int64            `json:"usedBytes"`
+	RemainingBytes int64            `json:"remainingBytes"`
+	CallingUser    storageQuotaUser `json:"callingUser"`
+}
+
+type storageQuotaUser struct {
+	UsedBytes      int64 `json:"usedBytes"`
+	UsedVideoBytes int64 `json:"usedVideoBytes"`
+	UsedImageBytes int64 `json:"usedImageBytes"`
+	UsedOtherBytes int64 `json:"usedOtherBytes"`
+}
+
 // --- Storage API client ---
 
 // storageClient talks to the Storage API. Requests go to baseURL; token refresh
@@ -95,6 +113,25 @@ func (sc *storageClient) resolveRoot(ctx context.Context) (*storageNode, error) 
 		return nil, err
 	}
 	return &node, nil
+}
+
+// quota fetches the account's storage usage. Cheap enough (a single request
+// returning counters the server already tracks) to call on startup and after
+// every remote change that lands.
+func (sc *storageClient) quota(ctx context.Context) (*storageQuota, error) {
+	resp, err := sc.request(ctx, "GET", "/quota", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, sc.errFrom(resp)
+	}
+	var q storageQuota
+	if err := json.NewDecoder(resp.Body).Decode(&q); err != nil {
+		return nil, err
+	}
+	return &q, nil
 }
 
 func (sc *storageClient) listChildren(ctx context.Context, parentID string) ([]storageNode, error) {
@@ -576,6 +613,19 @@ type syncEngine struct {
 	ctrlLastSync  time.Time
 	ctrlInFlight  *controlInFlight
 	ctrlActivity  []controlActivityEvent
+	ctrlQuota     *storageQuota
+	ctrlQuotaAt   time.Time
+
+	// onQuota, when set, is called with each freshly fetched quota so the
+	// interactive banner can repaint its storage line. Runs on whichever
+	// goroutine did the refresh. Assigned once during setup, before any of
+	// them start.
+	onQuota func(*storageQuota)
+
+	// quotaErrOnce keeps a persistently failing quota fetch — an older server
+	// without the endpoint, say — from logging on every remote change. Quota
+	// is decoration around syncing, so one report of the problem is enough.
+	quotaErrOnce sync.Once
 }
 
 // controlInFlight describes the single file transfer in progress, if any.
@@ -687,6 +737,14 @@ type controlStatus struct {
 	InFlight            *controlInFlight `json:"inFlight"`
 }
 
+// controlQuota is the JSON shape served at /v1/quota: the Storage API's quota
+// payload verbatim (so a client reads the same fields it would get from the
+// source API) plus when this process last fetched it.
+type controlQuota struct {
+	storageQuota
+	FetchedAt time.Time `json:"fetchedAt"`
+}
+
 type controlCounters struct {
 	Uploaded   int64 `json:"uploaded"`
 	Downloaded int64 `json:"downloaded"`
@@ -716,6 +774,46 @@ func (e *syncEngine) statusSnapshot() controlStatus {
 		},
 		InFlight: e.ctrlInFlight,
 	}
+}
+
+// refreshQuota fetches the account's storage usage and caches it for the
+// interactive banner and the control API's /v1/quota.
+func (e *syncEngine) refreshQuota(ctx context.Context) (*storageQuota, error) {
+	if e.sc == nil {
+		return nil, errors.New("no storage client")
+	}
+	q, err := e.sc.quota(ctx)
+	if err != nil {
+		return nil, err
+	}
+	e.ctrlMu.Lock()
+	e.ctrlQuota = q
+	e.ctrlQuotaAt = time.Now()
+	onQuota := e.onQuota
+	e.ctrlMu.Unlock()
+	if onQuota != nil {
+		onQuota(q)
+	}
+	return q, nil
+}
+
+// refreshQuotaAsync refreshes the cached quota off the caller's goroutine, so
+// a slow or unreachable quota endpoint never holds up a sync pass. Failures
+// are reported once and then stay quiet (see quotaErrOnce).
+func (e *syncEngine) refreshQuotaAsync(ctx context.Context) {
+	go func() {
+		if _, err := e.refreshQuota(ctx); err != nil && ctx.Err() == nil {
+			e.quotaErrOnce.Do(func() { log.Printf("could not read storage quota: %v", err) })
+		}
+	}()
+}
+
+// quotaSnapshot returns the cached quota and when it was fetched. The quota is
+// nil until the first successful fetch.
+func (e *syncEngine) quotaSnapshot() (*storageQuota, time.Time) {
+	e.ctrlMu.RLock()
+	defer e.ctrlMu.RUnlock()
+	return e.ctrlQuota, e.ctrlQuotaAt
 }
 
 func (e *syncEngine) markRecentlyWritten(abs string) {
@@ -1834,10 +1932,28 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 	if interactive {
 		if state, rawErr := term.MakeRaw(os.Stdin.Fd()); rawErr == nil {
 			rawState = state
-			log.SetOutput(newLiveWindow(liveWindowSize))
+			// The commands/storage/separator block lives in the live window's
+			// header rather than being printed once, so the storage line can
+			// be repainted in place each time the quota is refreshed.
+			win := newLiveWindow(liveWindowSize)
+			win.setHeader(syncHeaderLines(nil))
+			eng.onQuota = func(q *storageQuota) { win.setHeader(syncHeaderLines(q)) }
+			log.SetOutput(win)
 			go readSyncKeys(os.Stdin, cancel, &detachRequested, togglePause)
+		} else {
+			// No raw mode, so no live window to own the header — print it once
+			// as ordinary output instead. The storage line can't be updated in
+			// place here, so it's left out entirely rather than shown stale.
+			for _, line := range syncHeaderLines(nil) {
+				fmt.Println(line)
+			}
 		}
 	}
+
+	// Storage quota for the banner's "Storage: ..." line and the control API's
+	// /v1/quota, refreshed here at startup and again below whenever a remote
+	// change lands.
+	eng.refreshQuotaAsync(ctx)
 
 	// Remote file agent: register this device with the storage API. When
 	// remoteControl is enabled, the allowed roots are also exposed so the same
@@ -1854,7 +1970,10 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agentAddr, remoteControl)
 		defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)
 		if remoteControl {
-			fmt.Printf("Remote control enabled (roots: %s)\n", strings.Join(agentRoots, ", "))
+			// Logged rather than printed: in interactive mode the live window
+			// owns everything below the banner, and writing to stdout behind
+			// its back would be overwritten by its next redraw.
+			log.Printf("Remote control enabled (roots: %s)", strings.Join(agentRoots, ", "))
 		}
 	}
 
@@ -1936,6 +2055,11 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 					if ctx.Err() == nil {
 						log.Printf("sync error: %v", err)
 					}
+				} else {
+					// Local changes (uploads/deletes) just landed remotely, so
+					// the usage figures the banner and /v1/quota report are
+					// now stale.
+					eng.refreshQuotaAsync(ctx)
 				}
 				eng.addWatchesRecursive(watcher)
 			}
@@ -1988,6 +2112,9 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 				}
 				if reconciled {
 					eng.addWatchesRecursive(watcher)
+					// Remote changes just landed locally, so the usage figures
+					// the banner and /v1/quota report are now stale.
+					eng.refreshQuotaAsync(ctx)
 				}
 			}
 		}

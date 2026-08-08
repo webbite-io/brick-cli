@@ -6,7 +6,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -253,6 +255,100 @@ func TestControlServerActivity(t *testing.T) {
 	// Newest first.
 	if events[0].RelPath != "c.txt" || events[1].RelPath != "b.txt" {
 		t.Errorf("events = %+v, want [c.txt, b.txt]", events)
+	}
+}
+
+// /v1/quota serves the snapshot the sync loop keeps refreshed, and only calls
+// the Storage API itself when there is nothing cached (or a refresh is asked
+// for). The stub storage API here counts calls so both halves are visible.
+func TestControlServerQuota(t *testing.T) {
+	var calls atomic.Int64
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if got, want := r.URL.Path, "/v1/accounts/acct-1/quota"; got != want {
+			t.Errorf("storage API path = %q, want %q", got, want)
+		}
+		writeJSON(w, http.StatusOK, storageQuota{
+			QuotaBytes:     536870912000,
+			UsedBytes:      54666913545,
+			RemainingBytes: 482203998455,
+			CallingUser:    storageQuotaUser{UsedBytes: 30023108123},
+		})
+	}))
+	defer storage.Close()
+
+	cs, eng, cleanup := newTestControlServer(t)
+	defer cleanup()
+	eng.sc = &storageClient{baseURL: storage.URL, apiURL: storage.URL, accountID: "acct-1", cfg: &Config{}}
+	client := httpClientFor(cs)
+
+	get := func(query string) (int, controlQuota) {
+		t.Helper()
+		req, _ := http.NewRequest("GET", "http://unix/v1/quota"+query, nil)
+		req.Header.Set(controlSecretHeader, cs.token)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var q controlQuota
+		if resp.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(resp.Body).Decode(&q); err != nil {
+				t.Fatalf("decode quota: %v", err)
+			}
+		}
+		return resp.StatusCode, q
+	}
+
+	// Nothing cached yet -> fetches from the Storage API.
+	status, q := get("")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if q.QuotaBytes != 536870912000 || q.UsedBytes != 54666913545 || q.CallingUser.UsedBytes != 30023108123 {
+		t.Errorf("quota = %+v, want the Storage API's figures relayed verbatim", q)
+	}
+	if q.FetchedAt.IsZero() {
+		t.Error("fetchedAt is zero, want the time of the fetch")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("storage API calls = %d, want 1", n)
+	}
+
+	// Cached -> served without touching the Storage API again.
+	if status, _ := get(""); status != http.StatusOK {
+		t.Fatalf("cached status = %d, want 200", status)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("storage API calls after a cached read = %d, want 1", n)
+	}
+
+	// ?refresh=1 forces a live fetch even with a snapshot in hand.
+	if status, _ := get("?refresh=1"); status != http.StatusOK {
+		t.Fatalf("refresh status = %d, want 200", status)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Errorf("storage API calls after ?refresh=1 = %d, want 2", n)
+	}
+}
+
+// With no snapshot cached and the Storage API unreachable there is nothing to
+// serve, so the client gets a 503 rather than a zero-valued quota it might
+// render as "0 of 0 bytes used".
+func TestControlServerQuotaUnavailable(t *testing.T) {
+	cs, eng, cleanup := newTestControlServer(t)
+	defer cleanup()
+	eng.sc = &storageClient{baseURL: "http://127.0.0.1:1", apiURL: "http://127.0.0.1:1", accountID: "acct-1", cfg: &Config{}}
+
+	req, _ := http.NewRequest("GET", "http://unix/v1/quota", nil)
+	req.Header.Set(controlSecretHeader, cs.token)
+	resp, err := httpClientFor(cs).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
 }
 
