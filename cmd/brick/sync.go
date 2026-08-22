@@ -1750,12 +1750,128 @@ type syncSetup struct {
 	isFirstSetup bool
 }
 
+// onboardingChecklist prints a running numbered list of completed first-run
+// setup steps as onboarding proceeds ("1. ✅ Logged in to account: acme",
+// "2. ✅ Sync folder selected (~/Brick)", ...), so the user is left with a
+// persistent summary of everything that was just configured. Safe to call
+// methods on a nil pointer, so callers outside the first-run flow (e.g.
+// --switch-accounts) can pass nil and skip the checklist entirely.
+//
+// Between entries, onboarding prints transient status text and prompts (e.g.
+// "Opening browser for login...", the Y/n questions themselves) via print,
+// println, printf and promptRow rather than fmt directly. Those calls track
+// how many terminal rows that text used in pending; the next call to done
+// erases exactly those rows before drawing the new entry, so the finished
+// checklist ends up as one contiguous block instead of interleaved with the
+// now-irrelevant prompts that produced each entry.
+type onboardingChecklist struct {
+	n       int
+	pending int
+}
+
+// print writes s to stdout and, unless c is nil, counts the rows it used
+// toward the next done call's erasure. Each line terminated by a '\n' counts
+// for as many rows as it actually occupies on screen — a line longer than
+// the terminal width wraps onto more than one row — so the eventual
+// cursor-up in done lands back at the true start of the ephemeral block
+// rather than undershooting on a long line like the OAuth URL.
+func (c *onboardingChecklist) print(s string) {
+	fmt.Print(s)
+	if c == nil {
+		return
+	}
+	width := 0
+	if wd, _, err := term.GetSize(os.Stdout.Fd()); err == nil {
+		width = wd
+	}
+	lines := strings.Split(s, "\n")
+	for _, line := range lines[:len(lines)-1] {
+		c.pending += rowsForLine(line, width)
+	}
+}
+
+// rowsForLine returns how many terminal rows a single line (no embedded
+// newlines) occupies once printed, given a terminal width (0 if unknown, in
+// which case it's assumed not to wrap).
+func rowsForLine(line string, width int) int {
+	if width <= 0 {
+		return 1
+	}
+	n := visibleWidth(line)
+	if n == 0 {
+		return 1
+	}
+	return (n + width - 1) / width
+}
+
+func (c *onboardingChecklist) printf(format string, args ...any) {
+	c.print(fmt.Sprintf(format, args...))
+}
+
+func (c *onboardingChecklist) println(s string) {
+	c.print(s + "\n")
+}
+
+// promptRow records one additional pending row for a prompt printed via
+// print/printf without a trailing newline, whose row is nonetheless used up
+// once the terminal echoes the user's answer and Enter.
+func (c *onboardingChecklist) promptRow() {
+	if c != nil {
+		c.pending++
+	}
+}
+
+// done erases the rows accumulated since the last entry (if any), then draws
+// the next numbered checklist entry.
+func (c *onboardingChecklist) done(format string, args ...any) {
+	if c == nil {
+		return
+	}
+	if c.pending > 0 {
+		fmt.Printf("\033[%dA\033[J", c.pending)
+		c.pending = 0
+	}
+	c.n++
+	fmt.Printf("%d. ✅ %s\n", c.n, fmt.Sprintf(format, args...))
+}
+
+// promptYesNo prints prompt (which may itself lead with "\n" for blank-line
+// spacing) and reads a Y/n response from stdin, returning whether the user
+// answered yes (the default for an empty or unreadable response). When
+// checklist is non-nil, the prompt's row is tracked so a later checklist
+// entry can erase it.
+func promptYesNo(checklist *onboardingChecklist, prompt string) bool {
+	checklist.print(prompt)
+	checklist.promptRow()
+	reader := bufio.NewReader(os.Stdin)
+	response, err := reader.ReadString('\n')
+	return err == nil && strings.TrimSpace(strings.ToLower(response)) != "n"
+}
+
+// displayPath renders an absolute path relative to the user's home directory
+// (prefixed with ~) when it falls under it, or as the full path otherwise.
+func displayPath(abs string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return abs
+	}
+	if abs == home {
+		return "~"
+	}
+	if rel, relErr := filepath.Rel(home, abs); relErr == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.Join("~", rel)
+	}
+	return abs
+}
+
 // prepareSync runs the interactive setup steps needed before a sync can
 // start: authentication, sync folder resolution (prompting on first run), a
 // Storage API reachability check, and (on a brand new setup) the sync-scope
 // onboarding.
 func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
-	cfg, err := ensureAuthenticated(apiURL)
+	checklist := &onboardingChecklist{}
+
+	cfg, err := ensureAuthenticated(apiURL, checklist)
 	if err != nil {
 		return nil, err
 	}
@@ -1765,7 +1881,7 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 
 	ac := cfg.activeAccount()
 	isFirstSetup := ac == nil || strings.TrimSpace(ac.StorageSyncFolder) == ""
-	folder, conflictMode, err := ensureStorageSyncFolder(cfg)
+	folder, conflictMode, err := ensureStorageSyncFolder(cfg, checklist)
 	if err != nil {
 		return nil, err
 	}
@@ -1777,13 +1893,14 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 	}
 
 	if isFirstSetup {
-		if err := runSyncScopeOnboarding(sc, root.ID, cfg); err != nil {
+		if err := runSyncScopeOnboarding(sc, root.ID, cfg, checklist); err != nil {
 			return nil, err
 		}
-		if err := promptForRemoteControl(cfg); err != nil {
+		if err := promptForRemoteControl(cfg, checklist); err != nil {
 			return nil, err
 		}
-		fmt.Println("\nNow, we're ready. Brick will now sync your files...")
+		checklist.done("Done and ready to go!")
+		fmt.Println()
 	}
 
 	return &syncSetup{
@@ -2165,11 +2282,12 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 // conflictMode is only meaningful the first time a folder is configured, and is
 // empty otherwise; it reports how pre-existing local files that already have a
 // remote counterpart should be reconciled during the very first sync.
-func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, err error) {
+func ensureStorageSyncFolder(cfg *Config, checklist *onboardingChecklist) (folder string, conflictMode string, err error) {
 	ac := cfg.ensureActiveAccount()
 	folder = strings.TrimSpace(ac.StorageSyncFolder)
-	if folder == "" {
-		folder, conflictMode, err = promptForSyncFolder()
+	prompted := folder == ""
+	if prompted {
+		folder, conflictMode, err = promptForSyncFolder(checklist)
 		if err != nil {
 			return "", "", err
 		}
@@ -2192,7 +2310,11 @@ func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, e
 		if err := saveConfig(cfg); err != nil {
 			return "", "", err
 		}
-		fmt.Printf("Saved storageSyncFolder = %s\n", abs)
+		if prompted {
+			checklist.done("Sync folder selected (%s)", displayPath(abs))
+		} else {
+			fmt.Printf("Saved storageSyncFolder = %s\n", abs)
+		}
 	}
 	return abs, conflictMode, nil
 }
@@ -2201,7 +2323,7 @@ func ensureStorageSyncFolder(cfg *Config) (folder string, conflictMode string, e
 // has any top-level folders, it asks whether to sync everything or only a
 // subset, writing the folders the user picks to exclude into the active
 // account's ExcludeDirs. A no-op if the account has no folders yet.
-func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error {
+func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config, checklist *onboardingChecklist) error {
 	topFolders, totalSize, err := sc.folderSummary(context.Background(), rootID)
 	if err != nil {
 		return err
@@ -2210,8 +2332,8 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error
 		return nil
 	}
 
-	fmt.Println("\nOne last decision to make:")
-	fmt.Println()
+	checklist.println("\nOne last decision to make:")
+	checklist.println("")
 
 	const (
 		optAll  = "all"
@@ -2230,6 +2352,7 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error
 		return err
 	}
 	if choice == optAll {
+		checklist.done("Folders selected (all)")
 		return nil
 	}
 
@@ -2248,7 +2371,11 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error
 	}
 
 	cfg.ensureActiveAccount().ExcludeDirs = excludeDirs
-	return saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
+	checklist.done("Folders selected (%d of %d)", len(topFolders)-len(excludeDirs), len(topFolders))
+	return nil
 }
 
 // runSelectiveSync lets the user update which top-level folders are excluded
@@ -2258,7 +2385,7 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config) error
 // persisted to the active account's config, and any currently running brick
 // instance is stopped, restarting it in the background if it was a daemon.
 func runSelectiveSync(apiURL, storageURL string) error {
-	cfg, err := ensureAuthenticated(apiURL)
+	cfg, err := ensureAuthenticated(apiURL, nil)
 	if err != nil {
 		return err
 	}
@@ -2368,15 +2495,15 @@ func runListSelectiveSync() error {
 // default ~/Brick or a custom folder browsed via a huh file picker — and, if
 // that folder already contains files, how to resolve conflicts with the
 // remote copy during the first sync.
-func promptForSyncFolder() (folder string, conflictMode string, err error) {
+func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflictMode string, err error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", "", fmt.Errorf("could not determine home directory: %w", err)
 	}
 	defaultFolder := filepath.Join(home, "Brick")
 
-	fmt.Println("\n\nYou have no sync folder configured (storageSyncFolder).")
-	fmt.Println()
+	checklist.println("\n\nYou have no sync folder configured (storageSyncFolder).")
+	checklist.println("")
 
 	const (
 		optDefault = "default"
@@ -2422,7 +2549,7 @@ func promptForSyncFolder() (folder string, conflictMode string, err error) {
 		return "", "", err
 	}
 	if hasFiles {
-		conflictMode, err = promptConflictMode()
+		conflictMode, err = promptConflictMode(checklist)
 		if err != nil {
 			return "", "", err
 		}
@@ -2436,13 +2563,11 @@ func promptForSyncFolder() (folder string, conflictMode string, err error) {
 // cfg.RemoteControl/cfg.AgentRoots so it takes effect on every future run
 // without needing -r; declining here just means -r can still be used to
 // force it on for a single invocation later.
-func promptForRemoteControl(cfg *Config) error {
-	fmt.Print("\nDo you want to remotely access files on this device via Brick? (Y/n): ")
-	reader := bufio.NewReader(os.Stdin)
-	response, err := reader.ReadString('\n')
-	if err != nil || strings.TrimSpace(strings.ToLower(response)) == "n" {
+func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
+	if !promptYesNo(checklist, "\nDo you want to remotely access files on this device via Brick? (Y/n): ") {
 		return nil
 	}
+	checklist.println("")
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -2503,16 +2628,16 @@ func promptForRemoteControl(cfg *Config) error {
 		return err
 	}
 
-	fmt.Println("\nRemote file access is now ON by default. Disable via remoteControl flag in config file.")
+	checklist.done("Remote file access enabled (root folder: %s)", displayPath(abs))
 	return nil
 }
 
 // promptConflictMode asks how to resolve files that already exist both
 // locally (in a pre-existing, non-empty sync folder) and remotely, before any
 // sync history exists for them.
-func promptConflictMode() (string, error) {
-	fmt.Println("Your sync folder already contains files, how should we handle possible conflicts?")
-	fmt.Println()
+func promptConflictMode(checklist *onboardingChecklist) (string, error) {
+	checklist.println("Your sync folder already contains files, how should we handle possible conflicts?")
+	checklist.println("")
 	var mode string
 	err := huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().

@@ -153,14 +153,14 @@ func runWithAutoRelogin(apiURL string, fn func() error) error {
 	if readErr != nil || strings.EqualFold(strings.TrimSpace(response), "n") {
 		return errors.New("login cancelled")
 	}
-	if loginErr := runLogin(apiURL); loginErr != nil {
+	if loginErr := runLogin(apiURL, nil); loginErr != nil {
 		return fmt.Errorf("login failed: %w", loginErr)
 	}
 	return fn()
 }
 
 // runLogin performs the OIDC Authorization Code + PKCE login flow.
-func runLogin(apiURL string) error {
+func runLogin(apiURL string, checklist *onboardingChecklist) error {
 	clientID := getEnv("OAUTH_CLIENT_ID", DefaultOAuthClientID)
 	if clientID == "" {
 		return errors.New("OAUTH_CLIENT_ID is not set")
@@ -235,10 +235,10 @@ func runLogin(apiURL string) error {
 	}()
 	defer srv.Shutdown(context.Background()) //nolint:errcheck
 
-	fmt.Printf("Opening browser for login...\n\n")
-	fmt.Printf("If the browser does not open, visit this URL manually:\n\n  %s\n\n", authURL)
+	checklist.printf("Opening browser for login...\n\n")
+	checklist.printf("If the browser does not open, visit this URL manually:\n\n  %s\n\n", authURL)
 	openBrowser(authURL)
-	fmt.Println("Waiting for authorization...")
+	checklist.println("Waiting for authorization...")
 
 	// Wait up to 5 minutes for the callback.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -275,9 +275,9 @@ func runLogin(apiURL string) error {
 	}
 
 	if userInfo.GivenName != "" && userInfo.FamilyName != "" {
-		fmt.Printf("\nHello %s %s 👋\n", userInfo.GivenName, userInfo.FamilyName)
+		checklist.printf("\nHello %s %s 👋\n", userInfo.GivenName, userInfo.FamilyName)
 	} else {
-		fmt.Println("\nLogin successful 🎉.")
+		checklist.println("\nLogin successful 🎉.")
 	}
 
 	// Fetch accounts and pick one (prompting if there's more than one).
@@ -285,7 +285,7 @@ func runLogin(apiURL string) error {
 	if err != nil {
 		return err
 	}
-	accountID, accountName, err := selectAccount(accounts)
+	accountID, accountName, err := selectAccount(accounts, checklist)
 	if err != nil {
 		return err
 	}
@@ -295,7 +295,11 @@ func runLogin(apiURL string) error {
 		return err
 	}
 
-	fmt.Printf("Brick now has access to your account: %s.\n  To switch account, use the --switch-accounts parameter.", accountName)
+	if checklist != nil {
+		checklist.done("Logged in to account: %s", accountName)
+	} else {
+		fmt.Printf("Brick now has access to your account: %s.\n  To switch account, use the --switch-accounts parameter.", accountName)
+	}
 	return nil
 }
 
@@ -371,13 +375,13 @@ func fetchAccounts(apiURL, accessToken string) ([]accountInfo, error) {
 
 // selectAccount returns the account to use: the only one if there's just one,
 // otherwise an interactive prompt to pick from the list.
-func selectAccount(accounts []accountInfo) (id, name string, err error) {
+func selectAccount(accounts []accountInfo, checklist *onboardingChecklist) (id, name string, err error) {
 	if len(accounts) == 1 {
 		return accounts[0].ID, accounts[0].Name, nil
 	}
 
-	fmt.Println("\nYou have access to more than one account, which one do you want to use?")
-	fmt.Println()
+	checklist.println("\nYou have access to more than one account, which one do you want to use?")
+	checklist.println("")
 
 	options := make([]huh.Option[string], len(accounts))
 	for i, a := range accounts {
@@ -457,7 +461,7 @@ var errLoginDeclined = errors.New("login declined")
 
 // ensureAuthenticated ensures the config has a valid access token, refreshing or
 // prompting login as needed. Returns the (possibly updated) config.
-func ensureAuthenticated(apiURL string) (*Config, error) {
+func ensureAuthenticated(apiURL string, checklist *onboardingChecklist) (*Config, error) {
 	cfg, err := loadOrCreateConfig()
 	if err != nil {
 		return nil, err
@@ -465,13 +469,10 @@ func ensureAuthenticated(apiURL string) (*Config, error) {
 
 	// No credentials at all — ask user to log in.
 	if cfg.AccessToken == "" && cfg.RefreshToken == "" {
-		fmt.Print("Do you want to log in to get started? (Y/n): ")
-		reader := bufio.NewReader(os.Stdin)
-		response, err := reader.ReadString('\n')
-		if err != nil || strings.TrimSpace(strings.ToLower(response)) == "n" {
+		if !promptYesNo(checklist, "\nDo you want to log in to get started? (Y/n): ") {
 			return nil, errLoginDeclined
 		}
-		if err := runLogin(apiURL); err != nil {
+		if err := runLogin(apiURL, checklist); err != nil {
 			return nil, err
 		}
 		// Reload config after login.
@@ -590,7 +591,7 @@ func authedPost(apiURL, path, accessToken string, body []byte, cfg *Config) (*ht
 // daemon is currently running, it's stopped and (if it was a background
 // daemon) relaunched so it picks up the new account without a manual restart.
 func runSwitchAccounts(apiURL, storageURL string) error {
-	cfg, err := ensureAuthenticated(apiURL)
+	cfg, err := ensureAuthenticated(apiURL, nil)
 	if err != nil {
 		return err
 	}
@@ -663,7 +664,7 @@ func runSwitchAccounts(apiURL, storageURL string) error {
 func onboardNewAccount(apiURL, storageURL string, cfg *Config) error {
 	fmt.Println("\nThis account hasn't been synced on this device before — let's set it up.")
 
-	folder, _, err := ensureStorageSyncFolder(cfg)
+	folder, _, err := ensureStorageSyncFolder(cfg, nil)
 	if err != nil {
 		return err
 	}
@@ -674,7 +675,7 @@ func onboardNewAccount(apiURL, storageURL string, cfg *Config) error {
 		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
 	}
 
-	if err := runSyncScopeOnboarding(sc, root.ID, cfg); err != nil {
+	if err := runSyncScopeOnboarding(sc, root.ID, cfg, nil); err != nil {
 		return err
 	}
 

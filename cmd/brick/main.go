@@ -97,7 +97,7 @@ func main() {
 	// Login flow
 	if loginMode {
 		apiURL := resolveAPIURL()
-		if err := runLogin(apiURL); err != nil {
+		if err := runLogin(apiURL, nil); err != nil {
 			log.Fatalf("Login failed: %v", err)
 		}
 		os.Exit(0)
