@@ -728,6 +728,31 @@ func (e *syncEngine) setPaused(p bool) {
 	}
 }
 
+// errPausedMidPass signals that e.paused flipped true while reconcileAll was
+// partway through a pass, so it unwound early instead of running to
+// completion or blocking until resumed. It is not a real failure — setPaused
+// already logged the pause — so every place this can surface (reconcileAll's
+// own state bookkeeping, and each of its callers below) treats it the same
+// way it already treats ctx cancellation: silently, without recording a sync
+// error or printing a second log line under "⏸ sync paused".
+var errPausedMidPass = errors.New("sync paused mid-pass")
+
+// checkInterrupted reports whether reconcileAll should stop iterating and
+// return: either ctx was cancelled, or e.paused became true since the pass
+// started. Callers check this only between whole files/folders, never inside
+// a single transfer, so pausing can never leave a partial upload/download —
+// the same guarantee ctx cancellation already relies on (see downloadFile's
+// atomicWrite and the in-memory upload/download bodies).
+func (e *syncEngine) checkInterrupted(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if e.paused.Load() {
+		return errPausedMidPass
+	}
+	return nil
+}
+
 // controlStatus is the JSON shape served at /v1/status.
 type controlStatus struct {
 	State               string           `json:"state"`
@@ -1102,7 +1127,7 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := ctx.Err(); err != nil {
+	if err := e.checkInterrupted(ctx); err != nil {
 		return err
 	}
 
@@ -1112,8 +1137,9 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 		// surfacing it as a lingering "error" status would be misleading —
 		// the process is shutting down, not stuck. A context cancellation
 		// (Ctrl+C/SIGTERM interrupting mid-reconcile) is shutting down for the
-		// same reason, so it gets the same treatment.
-		if err != nil && !errors.Is(err, errSessionExpired) && ctx.Err() == nil {
+		// same reason, so it gets the same treatment. errPausedMidPass gets it
+		// too: the pass was interrupted on purpose, not broken.
+		if err != nil && !errors.Is(err, errSessionExpired) && !errors.Is(err, errPausedMidPass) && ctx.Err() == nil {
 			e.setSyncError(err)
 		} else if err == nil {
 			e.setSynced()
@@ -1164,7 +1190,7 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 	})
 	handledDeletes := map[string]bool{}
 	for _, rel := range deletedDirs {
-		if err := ctx.Err(); err != nil {
+		if err := e.checkInterrupted(ctx); err != nil {
 			return err
 		}
 		if isUnderAny(rel, handledDeletes) {
@@ -1209,7 +1235,7 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 		keys[k] = struct{}{}
 	}
 	for rel := range keys {
-		if err := ctx.Err(); err != nil {
+		if err := e.checkInterrupted(ctx); err != nil {
 			return err
 		}
 		if err := e.reconcileFile(ctx, rel, remoteFiles, localFiles, remoteFolders, folderID); err != nil {
@@ -1224,7 +1250,7 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 	//    This is what carries up empty directories the user just created; folders
 	//    that hold new files were already created during the file pass.
 	for rel := range localDirs {
-		if err := ctx.Err(); err != nil {
+		if err := e.checkInterrupted(ctx); err != nil {
 			return err
 		}
 		if _, ok := remoteFolders[rel]; ok {
@@ -1280,6 +1306,14 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 	}
 
 	e.saveStateLocked()
+	// Cleared here, on genuine completion, rather than unconditionally by the
+	// caller right after the first call: an initial sync that gets aborted
+	// mid-pass by errPausedMidPass must NOT flip this early, or files left
+	// over from that aborted pass would fall through to ordinary
+	// last-writer-wins on resume instead of the conflict mode chosen during
+	// onboarding (see applyFirstSyncConflict). Redundant to set on every
+	// later call once it's already false.
+	e.firstSync = false
 	return nil
 }
 
@@ -2100,15 +2134,18 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 	}
 
 	// Initial full reconciliation (pulls everything, pushes local-only files).
+	// If the user pauses partway through (see checkInterrupted), this returns
+	// errPausedMidPass having synced only some files; eng.firstSync stays true
+	// until a pass actually completes (set inside reconcileAll itself), and
+	// resuming re-triggers the debounce worker below to pick up the rest.
 	if err := eng.reconcileAll(ctx); err != nil {
 		if errors.Is(err, errSessionExpired) {
 			return false, err
 		}
-		if ctx.Err() == nil {
+		if ctx.Err() == nil && !errors.Is(err, errPausedMidPass) {
 			log.Printf("initial sync error: %v", err)
 		}
 	}
-	eng.firstSync = false
 	if bootstrapTime > 0 {
 		eng.setCursor(bootstrapTime)
 	}
@@ -2164,7 +2201,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 						cancel()
 						return
 					}
-					if ctx.Err() == nil {
+					if ctx.Err() == nil && !errors.Is(err, errPausedMidPass) {
 						log.Printf("sync error: %v", err)
 					}
 				} else {
@@ -2217,7 +2254,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 						cancel()
 						return
 					}
-					if ctx.Err() == nil {
+					if ctx.Err() == nil && !errors.Is(pollErr, errPausedMidPass) {
 						log.Printf("remote poll error: %v", pollErr)
 					}
 					continue
