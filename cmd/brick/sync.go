@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/x/term"
 	"github.com/fsnotify/fsnotify"
@@ -2357,7 +2358,7 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config, check
 	var excludeDirs []string
 	if err := huh.NewForm(huh.NewGroup(
 		huh.NewMultiSelect[string]().
-			Title("Select the folders to EXCLUDE from sync").
+			Title("Select the folders to EXCLUDE from sync (type "x" to toggle)").
 			Options(options...).
 			Value(&excludeDirs),
 	)).Run(); err != nil {
@@ -2485,10 +2486,33 @@ func runListSelectiveSync() error {
 	return nil
 }
 
+// escBackKeyMap returns a huh keymap identical to the default except Esc also
+// triggers the form's Quit binding (alongside ctrl+c). huh's file picker and
+// text input fields don't treat a plain Esc as "cancel" themselves -- for the
+// file picker it just closes the browser and advances to the next field with
+// whatever (possibly empty) value was set, and for a text input it's a no-op
+// key that leaves focus in place. Applying this keymap to a single-field form
+// makes Esc abort that form with huh.ErrUserAborted, which callers use to
+// detect "user backed out" and return to the previous prompt instead of
+// silently accepting an unset value.
+func escBackKeyMap() *huh.KeyMap {
+	km := huh.NewDefaultKeyMap()
+	km.Quit = key.NewBinding(key.WithKeys("esc", "ctrl+c"))
+	return km
+}
+
+// filePickerFormHeight is passed to huh.FilePicker.Height on the onboarding
+// folder pickers so they list 7 entries before scrolling, instead of huh's
+// default of 3. It accounts for the field's title line and its own help line
+// (see huh's FilePicker.WithHeight), which are subtracted from this value.
+const filePickerFormHeight = 9
+
 // promptForSyncFolder interactively asks the user to pick a sync folder — the
 // default ~/Brick or a custom folder browsed via a huh file picker — and, if
 // that folder already contains files, how to resolve conflicts with the
-// remote copy during the first sync.
+// remote copy during the first sync. Esc while picking or creating a folder
+// backs out to this top-level choice rather than continuing with a bogus
+// (empty) folder.
 func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflictMode string, err error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -2504,43 +2528,55 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 		optPick    = "pick"
 		optCreate  = "create"
 	)
-	var choice string
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title("Choose a sync folder").
-			Options(
-				huh.NewOption(fmt.Sprintf("Use %s", defaultFolder), optDefault),
-				huh.NewOption(fmt.Sprintf("Pick existing folder in %s", home), optPick),
-				huh.NewOption("Create folder", optCreate),
-			).
-			Value(&choice),
-	)).Run(); err != nil {
-		return "", "", err
-	}
 
-	switch choice {
-	case optDefault:
-		folder = defaultFolder
-	case optPick:
-		var picked string
+	for {
+		var choice string
 		if err := huh.NewForm(huh.NewGroup(
-			huh.NewFilePicker().
-				Title("Pick a folder to sync").
-				CurrentDirectory(home).
-				DirAllowed(true).
-				FileAllowed(false).
-				Picking(true).
-				Value(&picked),
+			huh.NewSelect[string]().
+				Title("Choose a sync folder").
+				Options(
+					huh.NewOption(fmt.Sprintf("Use %s", defaultFolder), optDefault),
+					huh.NewOption(fmt.Sprintf("Pick existing folder in %s", home), optPick),
+					huh.NewOption("Create folder", optCreate),
+				).
+				Value(&choice),
 		)).Run(); err != nil {
 			return "", "", err
 		}
-		folder = picked
-	case optCreate:
-		created, err := promptCreateFolder(home)
-		if err != nil {
-			return "", "", err
+
+		switch choice {
+		case optDefault:
+			folder = defaultFolder
+		case optPick:
+			var picked string
+			pickErr := huh.NewForm(huh.NewGroup(
+				huh.NewFilePicker().
+					Title("Pick a folder to sync").
+					CurrentDirectory(home).
+					DirAllowed(true).
+					FileAllowed(false).
+					Picking(true).
+					Height(filePickerFormHeight).
+					Value(&picked),
+			)).WithKeyMap(escBackKeyMap()).Run()
+			if errors.Is(pickErr, huh.ErrUserAborted) {
+				continue
+			}
+			if pickErr != nil {
+				return "", "", pickErr
+			}
+			folder = picked
+		case optCreate:
+			created, createErr := promptCreateFolder(home)
+			if errors.Is(createErr, huh.ErrUserAborted) {
+				continue
+			}
+			if createErr != nil {
+				return "", "", createErr
+			}
+			folder = created
 		}
-		folder = created
+		break
 	}
 
 	abs, err := filepath.Abs(folder)
@@ -2577,7 +2613,7 @@ func promptCreateFolder(home string) (string, error) {
 				}
 				return nil
 			}),
-	)).Run(); err != nil {
+	)).WithKeyMap(escBackKeyMap()).Run(); err != nil {
 		return "", err
 	}
 
@@ -2609,34 +2645,43 @@ func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
 		optHome   = "home"
 		optCustom = "custom"
 	)
-	choice := optHome
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title("Which folder should be accessible remotely?").
-			Options(
-				huh.NewOption(fmt.Sprintf("Home folder (%s)", home), optHome),
-				huh.NewOption("Custom folder", optCustom),
-			).
-			Value(&choice),
-	)).Run(); err != nil {
-		return err
-	}
-
-	root := home
-	if choice == optCustom {
-		var picked string
+	var root string
+	for {
+		choice := optHome
 		if err := huh.NewForm(huh.NewGroup(
-			huh.NewFilePicker().
-				Title("Pick a folder to expose remotely").
-				CurrentDirectory("/").
-				DirAllowed(true).
-				FileAllowed(false).
-				Picking(true).
-				Value(&picked),
+			huh.NewSelect[string]().
+				Title("Which folder should be accessible remotely?").
+				Options(
+					huh.NewOption(fmt.Sprintf("Home folder (%s)", home), optHome),
+					huh.NewOption("Custom folder", optCustom),
+				).
+				Value(&choice),
 		)).Run(); err != nil {
 			return err
 		}
-		root = picked
+
+		root = home
+		if choice == optCustom {
+			var picked string
+			pickErr := huh.NewForm(huh.NewGroup(
+				huh.NewFilePicker().
+					Title("Pick a folder to expose remotely").
+					CurrentDirectory("/").
+					DirAllowed(true).
+					FileAllowed(false).
+					Picking(true).
+					Height(filePickerFormHeight).
+					Value(&picked),
+			)).WithKeyMap(escBackKeyMap()).Run()
+			if errors.Is(pickErr, huh.ErrUserAborted) {
+				continue
+			}
+			if pickErr != nil {
+				return pickErr
+			}
+			root = picked
+		}
+		break
 	}
 
 	abs, err := filepath.Abs(root)
@@ -2674,7 +2719,7 @@ func promptConflictMode(checklist *onboardingChecklist) (string, error) {
 		huh.NewSelect[string]().
 			Title("Conflict resolution").
 			Options(
-				huh.NewOption("Overwrite duplicate any files on this device.", "device"),
+				huh.NewOption("Overwrite any duplicate files on this device.", "device"),
 				huh.NewOption("Overwrite any duplicate files on Brick.", "brick"),
 				huh.NewOption("Make a copy of any duplicate files (so nothing is lost).", "copy"),
 			).
