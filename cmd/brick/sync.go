@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/x/term"
 	"github.com/fsnotify/fsnotify"
@@ -2358,7 +2359,7 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config, check
 	var excludeDirs []string
 	if err := huh.NewForm(huh.NewGroup(
 		huh.NewMultiSelect[string]().
-			Title("Select the folders to EXCLUDE from sync (type "x" to toggle)").
+			Title("Select the folders to EXCLUDE from sync (type \"x\" to toggle)").
 			Options(options...).
 			Value(&excludeDirs),
 	)).Run(); err != nil {
@@ -2507,6 +2508,29 @@ func escBackKeyMap() *huh.KeyMap {
 // (see huh's FilePicker.WithHeight), which are subtracted from this value.
 const filePickerFormHeight = 9
 
+// altScreenFormOptions carries forward huh's own default program options
+// (tea.WithOutput(os.Stderr), tea.WithReportFocus() — see huh.NewForm) plus
+// tea.WithAltScreen(). Reserved for the two folder-browsing huh.FilePicker
+// forms specifically ("Pick a folder to sync" / "Pick a folder to expose
+// remotely"): at up to 7 listed entries they're the only forms tall enough to
+// force the terminal to scroll, which throws off huh's own cursor-based
+// self-erase on exit and leaves stray rows behind. The alternate screen
+// buffer sidesteps that: it saves the terminal's current contents when the
+// form starts and restores them verbatim when it exits (whether by Esc or by
+// picking a folder), so the picker never disturbs anything outside itself.
+//
+// Deliberately not used for the plain (short, non-scrolling) select and text
+// input forms elsewhere in onboarding — those already render and self-erase
+// inline without artifacts, and putting them on the alt screen would hide the
+// checklist/intro text above them for as long as the form is on screen.
+func altScreenFormOptions() []tea.ProgramOption {
+	return []tea.ProgramOption{
+		tea.WithOutput(os.Stderr),
+		tea.WithReportFocus(),
+		tea.WithAltScreen(),
+	}
+}
+
 // promptForSyncFolder interactively asks the user to pick a sync folder — the
 // default ~/Brick or a custom folder browsed via a huh file picker — and, if
 // that folder already contains files, how to resolve conflicts with the
@@ -2558,7 +2582,7 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 					Picking(true).
 					Height(filePickerFormHeight).
 					Value(&picked),
-			)).WithKeyMap(escBackKeyMap()).Run()
+			)).WithKeyMap(escBackKeyMap()).WithProgramOptions(altScreenFormOptions()...).Run()
 			if errors.Is(pickErr, huh.ErrUserAborted) {
 				continue
 			}
@@ -2672,7 +2696,7 @@ func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
 					Picking(true).
 					Height(filePickerFormHeight).
 					Value(&picked),
-			)).WithKeyMap(escBackKeyMap()).Run()
+			)).WithKeyMap(escBackKeyMap()).WithProgramOptions(altScreenFormOptions()...).Run()
 			if errors.Is(pickErr, huh.ErrUserAborted) {
 				continue
 			}
