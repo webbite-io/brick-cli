@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/x/term"
 	"github.com/fsnotify/fsnotify"
@@ -2487,18 +2486,16 @@ func runListSelectiveSync() error {
 	return nil
 }
 
-// escBackKeyMap returns a huh keymap identical to the default except Esc also
-// triggers the form's Quit binding (alongside ctrl+c). huh's file picker and
-// text input fields don't treat a plain Esc as "cancel" themselves -- for the
-// file picker it just closes the browser and advances to the next field with
-// whatever (possibly empty) value was set, and for a text input it's a no-op
-// key that leaves focus in place. Applying this keymap to a single-field form
-// makes Esc abort that form with huh.ErrUserAborted, which callers use to
-// detect "user backed out" and return to the previous prompt instead of
-// silently accepting an unset value.
-func escBackKeyMap() *huh.KeyMap {
+// escSubmitsInput returns a huh keymap identical to the default except the
+// Input field's own Next binding (which already triggers a normal, gracefully
+// self-erasing form completion) also fires on Esc, alongside Enter/Tab.
+// huh.Input has no native "cancel" key of its own to repurpose, unlike
+// huh.FilePicker's Esc-bound Close (see promptForSyncFolder), so this is what
+// gives Esc something to do here at all. Pairs with promptCreateFolder
+// treating an empty result as "user backed out" rather than as a real answer.
+func escSubmitsInput() *huh.KeyMap {
 	km := huh.NewDefaultKeyMap()
-	km.Quit = key.NewBinding(key.WithKeys("esc", "ctrl+c"))
+	km.Input.Next = key.NewBinding(key.WithKeys("enter", "tab", "esc"))
 	return km
 }
 
@@ -2507,29 +2504,6 @@ func escBackKeyMap() *huh.KeyMap {
 // default of 3. It accounts for the field's title line and its own help line
 // (see huh's FilePicker.WithHeight), which are subtracted from this value.
 const filePickerFormHeight = 9
-
-// altScreenFormOptions carries forward huh's own default program options
-// (tea.WithOutput(os.Stderr), tea.WithReportFocus() — see huh.NewForm) plus
-// tea.WithAltScreen(). Reserved for the two folder-browsing huh.FilePicker
-// forms specifically ("Pick a folder to sync" / "Pick a folder to expose
-// remotely"): at up to 7 listed entries they're the only forms tall enough to
-// force the terminal to scroll, which throws off huh's own cursor-based
-// self-erase on exit and leaves stray rows behind. The alternate screen
-// buffer sidesteps that: it saves the terminal's current contents when the
-// form starts and restores them verbatim when it exits (whether by Esc or by
-// picking a folder), so the picker never disturbs anything outside itself.
-//
-// Deliberately not used for the plain (short, non-scrolling) select and text
-// input forms elsewhere in onboarding — those already render and self-erase
-// inline without artifacts, and putting them on the alt screen would hide the
-// checklist/intro text above them for as long as the form is on screen.
-func altScreenFormOptions() []tea.ProgramOption {
-	return []tea.ProgramOption{
-		tea.WithOutput(os.Stderr),
-		tea.WithReportFocus(),
-		tea.WithAltScreen(),
-	}
-}
 
 // promptForSyncFolder interactively asks the user to pick a sync folder — the
 // default ~/Brick or a custom folder browsed via a huh file picker — and, if
@@ -2573,7 +2547,7 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 			folder = defaultFolder
 		case optPick:
 			var picked string
-			pickErr := huh.NewForm(huh.NewGroup(
+			if err := huh.NewForm(huh.NewGroup(
 				huh.NewFilePicker().
 					Title("Pick a folder to sync").
 					CurrentDirectory(home).
@@ -2582,21 +2556,20 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 					Picking(true).
 					Height(filePickerFormHeight).
 					Value(&picked),
-			)).WithKeyMap(escBackKeyMap()).WithProgramOptions(altScreenFormOptions()...).Run()
-			if errors.Is(pickErr, huh.ErrUserAborted) {
-				continue
+			)).Run(); err != nil {
+				return "", "", err
 			}
-			if pickErr != nil {
-				return "", "", pickErr
+			if picked == "" {
+				continue // Esc: back to "Choose a sync folder"
 			}
 			folder = picked
 		case optCreate:
-			created, createErr := promptCreateFolder(home)
-			if errors.Is(createErr, huh.ErrUserAborted) {
-				continue
+			created, err := promptCreateFolder(home)
+			if err != nil {
+				return "", "", err
 			}
-			if createErr != nil {
-				return "", "", createErr
+			if created == "" {
+				continue // Esc: back to "Choose a sync folder"
 			}
 			folder = created
 		}
@@ -2622,23 +2595,22 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 
 // promptCreateFolder asks for a folder name (or relative path, e.g.
 // "folder1/folder2") to create under home, creates it (and any missing
-// parents) via MkdirAll, and returns its absolute path. It's not an error
-// for the folder to already exist; MkdirAll never overwrites or removes
-// existing content.
+// parents) via MkdirAll, and returns its absolute path. Esc (see
+// escSubmitsInput) submits with whatever's typed so far; an empty result
+// means the user backed out, which the caller treats the same as backing out
+// of the folder picker. It's not an error for the folder to already exist;
+// MkdirAll never overwrites or removes existing content.
 func promptCreateFolder(home string) (string, error) {
 	var input string
 	if err := huh.NewForm(huh.NewGroup(
 		huh.NewInput().
 			Title(fmt.Sprintf("Create folder in %s", home)).
-			Value(&input).
-			Validate(func(s string) error {
-				if strings.TrimSpace(s) == "" {
-					return errors.New("folder name cannot be empty")
-				}
-				return nil
-			}),
-	)).WithKeyMap(escBackKeyMap()).Run(); err != nil {
+			Value(&input),
+	)).WithKeyMap(escSubmitsInput()).Run(); err != nil {
 		return "", err
+	}
+	if strings.TrimSpace(input) == "" {
+		return "", nil
 	}
 
 	folder := filepath.Join(home, input)
@@ -2687,7 +2659,7 @@ func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
 		root = home
 		if choice == optCustom {
 			var picked string
-			pickErr := huh.NewForm(huh.NewGroup(
+			if err := huh.NewForm(huh.NewGroup(
 				huh.NewFilePicker().
 					Title("Pick a folder to expose remotely").
 					CurrentDirectory("/").
@@ -2696,12 +2668,11 @@ func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
 					Picking(true).
 					Height(filePickerFormHeight).
 					Value(&picked),
-			)).WithKeyMap(escBackKeyMap()).WithProgramOptions(altScreenFormOptions()...).Run()
-			if errors.Is(pickErr, huh.ErrUserAborted) {
-				continue
+			)).Run(); err != nil {
+				return err
 			}
-			if pickErr != nil {
-				return pickErr
+			if picked == "" {
+				continue // Esc: back to "Which folder should be accessible remotely?"
 			}
 			root = picked
 		}
