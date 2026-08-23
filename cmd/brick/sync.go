@@ -2505,6 +2505,25 @@ func escSubmitsInput() *huh.KeyMap {
 // (see huh's FilePicker.WithHeight), which are subtracted from this value.
 const filePickerFormHeight = 9
 
+// filePickerHelpKeyMap returns a huh keymap identical to the default except
+// the file picker's Open binding is labeled "→ open" in the help bar instead
+// of huh's default "enter open". The bound keys are unchanged (l, right, and
+// enter all still open a highlighted directory) — only the label shown is
+// different, because on these two DirAllowed-only pickers, opening a
+// directory with enter also immediately selects it as the field's value
+// (bubbles/filepicker treats enter as both Open and Select), so "enter open"
+// sitting right next to "enter submit" understates that opening via enter
+// also finishes the picker. → only opens, so it's the accurate hint for
+// browsing without committing.
+func filePickerHelpKeyMap() *huh.KeyMap {
+	km := huh.NewDefaultKeyMap()
+	km.FilePicker.Open = key.NewBinding(
+		key.WithKeys("l", "right", "enter"),
+		key.WithHelp("→", "open"),
+	)
+	return km
+}
+
 // promptForSyncFolder interactively asks the user to pick a sync folder — the
 // default ~/Brick or a custom folder browsed via a huh file picker — and, if
 // that folder already contains files, how to resolve conflicts with the
@@ -2556,7 +2575,7 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 					Picking(true).
 					Height(filePickerFormHeight).
 					Value(&picked),
-			)).Run(); err != nil {
+			)).WithKeyMap(filePickerHelpKeyMap()).Run(); err != nil {
 				return "", "", err
 			}
 			if picked == "" {
@@ -2668,7 +2687,7 @@ func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
 					Picking(true).
 					Height(filePickerFormHeight).
 					Value(&picked),
-			)).Run(); err != nil {
+			)).WithKeyMap(filePickerHelpKeyMap()).Run(); err != nil {
 				return err
 			}
 			if picked == "" {
