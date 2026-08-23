@@ -1741,7 +1741,13 @@ func (e *syncEngine) saveStateLocked() {
 	_ = os.WriteFile(path, data, 0o600)
 }
 
+// addWatchesRecursive is a no-op when w is nil -- runSyncLoop passes nil here
+// when it degraded to poll-only mode because no fsnotify watcher could be
+// created (see newWatcherWithRetry).
 func (e *syncEngine) addWatchesRecursive(w *fsnotify.Watcher) {
+	if w == nil {
+		return
+	}
 	_ = filepath.WalkDir(e.folder, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -1987,6 +1993,30 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 	return nil
 }
 
+// newWatcherWithRetry tries a few times to create the fsnotify watcher,
+// since a creation failure (typically EMFILE against the system's
+// fs.inotify.max_user_instances ceiling) is often transient on a busy
+// desktop — another process closing an inotify instance a moment later is
+// common. Returns the last error only once every attempt has failed, letting
+// the caller decide whether to degrade gracefully instead of treating a
+// transient resource ceiling as fatal.
+func newWatcherWithRetry() (*fsnotify.Watcher, error) {
+	const attempts = 3
+	const delay = 500 * time.Millisecond
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(delay)
+		}
+		w, err := fsnotify.NewWatcher()
+		if err == nil {
+			return w, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 // runSyncLoop builds the sync engine from setup and runs it — the initial
 // full reconciliation, then the filesystem watcher and periodic poll — until
 // interrupted (Ctrl+C/SIGTERM in the foreground case; SIGTERM when stopping a
@@ -2150,15 +2180,21 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		eng.setCursor(bootstrapTime)
 	}
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		// Typically EMFILE when the system's inotify instance limit
-		// (fs.inotify.max_user_instances) is exhausted; keep the surfaced
-		// message vague since it lands in the user's console.
-		return false, errors.New("could not create a filesystem watcher")
+	// watcher is nil when creation fails even after retrying (see
+	// newWatcherWithRetry) -- typically EMFILE against the system's
+	// fs.inotify.max_user_instances ceiling, which a busy desktop with many
+	// terminals/editors/IDEs open can hit without brick's help. Rather than
+	// treating that as fatal, every use of watcher below is guarded so the
+	// sync loop runs in poll-only mode instead: local changes still reach the
+	// server via the periodic forceReconcile backstop further down, just with
+	// its ~30-minute cadence instead of the usual near-instant pickup.
+	watcher, watcherErr := newWatcherWithRetry()
+	if watcherErr != nil {
+		log.Printf("⚠ could not create a filesystem watcher (%v) — falling back to polling only; local changes may take up to ~30 minutes to sync until this is resolved (see fs.inotify.max_user_instances)", watcherErr)
+	} else {
+		defer watcher.Close()
+		eng.addWatchesRecursive(watcher)
 	}
-	defer watcher.Close()
-	eng.addWatchesRecursive(watcher)
 
 	// Local status/control API: lets a local client (e.g. a tray app) read
 	// live sync status and issue pause/resume/quit without touching the
@@ -2269,31 +2305,36 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		}
 	}()
 
-	// Watcher event loop.
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case ev, ok := <-watcher.Events:
-				if !ok {
+	// Watcher event loop. Skipped entirely in poll-only mode (watcher == nil,
+	// see newWatcherWithRetry) -- there is nothing to read events from, and
+	// local changes are still picked up by the periodic forceReconcile
+	// backstop above instead.
+	if watcher != nil {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
 					return
+				case ev, ok := <-watcher.Events:
+					if !ok {
+						return
+					}
+					if strings.HasSuffix(ev.Name, tmpSuffix) {
+						continue
+					}
+					if eng.isRecentlyWritten(ev.Name) {
+						continue
+					}
+					notify()
+				case werr, ok := <-watcher.Errors:
+					if !ok {
+						return
+					}
+					log.Printf("watcher error: %v", werr)
 				}
-				if strings.HasSuffix(ev.Name, tmpSuffix) {
-					continue
-				}
-				if eng.isRecentlyWritten(ev.Name) {
-					continue
-				}
-				notify()
-			case werr, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Printf("watcher error: %v", werr)
 			}
-		}
-	}()
+		}()
+	}
 
 	<-ctx.Done()
 	eng.saveState()
