@@ -1473,9 +1473,9 @@ func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles 
 }
 
 // reconcileExcludedFile handles a path under a configured excludeDirs entry:
-// it is never uploaded or downloaded. The index entry is kept purely to
-// detect when the file changes on either side, so each change is logged once
-// rather than on every reconcile pass.
+// it is never uploaded, downloaded, or logged. The index entry is kept
+// purely so a file that hasn't changed since the last pass is recognized
+// without re-hashing it on every reconcile pass.
 func (e *syncEngine) reconcileExcludedFile(rel string, remoteFiles map[string]storageNode, localFiles map[string]int64) error {
 	remoteNode, hasRemote := remoteFiles[rel]
 	_, localExists := localFiles[rel]
@@ -1499,16 +1499,7 @@ func (e *syncEngine) reconcileExcludedFile(rel string, remoteFiles map[string]st
 	}
 
 	if hasEntry && entry.LocalHash == localHash && entry.RemoteEtag == remoteNode.Etag {
-		return nil // already logged, nothing changed since
-	}
-
-	switch {
-	case localExists && !hasRemote:
-		log.Printf("⊘ ignored local change to %s (excluded directory)", rel)
-	case hasRemote && !localExists:
-		log.Printf("⊘ ignored remote change to %s (excluded directory)", rel)
-	default:
-		log.Printf("⊘ ignored change to %s (excluded directory)", rel)
+		return nil // nothing changed since the index entry was last written
 	}
 
 	e.state.Entries[rel] = SyncEntry{
@@ -1830,6 +1821,9 @@ func (c *onboardingChecklist) done(format string, args ...any) {
 	if c.pending > 0 {
 		fmt.Printf("\033[%dA\033[J", c.pending)
 		c.pending = 0
+	}
+	if c.n == 0 {
+		fmt.Println()
 	}
 	c.n++
 	fmt.Printf("%d. ✅ %s\n", c.n, fmt.Sprintf(format, args...))
@@ -2363,7 +2357,7 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config, check
 	var excludeDirs []string
 	if err := huh.NewForm(huh.NewGroup(
 		huh.NewMultiSelect[string]().
-			Title("Select the folders to exclude from sync").
+			Title("Select the folders to EXCLUDE from sync").
 			Options(options...).
 			Value(&excludeDirs),
 	)).Run(); err != nil {
@@ -2502,12 +2496,13 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 	}
 	defaultFolder := filepath.Join(home, "Brick")
 
-	checklist.println("\n\nYou have no sync folder configured (storageSyncFolder).")
+	checklist.println("\nYou have no sync folder configured (storageSyncFolder).")
 	checklist.println("")
 
 	const (
 		optDefault = "default"
-		optCustom  = "custom"
+		optPick    = "pick"
+		optCreate  = "create"
 	)
 	var choice string
 	if err := huh.NewForm(huh.NewGroup(
@@ -2515,16 +2510,18 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 			Title("Choose a sync folder").
 			Options(
 				huh.NewOption(fmt.Sprintf("Use %s", defaultFolder), optDefault),
-				huh.NewOption("Custom folder", optCustom),
+				huh.NewOption(fmt.Sprintf("Pick existing folder in %s", home), optPick),
+				huh.NewOption("Create folder", optCreate),
 			).
 			Value(&choice),
 	)).Run(); err != nil {
 		return "", "", err
 	}
 
-	if choice == optDefault {
+	switch choice {
+	case optDefault:
 		folder = defaultFolder
-	} else {
+	case optPick:
 		var picked string
 		if err := huh.NewForm(huh.NewGroup(
 			huh.NewFilePicker().
@@ -2538,6 +2535,12 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 			return "", "", err
 		}
 		folder = picked
+	case optCreate:
+		created, err := promptCreateFolder(home)
+		if err != nil {
+			return "", "", err
+		}
+		folder = created
 	}
 
 	abs, err := filepath.Abs(folder)
@@ -2555,6 +2558,34 @@ func promptForSyncFolder(checklist *onboardingChecklist) (folder string, conflic
 		}
 	}
 	return abs, conflictMode, nil
+}
+
+// promptCreateFolder asks for a folder name (or relative path, e.g.
+// "folder1/folder2") to create under home, creates it (and any missing
+// parents) via MkdirAll, and returns its absolute path. It's not an error
+// for the folder to already exist; MkdirAll never overwrites or removes
+// existing content.
+func promptCreateFolder(home string) (string, error) {
+	var input string
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewInput().
+			Title(fmt.Sprintf("Create folder in %s", home)).
+			Value(&input).
+			Validate(func(s string) error {
+				if strings.TrimSpace(s) == "" {
+					return errors.New("folder name cannot be empty")
+				}
+				return nil
+			}),
+	)).Run(); err != nil {
+		return "", err
+	}
+
+	folder := filepath.Join(home, input)
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		return "", fmt.Errorf("could not create folder %s: %w", folder, err)
+	}
+	return folder, nil
 }
 
 // promptForRemoteControl asks, during first-time onboarding, whether to

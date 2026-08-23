@@ -235,10 +235,10 @@ func runLogin(apiURL string, checklist *onboardingChecklist) error {
 	}()
 	defer srv.Shutdown(context.Background()) //nolint:errcheck
 
-	checklist.printf("Opening browser for login...\n\n")
+	checklist.printf("\nOpening browser for login...\n\n")
 	checklist.printf("If the browser does not open, visit this URL manually:\n\n  %s\n\n", authURL)
 	openBrowser(authURL)
-	checklist.println("Waiting for authorization...")
+	checklist.println("Waiting for authorization...\n")
 
 	// Wait up to 5 minutes for the callback.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
