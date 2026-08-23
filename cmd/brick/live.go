@@ -81,7 +81,7 @@ func quotaLine(q *storageQuota) string {
 	if q == nil || q.QuotaBytes <= 0 {
 		return ""
 	}
-	used := fmt.Sprintf("Total use is %s of %s", humanSize(q.UsedBytes), humanSize(q.QuotaBytes))
+	used := fmt.Sprintf("%s of %s used total", humanSize(q.UsedBytes), humanSize(q.QuotaBytes))
 	switch ratio := float64(q.UsedBytes) / float64(q.QuotaBytes); {
 	case ratio > quotaCriticalRatio:
 		used = ansiRed + used + ansiReset
