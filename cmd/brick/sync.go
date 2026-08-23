@@ -2667,16 +2667,16 @@ func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
 // locally (in a pre-existing, non-empty sync folder) and remotely, before any
 // sync history exists for them.
 func promptConflictMode(checklist *onboardingChecklist) (string, error) {
-	checklist.println("Your sync folder already contains files, how should we handle possible conflicts?")
+	checklist.println("The picked folder contains files. How should possible conflicts be handled on first sync?")
 	checklist.println("")
 	var mode string
 	err := huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().
 			Title("Conflict resolution").
 			Options(
-				huh.NewOption("Overwrite the file on this device.", "device"),
-				huh.NewOption("Overwrite the file on Brick.", "brick"),
-				huh.NewOption("Make a copy (so nothing is lost).", "copy"),
+				huh.NewOption("Overwrite duplicate any files on this device.", "device"),
+				huh.NewOption("Overwrite any duplicate files on Brick.", "brick"),
+				huh.NewOption("Make a copy of any duplicate files (so nothing is lost).", "copy"),
 			).
 			Value(&mode),
 	)).Run()
