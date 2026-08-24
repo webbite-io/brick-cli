@@ -12,7 +12,7 @@
 #   ./winget/generate-manifest.sh 1.2.3
 #
 #   # or point at an already-published release asset instead of dist/:
-#   ./winget/generate-manifest.sh 1.2.3 --url https://github.com/requestbite/brick/releases/download/1.2.3/brick-1.2.3-windows-amd64.zip
+#   ./winget/generate-manifest.sh 1.2.3 --url https://github.com/webbite-io/brick-cli/releases/download/1.2.3/brick-1.2.3-windows-amd64.zip
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ PACKAGE_IDENTIFIER="Webbite.Brick"
 PUBLISHER="Webbite"
 PACKAGE_NAME="Brick"
 MONIKER="brick"
-GITHUB_REPO="requestbite/brick"
+GITHUB_REPO="webbite-io/brick-cli"
 MANIFEST_SCHEMA_VERSION="1.10.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

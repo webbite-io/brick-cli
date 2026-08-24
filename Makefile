@@ -25,9 +25,6 @@ fi)
 # Binary name
 BINARY_NAME := brick
 
-# GitHub repo releases are published to (used by release-to-github)
-GITHUB_REPO := requestbite/brick
-
 # Build metadata
 BUILD_TIME := $(shell date -u '+%Y-%m-%d %H:%M:%S UTC')
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -175,6 +172,7 @@ release-to-github:
 		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) gh CLI is required (https://cli.github.com/) — install it and run 'gh auth login' first."; \
 		exit 1; \
 	fi; \
+	repo=$$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 1; \
 	rel_version=$$(awk '{print $$2}' $(DIST_DIR)/SHA256SUMS | sed -E 's/^$(BINARY_NAME)-(.+)-(darwin|linux|windows)-(amd64|arm64)\.(tar\.gz|zip)$$/\1/' | sort -u); \
 	if [ -z "$$rel_version" ] || [ $$(echo "$$rel_version" | wc -l) -ne 1 ]; then \
 		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) could not determine a single version from $(DIST_DIR)/SHA256SUMS; re-run 'make release' to rebuild a clean dist/."; \
@@ -184,8 +182,8 @@ release-to-github:
 	for f in $(DIST_DIR)/*.tar.gz $(DIST_DIR)/*.zip; do \
 		[ -f "$$f" ] && assets="$$assets $$f"; \
 	done; \
-	if gh release view "$$rel_version" --repo $(GITHUB_REPO) >/dev/null 2>&1; then \
-		echo "$(COLOR_YELLOW)Release $$rel_version already exists on $(GITHUB_REPO).$(COLOR_RESET)"; \
+	if gh release view "$$rel_version" --repo "$$repo" >/dev/null 2>&1; then \
+		echo "$(COLOR_YELLOW)Release $$rel_version already exists on $$repo.$(COLOR_RESET)"; \
 		printf "Replace it with the artifacts currently in $(DIST_DIR)/? (y/N): "; \
 		read -r resp; \
 		resp=$$(echo "$$resp" | tr '[:upper:]' '[:lower:]'); \
@@ -193,14 +191,14 @@ release-to-github:
 			echo "Aborted — existing release left untouched."; \
 			exit 1; \
 		fi; \
-		echo "$(COLOR_BOLD)$(COLOR_BLUE)Replacing release $$rel_version...$(COLOR_RESET)"; \
-		gh release delete "$$rel_version" --repo $(GITHUB_REPO) --yes; \
-		gh release create "$$rel_version" $$assets --repo $(GITHUB_REPO) --title "$$rel_version" --generate-notes; \
+		echo "$(COLOR_BOLD)$(COLOR_BLUE)Replacing release $$rel_version on $$repo...$(COLOR_RESET)"; \
+		gh release delete "$$rel_version" --repo "$$repo" --yes || exit 1; \
+		gh release create "$$rel_version" $$assets --repo "$$repo" --title "$$rel_version" --generate-notes || exit 1; \
 	else \
-		echo "$(COLOR_BOLD)$(COLOR_BLUE)Creating release $$rel_version...$(COLOR_RESET)"; \
-		gh release create "$$rel_version" $$assets --repo $(GITHUB_REPO) --title "$$rel_version" --generate-notes; \
+		echo "$(COLOR_BOLD)$(COLOR_BLUE)Creating release $$rel_version on $$repo...$(COLOR_RESET)"; \
+		gh release create "$$rel_version" $$assets --repo "$$repo" --title "$$rel_version" --generate-notes || exit 1; \
 	fi; \
-	echo "$(COLOR_GREEN)✓ Released $$rel_version to $(GITHUB_REPO)$(COLOR_RESET)"
+	echo "$(COLOR_GREEN)✓ Released $$rel_version to $$repo$(COLOR_RESET)"
 
 # Render winget package manifests from the already-built dist/ zip (run
 # `make release` first). Output goes to winget/manifests/, ready to copy into
