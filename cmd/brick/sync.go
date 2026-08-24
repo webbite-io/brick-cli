@@ -530,12 +530,12 @@ type SyncState struct {
 // ID (a UUID) rather than the sync folder, so each account keeps its own
 // synced-state bookkeeping even if two accounts share the same local folder.
 func syncStatePath(accountID string) (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := configDir()
 	if err != nil {
 		return "", err
 	}
 	name := fmt.Sprintf("sync-state-%s.json", accountID)
-	return filepath.Join(home, ".config", "brick", name), nil
+	return filepath.Join(dir, name), nil
 }
 
 func loadSyncState(accountID, folder string) *SyncState {

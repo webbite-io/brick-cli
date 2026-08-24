@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
@@ -99,13 +100,32 @@ func (c *Config) ensureActiveAccount() *AccountConfig {
 	return ac
 }
 
-// configPath returns the absolute path to ~/.config/brick/config.yaml.
-func configPath() (string, error) {
+// configDir returns the directory brick stores its config and state files in:
+// %AppData%\brick on Windows, and ~/.config/brick on Linux/Darwin (matching
+// the convention most CLI tools use on macOS rather than ~/Library/Application
+// Support).
+func configDir() (string, error) {
+	if runtime.GOOS == "windows" {
+		dir, err := os.UserConfigDir()
+		if err != nil {
+			return "", fmt.Errorf("could not determine config directory: %w", err)
+		}
+		return filepath.Join(dir, "brick"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("could not determine home directory: %w", err)
 	}
-	return filepath.Join(home, ".config", "brick", "config.yaml"), nil
+	return filepath.Join(home, ".config", "brick"), nil
+}
+
+// configPath returns the absolute path to brick's config.yaml.
+func configPath() (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.yaml"), nil
 }
 
 // saveConfig persists cfg to the config file with mode 0600.

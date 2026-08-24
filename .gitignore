@@ -1,9 +1,11 @@
 build/
-/brick
+dist/
 tmp/
+
+/brick
+/brick.exe
+/restart.sh
 
 .env
 .env.prod
 .env.dev
-
-restart.sh
