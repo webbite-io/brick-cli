@@ -265,7 +265,7 @@ func checkForUpdates() {
 		return
 	}
 
-	fmt.Print("Do you want to install (Y/N): ")
+	fmt.Print("Do you want to install (Y/n): ")
 	reader := bufio.NewReader(os.Stdin)
 	response, err := reader.ReadString('\n')
 	if err != nil {
@@ -274,7 +274,7 @@ func checkForUpdates() {
 	}
 
 	response = strings.TrimSpace(strings.ToLower(response))
-	if response == "y" || response == "yes" {
+	if response == "" || response == "y" || response == "yes" {
 		fmt.Println("\nInstalling update...")
 		if err := installUpdate(); err != nil {
 			fmt.Printf("\033[31mFailed to install update: %v\033[0m\n", err)

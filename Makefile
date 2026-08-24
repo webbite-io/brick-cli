@@ -5,6 +5,15 @@
 # `make build-prod`, or `ENV_FILE=... make build`). Left unset for targets
 # like build-all/release that expect the real values to already be in the
 # environment (e.g. from CI secrets).
+# Load .env.prod automatically so a plain `make release` picks up production
+# values for local publishing, without requiring the caller's shell to
+# already have them exported. CI sets ACC_API_URL et al. as real env vars
+# directly (see .github/workflows/release.yml) and never checks out
+# .env.prod (gitignored), so this stays a no-op there. ENV_FILE below (used
+# by build-dev/build-prod) is loaded after this and overrides it, so dev
+# builds are unaffected.
+-include .env.prod
+
 ENV_FILE ?=
 ifneq ($(strip $(ENV_FILE)),)
 -include $(ENV_FILE)
@@ -60,7 +69,7 @@ COLOR_GREEN := \033[32m
 COLOR_BLUE := \033[34m
 COLOR_YELLOW := \033[33m
 
-.PHONY: all build build-dev build-prod build-all release release-to-github winget-manifest clean install dev help
+.PHONY: all build build-dev build-prod build-all check-release-env release release-to-github winget-manifest clean install dev help
 
 # Default target
 all: build
@@ -89,8 +98,22 @@ build-dev:
 build-prod:
 	@$(MAKE) build ENV_FILE=.env.prod
 
+# Fail fast rather than silently baking empty values into the release
+# binaries, which fall back to the localhost dev URLs at runtime (see
+# resolveAPIURL/resolveStorageAPIURL in cmd/brick/config.go).
+check-release-env:
+	@missing=""; \
+	[ -n "$(ACC_API_URL)" ] || missing="$$missing ACC_API_URL"; \
+	[ -n "$(STORAGE_API_URL)" ] || missing="$$missing STORAGE_API_URL"; \
+	[ -n "$(OAUTH_CLIENT_ID)" ] || missing="$$missing OAUTH_CLIENT_ID"; \
+	if [ -n "$$missing" ]; then \
+		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) missing required release env vars:$$missing"; \
+		echo "Add them to .env.prod (see .env.example), or export them in your shell (as CI does), before running this target."; \
+		exit 1; \
+	fi
+
 # Build for all platforms
-build-all: clean
+build-all: clean check-release-env
 	@echo "$(COLOR_BOLD)$(COLOR_BLUE)Building $(BINARY_NAME) v$(VERSION) for all platforms...$(COLOR_RESET)"
 	@mkdir -p $(BUILD_DIR)
 	@$(foreach platform,$(PLATFORMS),\
@@ -172,6 +195,31 @@ release-to-github:
 		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) gh CLI is required (https://cli.github.com/) — install it and run 'gh auth login' first."; \
 		exit 1; \
 	fi; \
+	echo "$(COLOR_BOLD)$(COLOR_BLUE)Verifying release artifacts have production URLs baked in...$(COLOR_RESET)"; \
+	if [ -z "$(ACC_API_URL)" ] || [ -z "$(STORAGE_API_URL)" ]; then \
+		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) ACC_API_URL/STORAGE_API_URL are not available in this shell, so the artifacts can't be verified against them."; \
+		echo "Make sure .env.prod is present (see .env.example) and re-run."; \
+		exit 1; \
+	fi; \
+	bad=""; \
+	tmp=$$(mktemp); \
+	for f in $(DIST_DIR)/*.tar.gz; do \
+		[ -f "$$f" ] || continue; \
+		tar -xzOf "$$f" "$(BINARY_NAME)/$(BINARY_NAME)" > "$$tmp" 2>/dev/null; \
+		grep -aqF "$(ACC_API_URL)" "$$tmp" && grep -aqF "$(STORAGE_API_URL)" "$$tmp" || bad="$$bad $$f"; \
+	done; \
+	for f in $(DIST_DIR)/*.zip; do \
+		[ -f "$$f" ] || continue; \
+		unzip -p "$$f" "$(BINARY_NAME).exe" > "$$tmp" 2>/dev/null; \
+		grep -aqF "$(ACC_API_URL)" "$$tmp" && grep -aqF "$(STORAGE_API_URL)" "$$tmp" || bad="$$bad $$f"; \
+	done; \
+	rm -f "$$tmp"; \
+	if [ -n "$$bad" ]; then \
+		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) refusing to publish — these artifacts don't have the expected production URLs ($(ACC_API_URL), $(STORAGE_API_URL)) baked in:$$bad"; \
+		echo "Re-run 'make release' with production values set (see .env.prod) before publishing."; \
+		exit 1; \
+	fi; \
+	echo "$(COLOR_GREEN)✓ Artifacts look production-ready$(COLOR_RESET)"; \
 	repo=$$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 1; \
 	rel_version=$$(awk '{print $$2}' $(DIST_DIR)/SHA256SUMS | sed -E 's/^$(BINARY_NAME)-(.+)-(darwin|linux|windows)-(amd64|arm64)\.(tar\.gz|zip)$$/\1/' | sort -u); \
 	if [ -z "$$rel_version" ] || [ $$(echo "$$rel_version" | wc -l) -ne 1 ]; then \
