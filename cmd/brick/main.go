@@ -218,7 +218,7 @@ func getRemoteVersion() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/repos/requestbite/brick/releases/latest", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/repos/webbite-io/brick-cli/releases/latest", nil)
 	if err != nil {
 		return "", err
 	}
@@ -261,7 +261,7 @@ func checkForUpdates() {
 	fmt.Printf("You're running v%s and the new version is v%s.\n\n", Version, remoteVersion)
 
 	if runtime.GOOS == "windows" {
-		fmt.Printf("See https://github.com/requestbite/brick/ for installation details.\n\n")
+		fmt.Printf("See https://github.com/webbite-io/brick-cli/ for installation details.\n\n")
 		return
 	}
 
@@ -278,7 +278,7 @@ func checkForUpdates() {
 		fmt.Println("\nInstalling update...")
 		if err := installUpdate(); err != nil {
 			fmt.Printf("\033[31mFailed to install update: %v\033[0m\n", err)
-			fmt.Printf("Please visit https://github.com/requestbite/brick/ for manual installation.\n\n")
+			fmt.Printf("Please visit https://github.com/webbite-io/brick-cli/ for manual installation.\n\n")
 		} else {
 			fmt.Println("\033[32mUpdate installed successfully!\033[0m")
 			fmt.Printf("Please restart brick to use the new version.\n\n")
@@ -292,7 +292,7 @@ func checkForUpdates() {
 
 // installUpdate runs the installation script.
 func installUpdate() error {
-	cmd := exec.Command("bash", "-c", "curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh | bash")
+	cmd := exec.Command("bash", "-c", "curl -fsSL https://raw.githubusercontent.com/webbite-io/brick-cli/main/install.sh | bash")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

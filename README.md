@@ -1,4 +1,4 @@
-[![Release](https://github.com/requestbite/brick/actions/workflows/release.yml/badge.svg)](https://github.com/requestbite/brick/actions/workflows/release.yml)
+[![Release](https://github.com/webbite-io/brick-cli/actions/workflows/release.yml/badge.svg)](https://github.com/webbite-io/brick-cli/actions/workflows/release.yml)
 
 # Webbite Brick CLI
 
@@ -29,7 +29,7 @@ Read more at <https://docs.requestbite.com/>.
 Install the latest release on macOS or Linux like so:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/webbite-io/brick-cli/main/install.sh | bash
 ```
 
 The binary will be installed to `~/.local/bin` by default.
@@ -39,7 +39,7 @@ The binary will be installed to `~/.local/bin` by default.
 To install the latest release to a custom directory, do like so:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh | bash -s -- --prefix $HOME/bin
+curl -fsSL https://raw.githubusercontent.com/webbite-io/brick-cli/main/install.sh | bash -s -- --prefix $HOME/bin
 ```
 
 ### Install Older Version
@@ -47,13 +47,13 @@ curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh |
 To install a specific version (in this example, version 0.0.1), do like so:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh | bash -s -- --version 0.0.1
+curl -fsSL https://raw.githubusercontent.com/webbite-io/brick-cli/main/install.sh | bash -s -- --version 0.0.1
 ```
 
 ### Manual Download
 
 Download pre-built binaries from [GitHub
-Releases](https://github.com/requestbite/brick/releases).
+Releases](https://github.com/webbite-io/brick-cli/releases).
 
 **Supported Platforms:**
 

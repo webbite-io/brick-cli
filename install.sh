@@ -3,16 +3,16 @@
 # install.sh - Install brick from GitHub releases
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh | bash -s -- --prefix=$HOME/bin
-#   curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh | bash -s -- --version 0.0.1
+#   curl -fsSL https://raw.githubusercontent.com/webbite-io/brick-cli/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/webbite-io/brick-cli/main/install.sh | bash -s -- --prefix=$HOME/bin
+#   curl -fsSL https://raw.githubusercontent.com/webbite-io/brick-cli/main/install.sh | bash -s -- --version 0.0.1
 #
 
 set -euo pipefail
 
 # Configuration
 BINARY_NAME="brick"
-GITHUB_REPO="requestbite/brick"
+GITHUB_REPO="webbite-io/brick-cli"
 DEFAULT_INSTALL_DIR="$HOME/.local/bin"
 
 # Parse command line arguments
@@ -52,7 +52,7 @@ Examples:
   ./install.sh --prefix \$HOME
 
   # One-line install from GitHub
-  curl -fsSL https://raw.githubusercontent.com/requestbite/brick/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/webbite-io/brick-cli/main/install.sh | bash
 
 EOF
     exit 0
