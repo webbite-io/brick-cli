@@ -60,7 +60,7 @@ COLOR_GREEN := \033[32m
 COLOR_BLUE := \033[34m
 COLOR_YELLOW := \033[33m
 
-.PHONY: all build build-dev build-prod build-all release clean install dev help
+.PHONY: all build build-dev build-prod build-all release winget-manifest clean install dev help
 
 # Default target
 all: build
@@ -123,10 +123,11 @@ release: build-all
 			if echo "$$os_arch" | grep -q "windows"; then \
 				archive="$(BINARY_NAME)-$(VERSION)-$${os_arch%.exe}.zip"; \
 				echo "  Creating $$archive..."; \
+				cp "$$binary" "$(BINARY_NAME).exe"; \
 				cp ../LICENSE . 2>/dev/null || true; \
 				cp ../README.md . 2>/dev/null || true; \
-				zip -q "../$(DIST_DIR)/$$archive" "$$binary" LICENSE README.md 2>/dev/null || zip -q "../$(DIST_DIR)/$$archive" "$$binary"; \
-				rm -f LICENSE README.md; \
+				zip -q "../$(DIST_DIR)/$$archive" "$(BINARY_NAME).exe" LICENSE README.md 2>/dev/null || zip -q "../$(DIST_DIR)/$$archive" "$(BINARY_NAME).exe"; \
+				rm -f "$(BINARY_NAME).exe" LICENSE README.md; \
 			else \
 				archive="$(BINARY_NAME)-$(VERSION)-$$os_arch.tar.gz"; \
 				echo "  Creating $$archive..."; \
@@ -157,6 +158,12 @@ release: build-all
 	@echo ""
 	@echo "Checksums (SHA256SUMS):"
 	@cat $(DIST_DIR)/SHA256SUMS
+
+# Render winget package manifests from the already-built dist/ zip (run
+# `make release` first). Output goes to winget/manifests/, ready to copy into
+# a microsoft/winget-pkgs checkout for submission.
+winget-manifest:
+	@./winget/generate-manifest.sh $(VERSION)
 
 # Clean build artifacts
 clean:
@@ -217,6 +224,7 @@ help:
 	@echo "  dev        - Run with hot reload using Air, against .env.dev (for development)"
 	@echo "  build-all  - Build for all platforms (darwin/amd64, darwin/arm64, linux/amd64, windows/amd64)"
 	@echo "  release    - Build all platforms and create release archives with checksums"
+	@echo "  winget-manifest - Render winget manifests from dist/ (run after release)"
 	@echo "  clean      - Remove all build artifacts"
 	@echo "  install    - Build using .env.prod and install to ~/.local/bin (for testing)"
 	@echo "  version    - Show version information"

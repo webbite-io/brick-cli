@@ -1,6 +1,7 @@
 build/
 dist/
 tmp/
+winget/manifests/
 
 /brick
 /brick.exe
