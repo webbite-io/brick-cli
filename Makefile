@@ -25,6 +25,9 @@ fi)
 # Binary name
 BINARY_NAME := brick
 
+# GitHub repo releases are published to (used by release-to-github)
+GITHUB_REPO := requestbite/brick
+
 # Build metadata
 BUILD_TIME := $(shell date -u '+%Y-%m-%d %H:%M:%S UTC')
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -60,7 +63,7 @@ COLOR_GREEN := \033[32m
 COLOR_BLUE := \033[34m
 COLOR_YELLOW := \033[33m
 
-.PHONY: all build build-dev build-prod build-all release winget-manifest clean install dev help
+.PHONY: all build build-dev build-prod build-all release release-to-github winget-manifest clean install dev help
 
 # Default target
 all: build
@@ -159,6 +162,46 @@ release: build-all
 	@echo "Checksums (SHA256SUMS):"
 	@cat $(DIST_DIR)/SHA256SUMS
 
+# Publish the archives already sitting in dist/ (built by `make release`) as
+# a GitHub release. Does not rebuild anything — the version published is
+# whatever version dist/SHA256SUMS says was actually built. Prompts before
+# replacing a release that already exists.
+release-to-github:
+	@if [ ! -f "$(DIST_DIR)/SHA256SUMS" ]; then \
+		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) $(DIST_DIR)/SHA256SUMS not found. Run 'make release' first."; \
+		exit 1; \
+	fi; \
+	if ! command -v gh >/dev/null 2>&1; then \
+		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) gh CLI is required (https://cli.github.com/) — install it and run 'gh auth login' first."; \
+		exit 1; \
+	fi; \
+	rel_version=$$(awk '{print $$2}' $(DIST_DIR)/SHA256SUMS | sed -E 's/^$(BINARY_NAME)-(.+)-(darwin|linux|windows)-(amd64|arm64)\.(tar\.gz|zip)$$/\1/' | sort -u); \
+	if [ -z "$$rel_version" ] || [ $$(echo "$$rel_version" | wc -l) -ne 1 ]; then \
+		echo "$(COLOR_YELLOW)Error:$(COLOR_RESET) could not determine a single version from $(DIST_DIR)/SHA256SUMS; re-run 'make release' to rebuild a clean dist/."; \
+		exit 1; \
+	fi; \
+	assets="$(DIST_DIR)/SHA256SUMS"; \
+	for f in $(DIST_DIR)/*.tar.gz $(DIST_DIR)/*.zip; do \
+		[ -f "$$f" ] && assets="$$assets $$f"; \
+	done; \
+	if gh release view "$$rel_version" --repo $(GITHUB_REPO) >/dev/null 2>&1; then \
+		echo "$(COLOR_YELLOW)Release $$rel_version already exists on $(GITHUB_REPO).$(COLOR_RESET)"; \
+		printf "Replace it with the artifacts currently in $(DIST_DIR)/? (y/N): "; \
+		read -r resp; \
+		resp=$$(echo "$$resp" | tr '[:upper:]' '[:lower:]'); \
+		if [ "$$resp" != "y" ] && [ "$$resp" != "yes" ]; then \
+			echo "Aborted — existing release left untouched."; \
+			exit 1; \
+		fi; \
+		echo "$(COLOR_BOLD)$(COLOR_BLUE)Replacing release $$rel_version...$(COLOR_RESET)"; \
+		gh release delete "$$rel_version" --repo $(GITHUB_REPO) --yes; \
+		gh release create "$$rel_version" $$assets --repo $(GITHUB_REPO) --title "$$rel_version" --generate-notes; \
+	else \
+		echo "$(COLOR_BOLD)$(COLOR_BLUE)Creating release $$rel_version...$(COLOR_RESET)"; \
+		gh release create "$$rel_version" $$assets --repo $(GITHUB_REPO) --title "$$rel_version" --generate-notes; \
+	fi; \
+	echo "$(COLOR_GREEN)✓ Released $$rel_version to $(GITHUB_REPO)$(COLOR_RESET)"
+
 # Render winget package manifests from the already-built dist/ zip (run
 # `make release` first). Output goes to winget/manifests/, ready to copy into
 # a microsoft/winget-pkgs checkout for submission.
@@ -219,16 +262,17 @@ help:
 	@echo "  make [target]"
 	@echo ""
 	@echo "$(COLOR_BOLD)Targets:$(COLOR_RESET)"
-	@echo "  build-dev  - Build for current platform using .env.dev"
-	@echo "  build-prod - Build for current platform using .env.prod"
-	@echo "  dev        - Run with hot reload using Air, against .env.dev (for development)"
-	@echo "  build-all  - Build for all platforms (darwin/amd64, darwin/arm64, linux/amd64, windows/amd64)"
-	@echo "  release    - Build all platforms and create release archives with checksums"
-	@echo "  winget-manifest - Render winget manifests from dist/ (run after release)"
-	@echo "  clean      - Remove all build artifacts"
-	@echo "  install    - Build using .env.prod and install to ~/.local/bin (for testing)"
-	@echo "  version    - Show version information"
-	@echo "  help       - Show this help message"
+	@echo "  build-dev         - Build for current platform using .env.dev"
+	@echo "  build-prod        - Build for current platform using .env.prod"
+	@echo "  dev               - Run with hot reload using Air, against .env.dev (for development)"
+	@echo "  build-all         - Build for all platforms (darwin/amd64, darwin/arm64, linux/amd64, windows/amd64)"
+	@echo "  release           - Build all platforms and create release archives with checksums"
+	@echo "  release-to-github - Publish dist/ archives as a GitHub release (prompts before replacing)"
+	@echo "  winget-manifest   - Render winget manifests from dist/ (run after release)"
+	@echo "  clean             - Remove all build artifacts"
+	@echo "  install           - Build using .env.prod and install to ~/.local/bin (for testing)"
+	@echo "  version           - Show version information"
+	@echo "  help              - Show this help message"
 	@echo ""
 	@echo "$(COLOR_BOLD)Examples:$(COLOR_RESET)"
 	@echo "  make build-dev                                 # Quick build against .env.dev"
