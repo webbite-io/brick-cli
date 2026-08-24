@@ -5,3 +5,5 @@ tmp/
 .env
 .env.prod
 .env.dev
+
+restart.sh
