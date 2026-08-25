@@ -236,7 +236,7 @@ func resolveStorageAPIURL() string {
 }
 
 func printHelp() {
-	fmt.Printf("\n\033[38;5;208mWebbite Brick CLI\033[0m ⚡ v%s\n\n", Version)
+	fmt.Printf("\n\033[38;5;226mWebbite Brick CLI\033[0m v%s\n\n", Version)
 	fmt.Println("Usage:")
 	fmt.Printf("  brick [options]\n\n")
 	fmt.Println("Options:")
@@ -248,10 +248,10 @@ func printHelp() {
 	fmt.Println("\nStorage Sync\n============")
 	fmt.Printf("  Running brick with no other options syncs storageSyncFolder with the Storage API and watches for changes\n")
 	fmt.Printf("  -d, --daemon                Detach into the background once logged in and the Storage API is reachable\n")
-	fmt.Printf("  -r, --remote-control        Allow the Storage API to remotely list/browse/transfer files on this device (also enabled by default if remoteControl: true in config file)\n")
-	fmt.Printf("      --agent-root PATH       Additional directory to expose to remote clients when remote control is enabled (repeatable)\n")
-	fmt.Printf("  -s, --selective-sync         Choose which folders to exclude from sync (deletes their local copies)\n")
-	fmt.Printf("      --list-selective-sync    List the folders currently excluded from sync\n")
+	fmt.Printf("  -r, --remote-control        Allow remote control via Brick webapp (also possible to enable via config file)\n")
+	fmt.Printf("      --agent-root PATH       Directory to expose to remote clients when remote control is enabled (repeatable)\n")
+	fmt.Printf("  -s, --selective-sync        Choose which folders to exclude from sync (deletes their local copies)\n")
+	fmt.Printf("      --list-selective-sync   List the folders currently excluded from sync\n")
 	fmt.Println("\nOther\n=====")
 	fmt.Printf("      --no-upgrade-check      Disable automatic upgrade check\n")
 	fmt.Printf("      --no-control-api        Disable the local status/control API (used by tray apps)\n")

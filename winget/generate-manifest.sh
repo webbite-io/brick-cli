@@ -103,7 +103,7 @@ PackageIdentifier: ${PACKAGE_IDENTIFIER}
 PackageVersion: ${VERSION}
 PackageLocale: en-US
 Publisher: ${PUBLISHER}
-PublisherUrl: https://requestbite.com
+PublisherUrl: https://webbite.io
 PublisherSupportUrl: https://github.com/${GITHUB_REPO}/issues
 PackageName: ${PACKAGE_NAME}
 PackageUrl: https://github.com/${GITHUB_REPO}

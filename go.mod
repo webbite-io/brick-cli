@@ -1,4 +1,4 @@
-module github.com/requestbite/brick
+module github.com/webbite-io/brick-cli
 
 go 1.23.0
 

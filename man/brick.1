@@ -6,12 +6,12 @@ brick \- storage sync CLI client for Webbite Brick
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B brick
-is the command-line client for Webbite Brick's Storage Sync feature. It performs
-two-way synchronization between a local folder and the Storage API: it walks
-both trees, uploads local-only files, downloads remote-only files, and
-resolves conflicts with the remote copy winning. After the initial pass it
-watches the local folder for filesystem changes and also polls the Storage
-API periodically, so both sides stay in sync until interrupted.
+is the command-line client for Webbite Brick's storage sync feature. It performs
+two-way synchronization between a local folder and Brick: it walks both trees,
+uploads local-only files, downloads remote-only files, and resolves conflicts
+with the remote copy winning. After the initial pass it watches the local folder
+for filesystem changes and also polls the Storage API periodically, so both
+sides stay in sync until interrupted.
 .PP
 .B brick
 also manages the OIDC login and active account used for sync.
@@ -40,13 +40,20 @@ Print the name, email address, and active account of the currently authenticated
 user.
 If the access token has expired it is refreshed silently using the stored refresh
 token.
+.TP
+.B \-\-restart
+Clear existing settings and configure Brick from scratch, as if freshly
+installed. Stops any running instance, then for each account with a
+configured sync folder interactively offers to delete its local files and
+the folder itself, and finally removes the entire configuration directory
+before falling through into first-run setup.
 .SS Storage sync
 .TP
 Running
 .B brick
 with no other options synchronizes the folder configured as
 .I storageSyncFolder
-in the configuration file with the Storage API, then watches it for changes.
+in the configuration file with Brick, then watches it for changes.
 If no sync folder is configured yet,
 .B brick
 prompts for one and persists it to the configuration file. The remote copy
@@ -57,12 +64,27 @@ and
 .BR \-\-switch\-accounts ).
 Press
 .B Ctrl\-C
-to stop syncing.
+to stop syncing. When run in an interactive terminal, the sync loop also
+accepts
+.BR D
+to detach into the background (equivalent to
+.BR \-\-daemon ,
+where supported) and
+.BR P
+to pause or resume syncing without stopping it.
+.TP
+.BR \-d ", " \-\-daemon
+Detach into the background once logged in and Brick's API is reachable,
+so syncing continues after the terminal is closed. The same effect can also
+be triggered interactively from the foreground sync loop by pressing
+.BR D .
+Not supported on Windows.
 .TP
 .BR \-r ", " \-\-remote\-control
-Allow the Storage API to remotely list, browse, and transfer files on this
-device while syncing. Without this flag the local agent refuses any such
-request from the Storage API, even if it is otherwise connected.
+Allow Brick to remotely list, browse, and transfer files on this device while
+syncing. Without this flag the local agent refuses any such request from Brick,
+even if it is otherwise connected. Can also be enabled persistently via the
+configuration file, in which case this flag is unnecessary.
 .TP
 .B \-\-agent\-root \fIPATH\fR
 Expose an additional directory (beyond
@@ -70,12 +92,30 @@ Expose an additional directory (beyond
 to remote clients when
 .B \-\-remote\-control
 is enabled. Repeatable.
+.TP
+.BR \-s ", " \-\-selective\-sync
+Interactively choose which top-level folders of the active account are
+excluded from sync. Folders newly excluded are deleted from local disk
+immediately; any running
+.B brick
+instance is restarted to pick up the change.
+.TP
+.B \-\-list\-selective\-sync
+Print the folders currently excluded from sync for the active account.
 .SS Other
 .TP
 .B \-\-no\-upgrade\-check
 Suppress the automatic check for a newer version of
 .B brick
 that normally runs at startup before syncing.
+.TP
+.B \-\-no\-control\-api
+Disable the local status/control API that
+.B brick
+otherwise starts alongside the sync loop. Local clients such as a tray app
+use this API to query sync status and to send commands (pause, quit,
+detach) to a running instance; with this flag such clients cannot find or
+control the process.
 .TP
 .B \-\-uninstall
 Interactively remove the
@@ -105,12 +145,12 @@ Switch to a different account:
 brick \-\-switch\-accounts
 .EE
 .TP
-Sync the configured folder with the Storage API and watch for changes:
+Sync the configured folder with Brick and watch for changes:
 .EX
 brick
 .EE
 .TP
-Sync and allow the Storage API to remotely browse and transfer files:
+Sync and allow Brick to remotely browse and transfer files:
 .EX
 brick \-\-remote\-control
 .EE
@@ -118,6 +158,26 @@ brick \-\-remote\-control
 Sync without checking for CLI upgrades first:
 .EX
 brick \-\-no\-upgrade\-check
+.EE
+.TP
+Sync and immediately detach into the background:
+.EX
+brick \-\-daemon
+.EE
+.TP
+Choose which folders to exclude from sync:
+.EX
+brick \-\-selective\-sync
+.EE
+.TP
+List folders currently excluded from sync:
+.EX
+brick \-\-list\-selective\-sync
+.EE
+.TP
+Clear all local settings and set up Brick again from scratch:
+.EX
+brick \-\-restart
 .EE
 .SH FILES
 .TP
@@ -132,11 +192,12 @@ Stored with mode
 to protect the tokens.
 Do not share this file.
 .TP
-.I ~/.config/brick/sync-state-<hash>.json
-Per-folder sync state index, one file per distinct
-.I storageSyncFolder
-ever synced. Records the last-known local hash and remote ETag for each
-synced file so repeated runs only transfer what changed. Safe to delete;
+.I ~/.config/brick/sync\-state\-<account\-id>.json
+Per-account sync state index, one file per account ID ever synced (so two
+accounts sharing the same local folder still keep independent bookkeeping).
+Records the last-known local hash and remote ETag for each synced file, plus
+a server-time cursor for incremental polling, so repeated runs only transfer
+what changed. Safe to delete;
 .B brick
 will simply re-reconcile the full tree on the next run.
 .SH EXIT STATUS
@@ -149,6 +210,6 @@ An error occurred (invalid flags, network failure, authentication error, etc.).
 .SH BUGS
 Please report bugs and feature requests at:
 .br
-.I https://github.com/requestbite/brick/issues
+.I https://github.com/webbite-io/brick-cli/issues
 .SH AUTHORS
-The Webbite team (https://requestbite.com)
+The Webbite Team (https://webbite.io)

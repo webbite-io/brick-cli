@@ -20,6 +20,7 @@ const (
 	ansiReset      = "\033[0m"
 	ansiPurple     = "\033[38;5;135m"
 	ansiLightGreen = "\033[38;5;120m"
+	ansiYellow     = "\033[38;5;226m"
 	ansiOrange     = "\033[38;5;208m"
 	ansiRed        = "\033[38;5;196m"
 )
@@ -39,10 +40,10 @@ const (
 // the detached daemon child) this is the original plain one-liner.
 func printSyncBanner(folder string, interactive bool) {
 	if !interactive {
-		fmt.Printf("Syncing %s with Brick. Press Ctrl+C to stop.\n", folder)
+		fmt.Printf("I'm %sWebbite Brick CLI%s v%s, syncing %s with Brick. Press Ctrl+C to stop.\n", ansiYellow, ansiReset, Version, folder)
 		return
 	}
-	fmt.Printf("Syncing %s with Brick.\n", folder)
+	fmt.Printf("I'm %sWebbite Brick CLI%s v%s, syncing %s with Brick.\n", ansiYellow, ansiReset, Version, folder)
 }
 
 // syncHeaderLines renders the block shown beneath the "Syncing ..." line in

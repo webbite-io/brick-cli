@@ -18,9 +18,9 @@ interrupted.
 `brick` also handles logging in via OIDC and managing which account is active
 for sync.
 
-Read more at <https://docs.requestbite.com/>.
+Read more at <https://docs.webbite.io/>.
 
-[rb]: https://requestbite.com
+[rb]: https://webbite.io
 
 ## Installation
 
@@ -72,9 +72,9 @@ Account Mgmt
 
 Storage Sync
 ============
-  Running brick with no other options syncs storageSyncFolder with the Storage API and watches for changes
-  -r, --remote-control        Allow the Storage API to remotely list/browse/transfer files on this device
-      --agent-root PATH       Additional directory to expose to remote clients when remote control is enabled (repeatable)
+  Running brick with no options syncs the sync folder with Brick
+  -r, --remote-control        Allows Brick to remotely list/browse/transfer files on this device
+      --agent-root PATH       Expose additional directory when remote control is enabled
 
 Other
 =====
@@ -227,9 +227,9 @@ make release     # cross-compile + package release archives
 ```
 
 Copy `.env.example` to `.env.dev` (and/or `.env.prod`) and fill in
-`OAUTH_CLIENT_ID` once an OIDC client has been created for brick; the API
-URLs already point at the same local dev backend used by
-[rbite](https://github.com/requestbite/rbite). `make build-dev`/`make
+`OAUTH_CLIENT_ID` once an OIDC client has been created for brick; the API URLs
+already point at the same local dev backend used by
+[brick](https://github.com/webbite-io/brick-cli). `make build-dev`/`make
 build-prod` error out if the corresponding file doesn't exist.
 
 Man page and shell completions live in `man/` and `completions/` and are

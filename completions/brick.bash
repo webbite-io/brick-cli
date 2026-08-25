@@ -11,12 +11,25 @@ _brick() {
         --login
         --switch-accounts
         --whoami
-        -s --sync
+        --restart
+        -d --daemon
+        -r --remote-control
+        --agent-root
+        -s --selective-sync
+        --list-selective-sync
         --no-upgrade-check
+        --no-control-api
         --uninstall
         -h --help
         -v --version
     )
+
+    case "$prev" in
+        --agent-root)
+            _filedir -d
+            return 0
+            ;;
+    esac
 
     # Complete flags
     if [[ "$cur" == -* ]]; then
