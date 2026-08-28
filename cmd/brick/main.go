@@ -43,6 +43,7 @@ func main() {
 		daemonJSON        bool
 		selectiveSync     bool
 		listSelectiveSync bool
+		selfTest          bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "")
@@ -63,6 +64,10 @@ func main() {
 	flag.BoolVar(&selectiveSync, "s", false, "")
 	flag.BoolVar(&selectiveSync, "selective-sync", false, "")
 	flag.BoolVar(&listSelectiveSync, "list-selective-sync", false, "")
+	// Undocumented: a read-only diagnostic for a companion app to check
+	// whether brick is expected to be able to sync right now, without
+	// actually starting a sync. See README for the JSON output shape.
+	flag.BoolVar(&selfTest, "self-test", false, "")
 	// Undocumented: only used together with -d/--daemon, by the companion app
 	// that starts brick in daemon mode. See README for the JSON output shapes.
 	flag.BoolVar(&daemonJSON, "json", false, "")
@@ -138,6 +143,16 @@ func main() {
 			log.Fatalf("List selective sync failed: %v", err)
 		}
 		os.Exit(0)
+	}
+
+	// Self-test: run every readiness check and print a single JSON line,
+	// without prompting, checking for updates, or starting a sync. Placed
+	// ahead of checkForUpdates below since that can block on stdin for an
+	// upgrade prompt, which a companion app calling this must never hit.
+	if selfTest {
+		apiURL := resolveAPIURL()
+		storageURL := resolveStorageAPIURL()
+		emitSelfTestOutput(runSelfTest(apiURL, storageURL))
 	}
 
 	// Restart: wipe local settings and sync folders, then fall through into

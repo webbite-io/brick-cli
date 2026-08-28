@@ -150,6 +150,56 @@ On failure, `status` is `"error"` and `code` is one of:
 {"status":"error","code":"setup_required","message":"brick is not logged in; run 'brick --login' first"}
 ```
 
+### Self-test mode
+
+`--self-test` is an additional, undocumented (not listed in `-h`) flag for a
+companion app to check whether brick is expected to be able to sync
+successfully, without actually starting a sync. It never prompts, never
+checks for updates, and never touches the sync folder — the only state it may
+change is refreshing a stale access token, exactly as `brick --whoami` does.
+
+Exactly one line of JSON is printed to stdout and brick exits **0**, whether
+or not the checks passed — pass/fail is carried entirely by the `ready` field
+and each check's own `status`, never by the process exit code, so a companion
+app never has to special-case a "failed" self-test as a crash:
+
+```json
+{"status":"ok","version":"1.4.2","ready":false,"checks":[
+  {"id":"instance_lock","status":"ok","message":"No other brick instance is running."},
+  {"id":"configuration","status":"fail","code":"no_active_account","message":"No account selected; run 'brick --switch-accounts'."},
+  {"id":"authentication","status":"fail","code":"not_logged_in","message":"Not logged in; run 'brick --login'."},
+  {"id":"api_reachable","status":"ok","message":"Reached https://api.brick.example."},
+  {"id":"storage_reachable","status":"skipped","code":"not_configured","message":"Skipped: brick is not fully configured."}
+]}
+```
+
+Every `message` is normalized (capitalized, trailing period) so it can be
+shown directly in a UI without reformatting — including messages built from
+raw error text.
+
+Each entry in `checks` has:
+
+| Field     | Meaning                                                                 |
+| --------- | ------------------------------------------------------------------------ |
+| `id`      | Stable identifier for the check (see table below).                      |
+| `status`  | `"ok"`, `"fail"`, or `"skipped"` (a prerequisite check already failed, so this one couldn't meaningfully run). |
+| `code`    | Present on `"fail"`/`"skipped"`: a stable, machine-readable reason.       |
+| `message` | Human-readable detail, safe to log or show a user.                       |
+
+Checks run independently and in this order, so a companion app gets every
+failing reason at once rather than only the first:
+
+| `id`                 | Question                                            | `fail`/`skipped` codes                                                                                   |
+| -------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `instance_lock`      | Is another brick instance already running?           | `already_running`, `lock_error`, `lock_path_error`                                                          |
+| `configuration`      | Is there an active account with a valid sync folder?  | `no_active_account`, `no_sync_folder`, `sync_folder_missing`, `config_error`                                 |
+| `authentication`     | Is the stored access/refresh token still valid?       | `not_logged_in`, `session_expired`, `request_failed`, `unexpected_status`                                    |
+| `api_reachable`      | Can brick reach the Brick API at all (unauthenticated)? | `unreachable`                                                                                              |
+| `storage_reachable`  | Can it reach the Storage API and resolve the account's root folder? | `unreachable`; skipped as `not_configured`/`not_authenticated` if an earlier check failed |
+
+`ready` at the top level is `true` only when every check is `"ok"` — i.e. the
+next `brick -d` (or `brick -d --json`) is expected to succeed.
+
 ## Local Status/Control API
 
 While syncing, `brick` runs a local, loopback-only control API so another
