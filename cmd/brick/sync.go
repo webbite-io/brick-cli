@@ -1993,6 +1993,35 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 	return nil
 }
 
+// runSetupAndExit runs the exact same preamble as a normal sync start —
+// acquiring the instance lock, authenticating, resolving (and if needed,
+// interactively onboarding) the sync folder, and confirming the Storage API
+// is reachable — but stops just short of actually syncing anything or
+// watching the folder. Meant for a companion app to drive brick's normal
+// interactive setup once (e.g. during its own installer) and get a clear
+// success/failure signal without leaving a sync running afterward.
+func runSetupAndExit(apiURL, storageURL string) error {
+	lockPath, err := instanceLockPath()
+	if err != nil {
+		return err
+	}
+	lock, err := acquireInstanceLock(lockPath)
+	if err != nil {
+		if errors.Is(err, errInstanceLocked) {
+			return errors.New("brick is already running for this user")
+		}
+		return err
+	}
+	defer lock.Release()
+
+	if _, err := prepareSync(apiURL, storageURL); err != nil {
+		return err
+	}
+
+	fmt.Println("\n✅ Brick CLI is correctly configured and can reach the Brick API.")
+	return nil
+}
+
 // newWatcherWithRetry tries a few times to create the fsnotify watcher,
 // since a creation failure (typically EMFILE against the system's
 // fs.inotify.max_user_instances ceiling) is often transient on a busy

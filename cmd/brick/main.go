@@ -44,6 +44,7 @@ func main() {
 		selectiveSync     bool
 		listSelectiveSync bool
 		selfTest          bool
+		setupAndExit      bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "")
@@ -68,6 +69,11 @@ func main() {
 	// whether brick is expected to be able to sync right now, without
 	// actually starting a sync. See README for the JSON output shape.
 	flag.BoolVar(&selfTest, "self-test", false, "")
+	// Undocumented: runs every interactive setup step a normal sync start
+	// would (login, sync-folder selection, first-run onboarding, a Storage
+	// API reachability check), then exits without ever starting a sync. See
+	// README for details.
+	flag.BoolVar(&setupAndExit, "setup-and-exit", false, "")
 	// Undocumented: only used together with -d/--daemon, by the companion app
 	// that starts brick in daemon mode. See README for the JSON output shapes.
 	flag.BoolVar(&daemonJSON, "json", false, "")
@@ -153,6 +159,22 @@ func main() {
 		apiURL := resolveAPIURL()
 		storageURL := resolveStorageAPIURL()
 		emitSelfTestOutput(runSelfTest(apiURL, storageURL))
+	}
+
+	// Setup-and-exit: run every interactive step a normal sync start would —
+	// login, sync-folder selection, first-run onboarding, and confirming the
+	// Storage API is reachable — then exit successfully without ever
+	// starting a sync.
+	if setupAndExit {
+		apiURL := resolveAPIURL()
+		storageURL := resolveStorageAPIURL()
+		if err := runSetupAndExit(apiURL, storageURL); err != nil {
+			if errors.Is(err, errLoginDeclined) {
+				os.Exit(0)
+			}
+			log.Fatalf("Setup failed: %v", err)
+		}
+		os.Exit(0)
 	}
 
 	// Restart: wipe local settings and sync folders, then fall through into

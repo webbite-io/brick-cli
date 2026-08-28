@@ -177,6 +177,32 @@ Every `message` is normalized (capitalized, trailing period) so it can be
 shown directly in a UI without reformatting — including messages built from
 raw error text.
 
+### Setup-and-exit mode
+
+`--setup-and-exit` is an additional, undocumented (not listed in `-h`) flag
+that runs exactly the same steps a normal `brick` start does — login (with
+its usual prompt if not already logged in), sync-folder selection, first-run
+onboarding, and confirming the Storage API is reachable — but stops right
+before a sync would actually start. It's meant for a companion app that wants
+to drive brick's real interactive setup once (e.g. from its own installer)
+and get a definitive pass/fail rather than having to launch a real sync and
+watch for it to start working.
+
+Unlike `--self-test`, this is not read-only: it's the genuine first-run flow,
+so it will prompt for login and sync-folder choices exactly as an ordinary
+`brick` invocation would if setup isn't already complete.
+
+On success, it prints and exits **0**:
+
+```
+✅ Brick CLI is correctly configured and can reach the Brick API.
+```
+
+On failure (already running, login declined, Storage API unreachable, etc.)
+it behaves exactly like a normal `brick` run would: an error is printed to
+stderr and it exits non-zero, except a declined login prompt, which exits `0`
+quietly (again, exactly like a normal run).
+
 Each entry in `checks` has:
 
 | Field     | Meaning                                                                 |
