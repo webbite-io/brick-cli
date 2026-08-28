@@ -118,7 +118,7 @@ func main() {
 	if switchAccounts {
 		apiURL := resolveAPIURL()
 		storageURL := resolveStorageAPIURL()
-		if err := runWithAutoRelogin(apiURL, func() error { return runSwitchAccounts(apiURL, storageURL) }); err != nil {
+		if err := runWithAutoRelogin(apiURL, switchAccountsReloginPrompt, func() error { return runSwitchAccounts(apiURL, storageURL) }); err != nil {
 			log.Fatalf("Switch accounts failed: %v", err)
 		}
 		os.Exit(0)
@@ -137,7 +137,7 @@ func main() {
 	if selectiveSync {
 		apiURL := resolveAPIURL()
 		storageURL := resolveStorageAPIURL()
-		if err := runWithAutoRelogin(apiURL, func() error { return runSelectiveSync(apiURL, storageURL) }); err != nil {
+		if err := runWithAutoRelogin(apiURL, switchAccountsReloginPrompt, func() error { return runSelectiveSync(apiURL, storageURL) }); err != nil {
 			log.Fatalf("Selective sync failed: %v", err)
 		}
 		os.Exit(0)
@@ -168,7 +168,7 @@ func main() {
 	if setupAndExit {
 		apiURL := resolveAPIURL()
 		storageURL := resolveStorageAPIURL()
-		if err := runSetupAndExit(apiURL, storageURL); err != nil {
+		if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error { return runSetupAndExit(apiURL, storageURL) }); err != nil {
 			if errors.Is(err, errLoginDeclined) {
 				os.Exit(0)
 			}
@@ -218,7 +218,9 @@ func main() {
 			runAsDaemonJSON(apiURL, storageURL, remoteControl, noControlAPI)
 			return // unreachable: runAsDaemonJSON always exits the process itself
 		}
-		if err := runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI); err != nil {
+		if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
+			return runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI)
+		}); err != nil {
 			if errors.Is(err, errLoginDeclined) {
 				os.Exit(0)
 			}
@@ -227,7 +229,9 @@ func main() {
 		os.Exit(0)
 	}
 
-	if err := runStorageSync(apiURL, storageURL, remoteControl, noControlAPI); err != nil {
+	if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
+		return runStorageSync(apiURL, storageURL, remoteControl, noControlAPI)
+	}); err != nil {
 		if errors.Is(err, errLoginDeclined) {
 			os.Exit(0)
 		}

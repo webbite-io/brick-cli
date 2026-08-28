@@ -113,6 +113,24 @@ Files inside an excluded folder (or any folder below it) are never uploaded
 or downloaded; changes to them are detected and logged, but otherwise
 ignored.
 
+### Re-authenticating after a revoked or expired session
+
+If the stored access token is rejected and the refresh token can't renew it
+either (revoked, expired, or otherwise invalid — the API returns
+`invalid_grant`), brick prompts to log in again rather than just failing:
+
+```
+⚠️ Authentication failed! Do you want to login again (Y/n):
+```
+
+Answering `Y` runs the normal browser login flow and, if it succeeds, resumes
+from scratch — a normal `brick`/`-d` run starts syncing, `--setup-and-exit`
+re-verifies setup and prints its usual success message instead of syncing.
+Answering `n` (or anything else) exits non-zero with an error. This applies
+to the default sync start, `-d`/`--daemon` in the foreground, and
+`--setup-and-exit`; it never fires for `-d --json` or the detached daemon
+child, which must never prompt on a terminal they don't have.
+
 ### Daemon mode
 
 Pass `-d`/`--daemon` to run every interactive step (login, sync-folder

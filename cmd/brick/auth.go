@@ -140,14 +140,30 @@ func exchangeCodeForToken(tokenEndpoint, code, codeVerifier, redirectURI, client
 	return tokenResp.AccessToken, tokenResp.RefreshToken, tokenResp.IDToken, nil
 }
 
+// switchAccountsReloginPrompt and selectiveSyncReloginPrompt are the
+// re-authentication prompts for flows that were already mid-command when the
+// session expired.
+const switchAccountsReloginPrompt = "\nYou've been logged out and need to login again, continue? (Y/n): "
+
+// authFailedReloginPrompt is the re-authentication prompt for flows whose
+// whole purpose is reaching the API/starting a sync (the default sync start,
+// daemon mode, and --setup-and-exit) — phrased as the failure a user hit
+// rather than as a generic "logged out", since for these it's very often a
+// revoked or expired refresh token rather than a plain session timeout.
+const authFailedReloginPrompt = "\n⚠️ Authentication failed! Do you want to login again (Y/n): "
+
 // runWithAutoRelogin runs fn. If it returns an errSessionExpired error, it
-// prompts the user to log in again and retries fn once after a successful login.
-func runWithAutoRelogin(apiURL string, fn func() error) error {
+// prints prompt and offers to log in again, retrying fn once (from scratch)
+// after a successful login. Returns a non-nil error — never errLoginDeclined,
+// so callers that special-case that for a quiet exit 0 correctly fall
+// through to their normal non-zero-exit error handling here — if the user
+// declines, if login itself fails, or if the retry of fn still fails.
+func runWithAutoRelogin(apiURL, prompt string, fn func() error) error {
 	err := fn()
 	if err == nil || !errors.Is(err, errSessionExpired) {
 		return err
 	}
-	fmt.Print("\nYou've been logged out and need to login again, continue? (Y/n): ")
+	fmt.Print(prompt)
 	reader := bufio.NewReader(os.Stdin)
 	response, readErr := reader.ReadString('\n')
 	if readErr != nil || strings.EqualFold(strings.TrimSpace(response), "n") {
@@ -275,7 +291,7 @@ func runLogin(apiURL string, checklist *onboardingChecklist) error {
 	}
 
 	if userInfo.GivenName != "" && userInfo.FamilyName != "" {
-		checklist.printf("\nHello %s %s 👋\n", userInfo.GivenName, userInfo.FamilyName)
+		checklist.printf("Hello %s %s 👋\n\n", userInfo.GivenName, userInfo.FamilyName)
 	} else {
 		checklist.println("\nLogin successful 🎉.")
 	}
@@ -298,7 +314,7 @@ func runLogin(apiURL string, checklist *onboardingChecklist) error {
 	if checklist != nil {
 		checklist.done("Logged in to account: %s", accountName)
 	} else {
-		fmt.Printf("Brick now has access to your account: %s.\n  To switch account, use the --switch-accounts parameter.", accountName)
+		fmt.Printf("Brick now has access to your account: %s.\n  To switch account, use the --switch-accounts parameter.\n\n", accountName)
 	}
 	return nil
 }

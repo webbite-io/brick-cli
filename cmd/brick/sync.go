@@ -2018,7 +2018,7 @@ func runSetupAndExit(apiURL, storageURL string) error {
 		return err
 	}
 
-	fmt.Println("\n✅ Brick CLI is correctly configured and can reach the Brick API.")
+	fmt.Println("✅ Brick CLI is correctly configured and can reach the Brick API.")
 	return nil
 }
 
