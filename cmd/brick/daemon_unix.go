@@ -62,16 +62,16 @@ func runAsDaemonJSON(apiURL, storageURL string, remoteControl, noControlAPI bool
 		return
 	}
 	if cfg.AccessToken == "" && cfg.RefreshToken == "" {
-		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "brick is not logged in; run 'brick --login' first"})
+		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "brick is not logged in; run 'brick login' first"})
 		return
 	}
 	if cfg.ActiveAccountID == "" {
-		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "no active account selected; run 'brick --switch-accounts' first"})
+		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "no active account selected; run 'brick switch-accounts' first"})
 		return
 	}
 	ac := cfg.activeAccount()
 	if ac == nil || strings.TrimSpace(ac.StorageSyncFolder) == "" {
-		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "no sync folder configured; run 'brick' interactively first to complete setup"})
+		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "setup_required", Message: "no sync folder configured; run 'brick sync' interactively first to complete setup"})
 		return
 	}
 
@@ -164,13 +164,39 @@ func startDaemonProcess(apiURL, storageURL string, remoteControl, noControlAPI b
 // flow directly and has no terminal to prompt on for an update, and doesn't
 // itself understand --json (that flag only governs how the parent reports
 // the outcome of starting the child).
+//
+// args is os.Args[1:] as the CLI was actually invoked, e.g.
+// ["--no-control-api", "sync", "-d", "-r"]. Root flags (anything before the
+// "sync" subcommand) and sync's own flags (from "sync" onward) must stay on
+// their respective sides of that boundary in the reassembled result — the
+// root flag.Parse() in the re-exec'd child only sees flags that precede the
+// subcommand name, so injecting --no-upgrade-check after "sync" (as a naive
+// append would) would silently strand it as an unrecognized argument to the
+// sync subcommand instead. filterDaemonArgs is only ever reached via the
+// sync subcommand (ultimately from runAsDaemon/runAsDaemonJSON, called by
+// runSyncCmd), so "sync" is always present in args.
 func filterDaemonArgs(args []string) []string {
+	syncIdx := -1
+	for i, a := range args {
+		if a == "sync" {
+			syncIdx = i
+			break
+		}
+	}
+	var rootArgs, subArgs []string
+	if syncIdx >= 0 {
+		rootArgs = args[:syncIdx]
+		subArgs = args[syncIdx:]
+	} else {
+		// Should be unreachable — see the comment above — but if it somehow
+		// happens, keep the flags visible to the daemon rather than eating
+		// them silently.
+		subArgs = args
+	}
+
 	out := make([]string, 0, len(args)+1)
 	hasNoUpgradeCheck := false
-	for _, a := range args {
-		if a == "-d" || a == "--daemon" || a == "--json" {
-			continue
-		}
+	for _, a := range rootArgs {
 		if a == "--no-upgrade-check" {
 			hasNoUpgradeCheck = true
 		}
@@ -178,6 +204,12 @@ func filterDaemonArgs(args []string) []string {
 	}
 	if !hasNoUpgradeCheck {
 		out = append(out, "--no-upgrade-check")
+	}
+	for _, a := range subArgs {
+		if a == "-d" || a == "--daemon" || a == "--json" {
+			continue
+		}
+		out = append(out, a)
 	}
 	return out
 }
@@ -210,7 +242,7 @@ func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool,
 		return err
 	}
 	if cfg.ActiveAccountID == "" {
-		return errors.New("no active account selected; run 'brick --switch-accounts' first")
+		return errors.New("no active account selected; run 'brick switch-accounts' first")
 	}
 
 	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
@@ -235,10 +267,12 @@ func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool,
 
 // relaunchDaemon starts a fresh detached daemon reusing the remoteControl and
 // agentRoots flags a previous instance was running with, used by
-// restartDaemonIfRunning after 'brick --switch-accounts' stops a background
+// restartDaemonIfRunning after 'brick switch-accounts' stops a background
 // daemon so syncing resumes automatically under the new account.
 func relaunchDaemon(apiURL, storageURL string, remoteControl bool, agentRoots []string) error {
-	args := []string{"--no-upgrade-check"}
+	// --no-upgrade-check is a root flag and must precede the "sync"
+	// subcommand; -r/--agent-root are sync's own flags and must follow it.
+	args := []string{"--no-upgrade-check", "sync"}
 	if remoteControl {
 		args = append(args, "-r")
 	}

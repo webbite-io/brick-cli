@@ -63,37 +63,85 @@ Releases](https://github.com/webbite-io/brick-cli/releases).
 
 ## Usage
 
+> **Breaking change:** account management and sync options used to be flags
+> on the bare `brick` command. They're now subcommands — flags stay flags
+> only where a command has more than one action to modify (`sync`, `upload`,
+> `download`).
+>
+> | Old                                          | New                              |
+> | --------------------------------------------- | -------------------------------- |
+> | `brick --login`                               | `brick login`                    |
+> | `brick --switch-accounts`                     | `brick switch-accounts`          |
+> | `brick --whoami`                              | `brick whoami`                   |
+> | `brick --restart`                             | `brick restart`                  |
+> | `brick --uninstall`                           | `brick uninstall`                |
+> | `brick` (bare, syncs)                         | `brick sync`                     |
+> | `brick -d` / `--daemon`                       | `brick sync -d`                  |
+> | `brick -d --json`                             | `brick sync -d --json`           |
+> | `brick -r` / `--remote-control`               | `brick sync -r`                  |
+> | `brick --agent-root PATH`                     | `brick sync --agent-root PATH`   |
+> | `brick -s` / `--selective-sync`               | `brick sync -s`                  |
+> | `brick --list-selective-sync`                 | `brick sync --list-selective-sync` |
+>
+> `-h`/`-v` and the global toggles below are unchanged, but — like any global
+> flag — must come before the subcommand: `brick --no-upgrade-check sync -d`,
+> not `brick sync -d --no-upgrade-check`.
+
 ```
+Usage:
+  brick [global flags] <command> [command flags] [args]
+
+Global flags (must come before the command)
+============================================
+  -h, --help                  Show help information
+  -v, --version               Show version information
+      --no-upgrade-check      Disable automatic upgrade check
+      --no-control-api        Disable the local status/control API (used by tray apps)
+      --self-test             Print a readiness check as JSON, without syncing
+      --setup-and-exit        Run interactive setup, then exit without syncing
+
 Account Mgmt
 ============
-      --login                 Log in via browser
-      --switch-accounts       Switch the active account
-      --whoami                Show logged-in user and account details
+  login                       Log in via browser
+  switch-accounts             Switch the active account
+  whoami                      Show logged-in user and account details
+  restart                     Clear existing settings and configure Brick from scratch
 
 Storage Sync
 ============
-  Running brick with no options syncs the sync folder with Brick
-  -r, --remote-control        Allows Brick to remotely list/browse/transfer files on this device
-      --agent-root PATH       Expose additional directory when remote control is enabled
+  sync [options]              Sync storageSyncFolder with the Storage API and watch for changes
+    -d, --daemon                Detach into the background once logged in and the Storage API is reachable
+        --json                  With -d: print one JSON status line instead of running interactively
+    -r, --remote-control        Allow remote control via Brick webapp (also possible to enable via config file)
+        --agent-root PATH       Directory to expose to remote clients when remote control is enabled (repeatable)
+    -s, --selective-sync        Choose which folders to exclude from sync (deletes their local copies)
+        --list-selective-sync   List the folders currently excluded from sync
+
+Transfer
+========
+  upload <file|dir> [target]  Upload a local file or folder
+    -r, --recursive             Required to upload a folder
+    -s, --silent                Suppress all output except errors
+        --overwrite             Replace an existing remote file instead of creating a copy
+  download <uuid|path> [dir]  Download a remote file or folder
+    -r, --recursive             Required to download a folder
+    -s, --silent                Suppress all output except errors
 
 Other
 =====
-      --no-upgrade-check      Disable automatic upgrade check
-      --uninstall             Uninstall brick
-  -h, --help                  Show help information
-  -v, --version               Show version information
+  uninstall                   Uninstall brick
 ```
 
 Log in, pick an account, then sync:
 
 ```bash
-brick --login
-brick --switch-accounts   # only needed if your user has more than one account
-brick
+brick login
+brick switch-accounts   # only needed if your user has more than one account
+brick sync
 ```
 
-On first run, `brick` prompts for the local folder to sync and remembers it
-(`storageSyncFolder` in `~/.config/brick/config.yaml`) for subsequent runs.
+On first run, `brick sync` prompts for the local folder to sync and remembers
+it (`storageSyncFolder` in `~/.config/brick/config.yaml`) for subsequent runs.
 
 Pass `-r`/`--remote-control` to also allow the Storage API to remotely
 list, browse, and transfer files on this device while syncing. Without it,
@@ -124,23 +172,25 @@ either (revoked, expired, or otherwise invalid — the API returns
 ```
 
 Answering `Y` runs the normal browser login flow and, if it succeeds, resumes
-from scratch — a normal `brick`/`-d` run starts syncing, `--setup-and-exit`
-re-verifies setup and prints its usual success message instead of syncing.
-Answering `n` (or anything else) exits non-zero with an error. This applies
-to the default sync start, `-d`/`--daemon` in the foreground, and
-`--setup-and-exit`; it never fires for `-d --json` or the detached daemon
-child, which must never prompt on a terminal they don't have.
+from scratch — a normal `brick sync`/`brick sync -d` run starts syncing,
+`--setup-and-exit` re-verifies setup and prints its usual success message
+instead of syncing. Answering `n` (or anything else) exits non-zero with an
+error. This applies to the default sync start, `brick sync -d` in the
+foreground, and `--setup-and-exit`; it never fires for `brick sync -d --json`
+or the detached daemon child, which must never prompt on a terminal they
+don't have.
 
 ### Daemon mode
 
-Pass `-d`/`--daemon` to run every interactive step (login, sync-folder
-selection, first-run onboarding) attached to the current terminal as usual,
-then detach into the background once brick is logged in and the Storage API
-is reachable, handing control back to the shell. Not supported on Windows.
+Pass `brick sync -d` (or `--daemon`) to run every interactive step (login,
+sync-folder selection, first-run onboarding) attached to the current terminal
+as usual, then detach into the background once brick is logged in and the
+Storage API is reachable, handing control back to the shell. Not supported on
+Windows.
 
-`--json` is an additional, undocumented (not listed in `-h`) flag for
-`-d`/`--daemon`, meant for a companion app that starts `brick` in daemon mode
-itself rather than a human at a terminal. With `--json`:
+`--json` is an additional flag for `sync -d`/`--daemon`, meant for a
+companion app that starts `brick` in daemon mode itself rather than a human at
+a terminal. With `--json`:
 
 - Nothing interactive ever runs — login, account selection and sync-folder
   setup must already be complete from a prior ordinary run, otherwise brick
@@ -158,23 +208,23 @@ On failure, `status` is `"error"` and `code` is one of:
 
 | Code                  | Meaning                                                              |
 | --------------------- | --------------------------------------------------------------------- |
-| `setup_required`      | Not logged in, no active account, or no sync folder configured yet — run `brick` (or `--login`/`--switch-accounts`) interactively first. |
+| `setup_required`      | Not logged in, no active account, or no sync folder configured yet — run `brick sync` (or `login`/`switch-accounts`) interactively first. |
 | `already_running`     | brick is already running for this user (instance lock held).          |
 | `unsupported_platform`| Daemon mode was requested on Windows.                                  |
 | `start_failed`        | Setup succeeded but starting the background process failed (e.g. the Storage API is unreachable); see `message`. |
 | `internal_error`      | Reading local config failed.                                          |
 
 ```json
-{"status":"error","code":"setup_required","message":"brick is not logged in; run 'brick --login' first"}
+{"status":"error","code":"setup_required","message":"brick is not logged in; run 'brick login' first"}
 ```
 
 ### Self-test mode
 
-`--self-test` is an additional, undocumented (not listed in `-h`) flag for a
-companion app to check whether brick is expected to be able to sync
-successfully, without actually starting a sync. It never prompts, never
-checks for updates, and never touches the sync folder — the only state it may
-change is refreshing a stale access token, exactly as `brick --whoami` does.
+`--self-test` is a global flag for a companion app to check whether brick is
+expected to be able to sync successfully, without actually starting a sync.
+It never prompts, never checks for updates, and never touches the sync folder
+— the only state it may change is refreshing a stale access token, exactly as
+`brick whoami` does.
 
 Exactly one line of JSON is printed to stdout and brick exits **0**, whether
 or not the checks passed — pass/fail is carried entirely by the `ready` field
@@ -184,8 +234,8 @@ app never has to special-case a "failed" self-test as a crash:
 ```json
 {"status":"ok","version":"1.4.2","ready":false,"checks":[
   {"id":"instance_lock","status":"ok","message":"No other brick instance is running."},
-  {"id":"configuration","status":"fail","code":"no_active_account","message":"No account selected; run 'brick --switch-accounts'."},
-  {"id":"authentication","status":"fail","code":"not_logged_in","message":"Not logged in; run 'brick --login'."},
+  {"id":"configuration","status":"fail","code":"no_active_account","message":"No account selected; run 'brick switch-accounts'."},
+  {"id":"authentication","status":"fail","code":"not_logged_in","message":"Not logged in; run 'brick login'."},
   {"id":"api_reachable","status":"ok","message":"Reached https://api.brick.example."},
   {"id":"storage_reachable","status":"skipped","code":"not_configured","message":"Skipped: brick is not fully configured."}
 ]}
@@ -197,18 +247,17 @@ raw error text.
 
 ### Setup-and-exit mode
 
-`--setup-and-exit` is an additional, undocumented (not listed in `-h`) flag
-that runs exactly the same steps a normal `brick` start does — login (with
-its usual prompt if not already logged in), sync-folder selection, first-run
-onboarding, and confirming the Storage API is reachable — but stops right
-before a sync would actually start. It's meant for a companion app that wants
-to drive brick's real interactive setup once (e.g. from its own installer)
-and get a definitive pass/fail rather than having to launch a real sync and
-watch for it to start working.
+`--setup-and-exit` is a global flag that runs exactly the same steps a normal
+`brick sync` start does — login (with its usual prompt if not already logged
+in), sync-folder selection, first-run onboarding, and confirming the Storage
+API is reachable — but stops right before a sync would actually start. It's
+meant for a companion app that wants to drive brick's real interactive setup
+once (e.g. from its own installer) and get a definitive pass/fail rather than
+having to launch a real sync and watch for it to start working.
 
 Unlike `--self-test`, this is not read-only: it's the genuine first-run flow,
 so it will prompt for login and sync-folder choices exactly as an ordinary
-`brick` invocation would if setup isn't already complete.
+`brick sync` invocation would if setup isn't already complete.
 
 On success, it prints and exits **0**:
 
@@ -217,9 +266,9 @@ On success, it prints and exits **0**:
 ```
 
 On failure (already running, login declined, Storage API unreachable, etc.)
-it behaves exactly like a normal `brick` run would: an error is printed to
-stderr and it exits non-zero, except a declined login prompt, which exits `0`
-quietly (again, exactly like a normal run).
+it behaves exactly like a normal `brick sync` run would: an error is printed
+to stderr and it exits non-zero, except a declined login prompt, which exits
+`0` quietly (again, exactly like a normal run).
 
 Each entry in `checks` has:
 
@@ -242,7 +291,50 @@ failing reason at once rather than only the first:
 | `storage_reachable`  | Can it reach the Storage API and resolve the account's root folder? | `unreachable`; skipped as `not_configured`/`not_authenticated` if an earlier check failed |
 
 `ready` at the top level is `true` only when every check is `"ok"` — i.e. the
-next `brick -d` (or `brick -d --json`) is expected to succeed.
+next `brick sync -d` (or `brick sync -d --json`) is expected to succeed.
+
+## Upload & Download
+
+`brick upload` and `brick download` transfer a single file or an entire
+folder outside of the two-way sync loop — useful for a one-off transfer
+without setting up (or touching) a synced folder.
+
+```bash
+brick upload [-r] [-s] [--overwrite] <local-file|local-dir> [remote-path|uuid]
+brick download [-r] [-s] <uuid|remote-path> [local-target-dir]
+```
+
+Both commands accept either a node UUID or a path when one is needed:
+
+- `download`'s source and `upload`'s target may be a node UUID (e.g. copied
+  from the Brick webapp) or a path like `/Documents/Reports` — resolved from
+  the account root the same way the webapp resolves it.
+- `upload`'s target may be omitted entirely, in which case the file or folder
+  is uploaded to the account root.
+- `download`'s target directory may be omitted, in which case it defaults to
+  the current directory. It's created if it doesn't already exist.
+
+**Recursive folders.** A folder source requires `-r`/`--recursive` — without
+it, brick does nothing and exits non-zero rather than guessing you meant the
+whole tree. With `-r`, brick first prints a summary (`Uploading 42 files in 6
+folders (18.2 MB)...`) before transferring anything, then shows a per-file
+progress bar as it goes.
+
+**Errors during a recursive transfer** don't abort the whole thing — brick
+continues with the remaining files, then prints every failure at the end and
+exits non-zero if any occurred.
+
+**Conflicts.**
+
+- `download` overwrites an existing local file with the same name.
+- `upload` creates a copy (`report.pdf` → `report (copy).pdf`) by default,
+  matching how the Brick webapp itself handles a name already taken by a
+  sibling. Pass `--overwrite` to replace the existing remote file's content
+  instead.
+
+**Silent mode.** `-s`/`--silent` suppresses everything but errors — no
+pre-flight summary, no progress bars, no final summary line. Useful for a
+cron job or script that only cares about the exit code.
 
 ## Local Status/Control API
 
@@ -315,7 +407,7 @@ This repo uses a `Makefile` for building:
 make build-dev   # build ./cmd/brick for the current platform, using .env.dev
 make build-prod  # build ./cmd/brick for the current platform, using .env.prod
 make build-all   # cross-compile for macOS/Linux/Windows
-make dev         # hot-reload with air, against .env.dev (make dev ARGS="-s")
+make dev         # hot-reload with air, against .env.dev (make dev ARGS="sync -s")
 make install     # build using .env.prod and install to ~/.local/bin
 make release     # cross-compile + package release archives
 ```

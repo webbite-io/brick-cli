@@ -25,7 +25,7 @@ type selfTestCheck struct {
 
 // selfTestOutput is the sole line of output brick prints for --self-test,
 // meant to be parsed deterministically by a companion app deciding whether a
-// subsequent 'brick -d' is expected to succeed. Status is always "ok" — the
+// subsequent 'brick sync -d' is expected to succeed. Status is always "ok" — the
 // self-test ran to completion — since pass/fail of the underlying conditions
 // is carried by Ready and by each check's own Status, never by the process
 // exit code (--self-test always exits 0).
@@ -75,7 +75,7 @@ func selfTestSkipped(id, code, msg string) selfTestCheck {
 // and a token — those are reported "skipped" rather than attempted). It never
 // prompts, writes to the sync folder, or starts syncing; the only state it
 // may change is a token refresh during the authentication check, exactly as
-// an ordinary 'brick --whoami' would do.
+// an ordinary 'brick whoami' would do.
 func runSelfTest(apiURL, storageURL string) selfTestOutput {
 	var checks []selfTestCheck
 
@@ -100,9 +100,9 @@ func runSelfTest(apiURL, storageURL string) selfTestOutput {
 	if err != nil {
 		checks = append(checks, selfTestFail("configuration", "config_error", err.Error()))
 	} else if cfg.ActiveAccountID == "" {
-		checks = append(checks, selfTestFail("configuration", "no_active_account", "no account selected; run 'brick --switch-accounts'"))
+		checks = append(checks, selfTestFail("configuration", "no_active_account", "no account selected; run 'brick switch-accounts'"))
 	} else if ac := cfg.activeAccount(); ac == nil || ac.StorageSyncFolder == "" {
-		checks = append(checks, selfTestFail("configuration", "no_sync_folder", "no sync folder configured for the active account; run 'brick' interactively to finish setup"))
+		checks = append(checks, selfTestFail("configuration", "no_sync_folder", "no sync folder configured for the active account; run 'brick sync' interactively to finish setup"))
 	} else if _, statErr := os.Stat(ac.StorageSyncFolder); statErr != nil {
 		checks = append(checks, selfTestFail("configuration", "sync_folder_missing", fmt.Sprintf("configured sync folder %s is not accessible: %v", ac.StorageSyncFolder, statErr)))
 	} else {
@@ -111,16 +111,16 @@ func runSelfTest(apiURL, storageURL string) selfTestOutput {
 	}
 
 	// 3. Am I authenticated? A round trip to /oauth2/userinfo, same as
-	// 'brick --whoami' — authedGet silently refreshes the access token first
+	// 'brick whoami' — authedGet silently refreshes the access token first
 	// if needed, so this also confirms a stored refresh token still works.
 	authOK := false
 	if cfg == nil || (cfg.AccessToken == "" && cfg.RefreshToken == "") {
-		checks = append(checks, selfTestFail("authentication", "not_logged_in", "not logged in; run 'brick --login'"))
+		checks = append(checks, selfTestFail("authentication", "not_logged_in", "not logged in; run 'brick login'"))
 	} else {
 		resp, reqErr := authedGet(apiURL, "/oauth2/userinfo", cfg.AccessToken, cfg)
 		if reqErr != nil {
 			if errors.Is(reqErr, errSessionExpired) {
-				checks = append(checks, selfTestFail("authentication", "session_expired", "session has expired; run 'brick --login' to re-authenticate"))
+				checks = append(checks, selfTestFail("authentication", "session_expired", "session has expired; run 'brick login' to re-authenticate"))
 			} else {
 				checks = append(checks, selfTestFail("authentication", "request_failed", reqErr.Error()))
 			}

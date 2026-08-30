@@ -3,18 +3,27 @@
 brick \- storage sync CLI client for Webbite Brick
 .SH SYNOPSIS
 .B brick
-[\fIOPTIONS\fR]
+[\fIGLOBAL OPTIONS\fR]
+.I command
+[\fICOMMAND OPTIONS\fR]
+[\fIARGS\fR]
 .SH DESCRIPTION
 .B brick
-is the command-line client for Webbite Brick's storage sync feature. It performs
-two-way synchronization between a local folder and Brick: it walks both trees,
-uploads local-only files, downloads remote-only files, and resolves conflicts
-with the remote copy winning. After the initial pass it watches the local folder
-for filesystem changes and also polls the Storage API periodically, so both
-sides stay in sync until interrupted.
+is the command-line client for Webbite Brick's storage sync feature. Its
+.B sync
+command performs two-way synchronization between a local folder and Brick: it
+walks both trees, uploads local-only files, downloads remote-only files, and
+resolves conflicts with the remote copy winning. After the initial pass it
+watches the local folder for filesystem changes and also polls the Storage
+API periodically, so both sides stay in sync until interrupted.
 .PP
 .B brick
-also manages the OIDC login and active account used for sync.
+also manages the OIDC login and active account used for sync, and can
+transfer a single file or folder outside of the sync loop via its
+.B upload
+and
+.B download
+commands.
 .PP
 On first run
 .B brick
@@ -22,46 +31,93 @@ creates a configuration file at
 .I ~/.config/brick/config.yaml
 containing a unique client identifier.
 Authentication tokens are stored in the same file after a successful login.
-.SH OPTIONS
+.PP
+Global options must precede the command name; a command's own options must
+precede its positional arguments. For example:
+.B brick \-\-no\-upgrade\-check sync \-d
+is valid,
+.B brick sync \-d \-\-no\-upgrade\-check
+is not.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print a short usage summary and exit. Must be used alone.
+.TP
+.BR \-v ", " \-\-version
+Print the version number, build timestamp, and git commit hash, then exit.
+Must be used alone.
+.TP
+.B \-\-no\-upgrade\-check
+Suppress the automatic check for a newer version of
+.B brick
+that normally runs before
+.BR sync .
+.TP
+.B \-\-no\-control\-api
+Disable the local status/control API that
+.B "brick sync"
+otherwise starts alongside the sync loop. Local clients such as a tray app
+use this API to query sync status and to send commands (pause, quit,
+detach) to a running instance; with this flag such clients cannot find or
+control the process.
+.TP
+.B \-\-self\-test
+Print a single line of JSON reporting whether
+.B "brick sync"
+is expected to succeed right now (login, active account, sync folder, and
+API reachability), without starting a sync. Meant for a companion app.
+.TP
+.B \-\-setup\-and\-exit
+Run every interactive step a normal
+.B "brick sync"
+start would (login, sync-folder selection, first-run onboarding, an API
+reachability check), then exit without ever starting a sync. Meant for a
+companion app driving brick's setup from its own installer.
+.SH COMMANDS
 .SS Account management
 .TP
-.B \-\-login
+.B login
 Open the default web browser and start login flow.
 On completion the received credentials are saved to the configuration file.
 Run this command before using any feature that requires an authenticated account.
 .TP
-.B \-\-switch\-accounts
+.B switch\-accounts
 Interactively select which account to make active when more than one account
 has been authenticated.
 The selected account ID is persisted to the configuration file.
 .TP
-.B \-\-whoami
+.B whoami
 Print the name, email address, and active account of the currently authenticated
 user.
 If the access token has expired it is refreshed silently using the stored refresh
 token.
 .TP
-.B \-\-restart
+.B restart
 Clear existing settings and configure Brick from scratch, as if freshly
 installed. Stops any running instance, then for each account with a
 configured sync folder interactively offers to delete its local files and
-the folder itself, and finally removes the entire configuration directory
-before falling through into first-run setup.
-.SS Storage sync
+the folder itself, removes the entire configuration directory, and then
+immediately re-enters the same interactive setup a foreground
+.B sync
+would run.
 .TP
-Running
+.B uninstall
+Interactively remove the
 .B brick
-with no other options synchronizes the folder configured as
+binary, configuration directory, shell completion files, and man page.
+Each step prompts for confirmation before proceeding.
+.SS "sync \fR[\fIoptions\fR]"
+Synchronizes the folder configured as
 .I storageSyncFolder
 in the configuration file with Brick, then watches it for changes.
 If no sync folder is configured yet,
-.B brick
+.B "brick sync"
 prompts for one and persists it to the configuration file. The remote copy
 always wins on conflict. Requires a logged-in session with an active account
 (see
-.B \-\-login
+.B login
 and
-.BR \-\-switch\-accounts ).
+.BR switch\-accounts ).
 Press
 .B Ctrl\-C
 to stop syncing. When run in an interactive terminal, the sync loop also
@@ -79,6 +135,13 @@ so syncing continues after the terminal is closed. The same effect can also
 be triggered interactively from the foreground sync loop by pressing
 .BR D .
 Not supported on Windows.
+.TP
+.B \-\-json
+Used together with
+.BR \-d .
+Print a single line of JSON reporting the outcome of starting the daemon
+(or why it failed) instead of running interactively. Meant for a companion
+app that starts brick in daemon mode itself.
 .TP
 .BR \-r ", " \-\-remote\-control
 Allow Brick to remotely list, browse, and transfer files on this device while
@@ -102,82 +165,109 @@ instance is restarted to pick up the change.
 .TP
 .B \-\-list\-selective\-sync
 Print the folders currently excluded from sync for the active account.
-.SS Other
+.SS "upload \fR[\fIoptions\fR] \fIfile\fR|\fIdir\fR [\fItarget\-path\fR|\fIuuid\fR]"
+Upload a local file or folder to Brick, outside of the two-way sync loop.
+.I target
+may be a remote path (created if it doesn't already exist, like
+.BR "mkdir \-p" )
+or a folder's UUID; if omitted, the upload goes to the account root.
 .TP
-.B \-\-no\-upgrade\-check
-Suppress the automatic check for a newer version of
-.B brick
-that normally runs at startup before syncing.
+.BR \-r ", " \-\-recursive
+Required when the source is a folder; without it brick does nothing and
+exits non\-zero rather than guessing the whole tree was intended.
 .TP
-.B \-\-no\-control\-api
-Disable the local status/control API that
-.B brick
-otherwise starts alongside the sync loop. Local clients such as a tray app
-use this API to query sync status and to send commands (pause, quit,
-detach) to a running instance; with this flag such clients cannot find or
-control the process.
+.BR \-s ", " \-\-silent
+Suppress the pre\-flight summary, per\-file progress bars, and final summary
+line. Errors are still printed.
 .TP
-.B \-\-uninstall
-Interactively remove the
-.B brick
-binary, configuration directory, shell completion files, and man page.
-Each step prompts for confirmation before proceeding.
+.B \-\-overwrite
+If a file with the same name already exists at the destination, replace its
+content instead of creating a copy (Brick's default behavior otherwise, e.g.
+.IR "report.pdf" " \(-> " "report (copy).pdf" ).
+.SS "download \fR[\fIoptions\fR] \fIuuid\fR|\fIpath\fR [\fItarget\-dir\fR]"
+Download a remote file or folder from Brick, outside of the two-way sync
+loop.
+.I source
+may be a node UUID or a remote path.
+.I target\-dir
+defaults to the current directory if omitted, and is created if it doesn't
+already exist. An existing local file with the same name is overwritten.
 .TP
-.BR \-h ", " \-\-help
-Print a short usage summary and exit.
+.BR \-r ", " \-\-recursive
+Required when the source is a folder; without it brick does nothing and
+exits non\-zero rather than guessing the whole tree was intended.
 .TP
-.BR \-v ", " \-\-version
-Print the version number, build timestamp, and git commit hash, then exit.
+.BR \-s ", " \-\-silent
+Suppress the pre\-flight summary, per\-file progress bars, and final summary
+line. Errors are still printed.
+.PP
+Both
+.B upload
+and
+.B download
+continue past a per\-file error during a recursive transfer rather than
+aborting; every failure is listed at the end, and the process exits non\-zero
+if any occurred.
 .SH EXAMPLES
 .TP
 Log in to a Webbite account:
 .EX
-brick \-\-login
+brick login
 .EE
 .TP
 Show the currently authenticated user:
 .EX
-brick \-\-whoami
+brick whoami
 .EE
 .TP
 Switch to a different account:
 .EX
-brick \-\-switch\-accounts
+brick switch\-accounts
 .EE
 .TP
 Sync the configured folder with Brick and watch for changes:
 .EX
-brick
+brick sync
 .EE
 .TP
 Sync and allow Brick to remotely browse and transfer files:
 .EX
-brick \-\-remote\-control
+brick sync \-\-remote\-control
 .EE
 .TP
 Sync without checking for CLI upgrades first:
 .EX
-brick \-\-no\-upgrade\-check
+brick \-\-no\-upgrade\-check sync
 .EE
 .TP
 Sync and immediately detach into the background:
 .EX
-brick \-\-daemon
+brick sync \-\-daemon
 .EE
 .TP
 Choose which folders to exclude from sync:
 .EX
-brick \-\-selective\-sync
+brick sync \-\-selective\-sync
 .EE
 .TP
 List folders currently excluded from sync:
 .EX
-brick \-\-list\-selective\-sync
+brick sync \-\-list\-selective\-sync
 .EE
 .TP
 Clear all local settings and set up Brick again from scratch:
 .EX
-brick \-\-restart
+brick restart
+.EE
+.TP
+Upload a folder recursively to a remote path:
+.EX
+brick upload \-r ~/Photos /Backups/Photos
+.EE
+.TP
+Download a remote folder by UUID into the current directory:
+.EX
+brick download \-r 3fa85f64\-5717\-4562\-b3fc\-2c963f66afa6
 .EE
 .SH FILES
 .TP
@@ -198,7 +288,7 @@ accounts sharing the same local folder still keep independent bookkeeping).
 Records the last-known local hash and remote ETag for each synced file, plus
 a server-time cursor for incremental polling, so repeated runs only transfer
 what changed. Safe to delete;
-.B brick
+.B "brick sync"
 will simply re-reconcile the full tree on the next run.
 .SH EXIT STATUS
 .TP
@@ -206,7 +296,8 @@ will simply re-reconcile the full tree on the next run.
 Success.
 .TP
 .B 1
-An error occurred (invalid flags, network failure, authentication error, etc.).
+An error occurred (invalid flags, network failure, authentication error,
+one or more files failed during a recursive transfer, etc.).
 .SH BUGS
 Please report bugs and feature requests at:
 .br

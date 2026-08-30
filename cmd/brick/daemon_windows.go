@@ -7,7 +7,7 @@ import "errors"
 // Daemon mode relies on POSIX session detachment (setsid) and fd inheritance
 // across exec, neither of which Windows has an equivalent for, so -d/--daemon
 // is unsupported there.
-var errDaemonUnsupported = errors.New("daemon mode (-d) is not supported on Windows; run brick without -d instead")
+var errDaemonUnsupported = errors.New("daemon mode (-d) is not supported on Windows; run 'brick sync' without -d instead")
 
 // daemonSupported reports whether this platform can run brick as a detached
 // background daemon; used to decide whether the interactive sync banner

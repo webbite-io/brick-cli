@@ -4,24 +4,75 @@
 #   ~/.local/share/zsh/site-functions/_brick
 
 _brick() {
-    local -a args
-    args=(
-        '(--login)'--login'[Log in via browser]'
-        '(--switch-accounts)'--switch-accounts'[Switch the active account]'
-        '(--whoami)'--whoami'[Show logged-in user and account details]'
-        '(--restart)'--restart'[Clear existing settings and configure Brick from scratch]'
-        '(-d --daemon)'{-d,--daemon}'[Detach into the background once logged in and reachable]'
-        '(-r --remote-control)'{-r,--remote-control}'[Allow the Storage API to remotely list/browse/transfer files on this device]'
-        '(--agent-root)'--agent-root'[Additional directory to expose to remote clients when remote control is enabled]:directory:_files -/'
-        '(-s --selective-sync)'{-s,--selective-sync}'[Choose which folders to exclude from sync]'
-        '(--list-selective-sync)'--list-selective-sync'[List the folders currently excluded from sync]'
-        '(--no-upgrade-check)'--no-upgrade-check'[Disable automatic upgrade check]'
-        '(--no-control-api)'--no-control-api'[Disable the local status/control API]'
-        '(--uninstall)'--uninstall'[Uninstall brick]'
+    local -a global_flags
+    global_flags=(
         '(-h --help)'{-h,--help}'[Show help information]'
         '(-v --version)'{-v,--version}'[Show version information]'
+        '(--no-upgrade-check)'--no-upgrade-check'[Disable automatic upgrade check]'
+        '(--no-control-api)'--no-control-api'[Disable the local status/control API]'
+        '(--self-test)'--self-test'[Print a readiness check as JSON, without syncing]'
+        '(--setup-and-exit)'--setup-and-exit'[Run interactive setup, then exit without syncing]'
     )
-    _arguments -s $args
+
+    local -a commands
+    commands=(
+        'login:Log in via browser'
+        'switch-accounts:Switch the active account'
+        'whoami:Show logged-in user and account details'
+        'restart:Clear existing settings and configure Brick from scratch'
+        'uninstall:Uninstall brick (interactive)'
+        'sync:Sync storageSyncFolder with the Storage API and watch for changes'
+        'upload:Upload a local file or folder'
+        'download:Download a remote file or folder'
+    )
+
+    _arguments -C \
+        $global_flags \
+        '1: :->command' \
+        '*:: :->args'
+
+    case $state in
+        command)
+            _describe 'command' commands
+            ;;
+        args)
+            case $words[1] in
+                sync)
+                    local -a sync_flags
+                    sync_flags=(
+                        '(-d --daemon)'{-d,--daemon}'[Detach into the background once logged in and reachable]'
+                        '(--json)'--json'[With -d: print one JSON status line instead of running interactively]'
+                        '(-r --remote-control)'{-r,--remote-control}'[Allow the Storage API to remotely list/browse/transfer files on this device]'
+                        '(--agent-root)'--agent-root'[Additional directory to expose to remote clients when remote control is enabled]:directory:_files -/'
+                        '(-s --selective-sync)'{-s,--selective-sync}'[Choose which folders to exclude from sync]'
+                        '(--list-selective-sync)'--list-selective-sync'[List the folders currently excluded from sync]'
+                    )
+                    _arguments -s $sync_flags
+                    ;;
+                upload)
+                    local -a upload_flags
+                    upload_flags=(
+                        '(-r --recursive)'{-r,--recursive}'[Required to upload a folder]'
+                        '(-s --silent)'{-s,--silent}'[Suppress all output except errors]'
+                        '(--overwrite)'--overwrite'[Replace an existing remote file instead of creating a copy]'
+                        '1:file or directory:_files'
+                        '2:target path or uuid:'
+                    )
+                    _arguments -s $upload_flags
+                    ;;
+                download)
+                    local -a download_flags
+                    download_flags=(
+                        '(-r --recursive)'{-r,--recursive}'[Required to download a folder]'
+                        '(-s --silent)'{-s,--silent}'[Suppress all output except errors]'
+                        '1:uuid or path:'
+                        '2:target directory:_files -/'
+                    )
+                    _arguments -s $download_flags
+                    ;;
+            esac
+            ;;
+    esac
 }
 
 _brick "$@"

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -480,7 +481,7 @@ func authedRequest(ctx context.Context, reqBaseURL, refreshAPIURL, method, path 
 			return nil, fmt.Errorf("%w; token refresh failed: %v", errSessionExpired, refreshErr)
 		}
 		if newAccess == "" {
-			return nil, fmt.Errorf("%w; no access token available (run 'brick --login')", errSessionExpired)
+			return nil, fmt.Errorf("%w; no access token available (run 'brick login')", errSessionExpired)
 		}
 		return doRequest(newAccess)
 	}
@@ -1911,7 +1912,7 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 		return nil, err
 	}
 	if cfg.ActiveAccountID == "" {
-		return nil, errors.New("no active account selected; run 'brick --switch-accounts' first")
+		return nil, errors.New("no active account selected; run 'brick switch-accounts' first")
 	}
 
 	ac := cfg.activeAccount()
@@ -1946,6 +1947,101 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 		conflictMode: conflictMode,
 		isFirstSetup: isFirstSetup,
 	}, nil
+}
+
+// runSyncCmd handles `brick sync [flags]` — the subcommand form of what used
+// to be brick's default (bare) action. It owns a dedicated FlagSet so its
+// -d/-r/-s never collide with the root command's own flags (which mean
+// different things: -h/-v, etc.), and reproduces exactly the branching that
+// used to live at the bottom of main(): selective-sync config, listing
+// selective-sync, the detached-daemon-child re-exec check, daemon start, and
+// finally the default foreground sync. None of that internal logic changed —
+// only its container moved out of main().
+func runSyncCmd(args []string, noUpgradeCheck, noControlAPI bool) {
+	syncFlags := flag.NewFlagSet("sync", flag.ExitOnError)
+	var (
+		daemon            bool
+		daemonJSON        bool
+		remoteControl     bool
+		selectiveSync     bool
+		listSelectiveSync bool
+	)
+	syncFlags.BoolVar(&daemon, "d", false, "")
+	syncFlags.BoolVar(&daemon, "daemon", false, "")
+	// Undocumented: only used together with -d/--daemon, by the companion app
+	// that starts brick in daemon mode. See README for the JSON output shapes.
+	syncFlags.BoolVar(&daemonJSON, "json", false, "")
+	syncFlags.BoolVar(&remoteControl, "r", false, "")
+	syncFlags.BoolVar(&remoteControl, "remote-control", false, "")
+	syncFlags.BoolVar(&selectiveSync, "s", false, "")
+	syncFlags.BoolVar(&selectiveSync, "selective-sync", false, "")
+	syncFlags.BoolVar(&listSelectiveSync, "list-selective-sync", false, "")
+	syncFlags.Var(&agentRootsFlag, "agent-root", "")
+	_ = syncFlags.Parse(args)
+
+	// Skipped entirely under -d --json: checkForUpdates can print a prompt
+	// and read stdin, which would break the "exactly one JSON line on
+	// stdout" contract.
+	if !noUpgradeCheck && !(daemon && daemonJSON) && !isRunningInDevelopment() {
+		checkForUpdates()
+	}
+	apiURL := resolveAPIURL()
+	storageURL := resolveStorageAPIURL()
+
+	// Detached daemon child: runAsDaemon re-execs the binary with this env var
+	// set, handing over the folder/conflict-mode decisions made interactively
+	// in the foreground parent so they're applied here without prompting again.
+	if folder := os.Getenv(daemonFolderEnv); folder != "" {
+		isFirstSetup := os.Getenv(daemonFirstSetupEnv) == "1"
+		if err := runDaemonChild(apiURL, storageURL, remoteControl, noControlAPI, folder, os.Getenv(daemonConflictModeEnv), isFirstSetup); err != nil {
+			if errors.Is(err, errLoginDeclined) {
+				return
+			}
+			log.Fatalf("Storage sync failed: %v", err)
+		}
+		return
+	}
+
+	// Selective sync: update which folders are excluded from sync.
+	if selectiveSync {
+		if err := runWithAutoRelogin(apiURL, switchAccountsReloginPrompt, func() error { return runSelectiveSync(apiURL, storageURL) }); err != nil {
+			log.Fatalf("Selective sync failed: %v", err)
+		}
+		return
+	}
+
+	// List selective sync: print the folders currently excluded from sync.
+	if listSelectiveSync {
+		if err := runListSelectiveSync(); err != nil {
+			log.Fatalf("List selective sync failed: %v", err)
+		}
+		return
+	}
+
+	if daemon {
+		if daemonJSON {
+			runAsDaemonJSON(apiURL, storageURL, remoteControl, noControlAPI)
+			return // unreachable: runAsDaemonJSON always exits the process itself
+		}
+		if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
+			return runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI)
+		}); err != nil {
+			if errors.Is(err, errLoginDeclined) {
+				return
+			}
+			log.Fatalf("Failed to start daemon: %v", err)
+		}
+		return
+	}
+
+	if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
+		return runStorageSync(apiURL, storageURL, remoteControl, noControlAPI)
+	}); err != nil {
+		if errors.Is(err, errLoginDeclined) {
+			return
+		}
+		log.Fatalf("Storage sync failed: %v", err)
+	}
 }
 
 // runStorageSync performs an initial full sync of storageSyncFolder with the
@@ -2051,7 +2147,7 @@ func newWatcherWithRetry() (*fsnotify.Watcher, error) {
 // interrupted (Ctrl+C/SIGTERM in the foreground case; SIGTERM when stopping a
 // detached daemon). background is true when this is the detached daemon
 // child (as opposed to a foreground run), and is recorded in the control
-// discovery file so a later 'brick --switch-accounts' knows whether it's
+// discovery file so a later 'brick switch-accounts' knows whether it's
 // safe to relaunch a replacement daemon after stopping this one.
 //
 // The returned bool is true when the loop stopped because the user pressed
@@ -2262,7 +2358,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 				}
 				if err := eng.reconcileAll(ctx); err != nil {
 					if errors.Is(err, errSessionExpired) {
-						log.Printf("session expired — run 'brick --login' to re-authenticate")
+						log.Printf("session expired — run 'brick login' to re-authenticate")
 						cancel()
 						return
 					}
@@ -2315,7 +2411,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 
 				if pollErr != nil {
 					if errors.Is(pollErr, errSessionExpired) {
-						log.Printf("session expired — run 'brick --login' to re-authenticate")
+						log.Printf("session expired — run 'brick login' to re-authenticate")
 						cancel()
 						return
 					}
@@ -2492,12 +2588,12 @@ func runSelectiveSync(apiURL, storageURL string) error {
 		return err
 	}
 	if cfg.ActiveAccountID == "" {
-		return errors.New("no active account selected; run 'brick --switch-accounts' first")
+		return errors.New("no active account selected; run 'brick switch-accounts' first")
 	}
 	ac := cfg.ensureActiveAccount()
 	folder := strings.TrimSpace(ac.StorageSyncFolder)
 	if folder == "" {
-		return errors.New("no sync folder configured yet; run 'brick' first to set one up")
+		return errors.New("no sync folder configured yet; run 'brick sync' first to set one up")
 	}
 
 	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
@@ -2579,7 +2675,7 @@ func runListSelectiveSync() error {
 		return err
 	}
 	if cfg.ActiveAccountID == "" {
-		return errors.New("no active account selected; run 'brick --switch-accounts' first")
+		return errors.New("no active account selected; run 'brick switch-accounts' first")
 	}
 	ac := cfg.activeAccount()
 	if ac == nil || len(ac.ExcludeDirs) == 0 {

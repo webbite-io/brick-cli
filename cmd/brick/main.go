@@ -29,55 +29,34 @@ func main() {
 	}
 
 	var (
-		showVersion       bool
-		showHelp          bool
-		noUpgradeCheck    bool
-		uninstall         bool
-		loginMode         bool
-		switchAccounts    bool
-		whoami            bool
-		restart           bool
-		remoteControl     bool
-		noControlAPI      bool
-		daemon            bool
-		daemonJSON        bool
-		selectiveSync     bool
-		listSelectiveSync bool
-		selfTest          bool
-		setupAndExit      bool
+		showVersion    bool
+		showHelp       bool
+		noUpgradeCheck bool
+		noControlAPI   bool
+		selfTest       bool
+		setupAndExit   bool
 	)
 
+	// Global flags. These must appear before the subcommand (if any) — the
+	// stdlib flag package stops parsing at the first non-flag token, so
+	// e.g. `brick --no-upgrade-check sync -d` works but `brick sync -d
+	// --no-upgrade-check` does not (--no-upgrade-check would be parsed as an
+	// argument to the sync subcommand instead, and rejected there).
 	flag.BoolVar(&showVersion, "v", false, "")
 	flag.BoolVar(&showVersion, "version", false, "")
 	flag.BoolVar(&showHelp, "h", false, "")
 	flag.BoolVar(&showHelp, "help", false, "")
 	flag.BoolVar(&noUpgradeCheck, "no-upgrade-check", false, "")
-	flag.BoolVar(&uninstall, "uninstall", false, "")
-	flag.BoolVar(&loginMode, "login", false, "")
-	flag.BoolVar(&switchAccounts, "switch-accounts", false, "")
-	flag.BoolVar(&whoami, "whoami", false, "")
-	flag.BoolVar(&restart, "restart", false, "")
-	flag.BoolVar(&remoteControl, "r", false, "")
-	flag.BoolVar(&remoteControl, "remote-control", false, "")
 	flag.BoolVar(&noControlAPI, "no-control-api", false, "")
-	flag.BoolVar(&daemon, "d", false, "")
-	flag.BoolVar(&daemon, "daemon", false, "")
-	flag.BoolVar(&selectiveSync, "s", false, "")
-	flag.BoolVar(&selectiveSync, "selective-sync", false, "")
-	flag.BoolVar(&listSelectiveSync, "list-selective-sync", false, "")
-	// Undocumented: a read-only diagnostic for a companion app to check
-	// whether brick is expected to be able to sync right now, without
-	// actually starting a sync. See README for the JSON output shape.
+	// Undocumented until recently, now documented under "Other": a read-only
+	// diagnostic for a companion app to check whether brick is expected to be
+	// able to sync right now, without actually starting a sync. See README.
 	flag.BoolVar(&selfTest, "self-test", false, "")
-	// Undocumented: runs every interactive setup step a normal sync start
-	// would (login, sync-folder selection, first-run onboarding, a Storage
-	// API reachability check), then exits without ever starting a sync. See
-	// README for details.
+	// Undocumented until recently, now documented under "Other": runs every
+	// interactive setup step a normal sync start would (login, sync-folder
+	// selection, first-run onboarding, a Storage API reachability check),
+	// then exits without ever starting a sync. See README for details.
 	flag.BoolVar(&setupAndExit, "setup-and-exit", false, "")
-	// Undocumented: only used together with -d/--daemon, by the companion app
-	// that starts brick in daemon mode. See README for the JSON output shapes.
-	flag.BoolVar(&daemonJSON, "json", false, "")
-	flag.Var(&agentRootsFlag, "agent-root", "")
 	flag.Usage = printHelp
 	flag.Parse()
 
@@ -99,62 +78,11 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Uninstall flow
-	if uninstall {
-		runUninstall()
-		os.Exit(0)
-	}
-
-	// Login flow
-	if loginMode {
-		apiURL := resolveAPIURL()
-		if err := runLogin(apiURL, nil); err != nil {
-			log.Fatalf("Login failed: %v", err)
-		}
-		os.Exit(0)
-	}
-
-	// Switch accounts
-	if switchAccounts {
-		apiURL := resolveAPIURL()
-		storageURL := resolveStorageAPIURL()
-		if err := runWithAutoRelogin(apiURL, switchAccountsReloginPrompt, func() error { return runSwitchAccounts(apiURL, storageURL) }); err != nil {
-			log.Fatalf("Switch accounts failed: %v", err)
-		}
-		os.Exit(0)
-	}
-
-	// Whoami
-	if whoami {
-		apiURL := resolveAPIURL()
-		if err := runWhoami(apiURL); err != nil {
-			log.Fatalf("whoami failed: %v", err)
-		}
-		os.Exit(0)
-	}
-
-	// Selective sync: update which folders are excluded from sync.
-	if selectiveSync {
-		apiURL := resolveAPIURL()
-		storageURL := resolveStorageAPIURL()
-		if err := runWithAutoRelogin(apiURL, switchAccountsReloginPrompt, func() error { return runSelectiveSync(apiURL, storageURL) }); err != nil {
-			log.Fatalf("Selective sync failed: %v", err)
-		}
-		os.Exit(0)
-	}
-
-	// List selective sync: print the folders currently excluded from sync.
-	if listSelectiveSync {
-		if err := runListSelectiveSync(); err != nil {
-			log.Fatalf("List selective sync failed: %v", err)
-		}
-		os.Exit(0)
-	}
-
 	// Self-test: run every readiness check and print a single JSON line,
 	// without prompting, checking for updates, or starting a sync. Placed
-	// ahead of checkForUpdates below since that can block on stdin for an
-	// upgrade prompt, which a companion app calling this must never hit.
+	// ahead of any subcommand dispatch below since that can block on stdin
+	// for an upgrade prompt, which a companion app calling this must never
+	// hit.
 	if selfTest {
 		apiURL := resolveAPIURL()
 		storageURL := resolveStorageAPIURL()
@@ -177,65 +105,73 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Restart: wipe local settings and sync folders, then fall through into
-	// the normal flow below so setup runs again as if this were a fresh
-	// install.
-	if restart {
-		proceed, err := runRestart()
-		if err != nil {
-			log.Fatalf("Restart failed: %v", err)
-		}
-		if !proceed {
-			os.Exit(0)
-		}
-	}
+	switch flag.Arg(0) {
+	case "":
+		printHelp()
+		os.Exit(0)
 
-	// Storage sync: the default action, requiring no CLI options. Skipped
-	// entirely under -d --json: checkForUpdates can print a prompt and read
-	// stdin, which would break the "exactly one JSON line on stdout" contract.
-	if !noUpgradeCheck && !(daemon && daemonJSON) && !isRunningInDevelopment() {
-		checkForUpdates()
-	}
-	apiURL := resolveAPIURL()
-	storageURL := resolveStorageAPIURL()
-
-	// Detached daemon child: runAsDaemon re-execs the binary with this env var
-	// set, handing over the folder/conflict-mode decisions made interactively
-	// in the foreground parent so they're applied here without prompting again.
-	if folder := os.Getenv(daemonFolderEnv); folder != "" {
-		isFirstSetup := os.Getenv(daemonFirstSetupEnv) == "1"
-		if err := runDaemonChild(apiURL, storageURL, remoteControl, noControlAPI, folder, os.Getenv(daemonConflictModeEnv), isFirstSetup); err != nil {
-			if errors.Is(err, errLoginDeclined) {
-				os.Exit(0)
-			}
-			log.Fatalf("Storage sync failed: %v", err)
+	case "login":
+		requireNoExtraArgs("login")
+		apiURL := resolveAPIURL()
+		if err := runLogin(apiURL, nil); err != nil {
+			log.Fatalf("Login failed: %v", err)
 		}
 		os.Exit(0)
-	}
 
-	if daemon {
-		if daemonJSON {
-			runAsDaemonJSON(apiURL, storageURL, remoteControl, noControlAPI)
-			return // unreachable: runAsDaemonJSON always exits the process itself
-		}
-		if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
-			return runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI)
-		}); err != nil {
-			if errors.Is(err, errLoginDeclined) {
-				os.Exit(0)
-			}
-			log.Fatalf("Failed to start daemon: %v", err)
+	case "switch-accounts":
+		requireNoExtraArgs("switch-accounts")
+		apiURL := resolveAPIURL()
+		storageURL := resolveStorageAPIURL()
+		if err := runWithAutoRelogin(apiURL, switchAccountsReloginPrompt, func() error { return runSwitchAccounts(apiURL, storageURL) }); err != nil {
+			log.Fatalf("Switch accounts failed: %v", err)
 		}
 		os.Exit(0)
-	}
 
-	if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
-		return runStorageSync(apiURL, storageURL, remoteControl, noControlAPI)
-	}); err != nil {
-		if errors.Is(err, errLoginDeclined) {
-			os.Exit(0)
+	case "whoami":
+		requireNoExtraArgs("whoami")
+		apiURL := resolveAPIURL()
+		if err := runWhoami(apiURL); err != nil {
+			log.Fatalf("whoami failed: %v", err)
 		}
-		log.Fatalf("Storage sync failed: %v", err)
+		os.Exit(0)
+
+	case "restart":
+		requireNoExtraArgs("restart")
+		runRestartCmd(noUpgradeCheck, noControlAPI)
+		os.Exit(0)
+
+	case "uninstall":
+		requireNoExtraArgs("uninstall")
+		runUninstall()
+		os.Exit(0)
+
+	case "sync":
+		runSyncCmd(flag.Args()[1:], noUpgradeCheck, noControlAPI)
+		os.Exit(0)
+
+	case "upload":
+		runUploadCmd(flag.Args()[1:])
+		os.Exit(0)
+
+	case "download":
+		runDownloadCmd(flag.Args()[1:])
+		os.Exit(0)
+
+	default:
+		fmt.Fprintf(os.Stderr, "brick: unknown command %q\n\n", flag.Arg(0))
+		printHelp()
+		os.Exit(1)
+	}
+}
+
+// requireNoExtraArgs exits with an error if anything follows the subcommand
+// name in flag.Args() — used by the account-mgmt subcommands, none of which
+// take any flags or positional arguments of their own, so e.g. `brick login
+// -d` must be rejected rather than silently ignoring -d.
+func requireNoExtraArgs(cmd string) {
+	if extra := flag.Args()[1:]; len(extra) > 0 {
+		fmt.Fprintf(os.Stderr, "brick %s: takes no flags or arguments (got %q)\n", cmd, strings.Join(extra, " "))
+		os.Exit(1)
 	}
 }
 
@@ -458,6 +394,39 @@ func runUninstall() {
 	}
 
 	fmt.Println("\nUninstall complete.")
+}
+
+// runRestartCmd handles `brick restart`: clears local settings (config,
+// optionally each account's local sync folder) and, unless the user backs
+// out at the initial confirmation, immediately re-enters the same
+// interactive foreground setup a plain `brick sync` would run — so restarting
+// always leaves brick reconfigured and syncing, rather than requiring a
+// separate `brick sync` call afterward. Mirrors the fallthrough behavior the
+// old --restart flag got for free by sharing main()'s body with the default
+// sync path.
+func runRestartCmd(noUpgradeCheck, noControlAPI bool) {
+	proceed, err := runRestart()
+	if err != nil {
+		log.Fatalf("Restart failed: %v", err)
+	}
+	if !proceed {
+		return
+	}
+
+	if !noUpgradeCheck && !isRunningInDevelopment() {
+		checkForUpdates()
+	}
+	apiURL := resolveAPIURL()
+	storageURL := resolveStorageAPIURL()
+
+	if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
+		return runStorageSync(apiURL, storageURL, false, noControlAPI)
+	}); err != nil {
+		if errors.Is(err, errLoginDeclined) {
+			return
+		}
+		log.Fatalf("Storage sync failed: %v", err)
+	}
 }
 
 // runRestart clears brick's local settings so it can be configured from

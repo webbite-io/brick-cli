@@ -41,7 +41,7 @@ type controlDiscovery struct {
 
 	// Background is true when this process is a detached daemon (started via
 	// -d/--daemon) rather than a foreground run. Only background instances
-	// are safe to relaunch unattended after 'brick --switch-accounts' stops
+	// are safe to relaunch unattended after 'brick switch-accounts' stops
 	// them — a foreground run is attached to someone's terminal and is left
 	// stopped instead.
 	Background bool `json:"background"`
@@ -434,7 +434,7 @@ func pauseRunningInstance() (bool, error) {
 	return true, nil
 }
 
-// restartDaemonIfRunning is called after 'brick --switch-accounts' picks a
+// restartDaemonIfRunning is called after 'brick switch-accounts' picks a
 // new account. It looks for a currently running brick instance and, if one
 // is found, stops it gracefully (so it isn't left syncing under the
 // just-replaced account) and, if it was a background daemon, relaunches it

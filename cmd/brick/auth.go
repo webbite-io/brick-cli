@@ -706,7 +706,7 @@ func runWhoami(apiURL string) error {
 		return err
 	}
 	if cfg.AccessToken == "" && cfg.RefreshToken == "" {
-		fmt.Println("You are not logged in. Run 'brick --login' to authenticate.")
+		fmt.Println("You are not logged in. Run 'brick login' to authenticate.")
 		return nil
 	}
 
@@ -715,7 +715,7 @@ func runWhoami(apiURL string) error {
 		clientID := getEnv("OAUTH_CLIENT_ID", DefaultOAuthClientID)
 		newAccess, newRefresh, newID, refreshErr := refreshAccessToken(apiURL, cfg.RefreshToken, clientID)
 		if refreshErr != nil {
-			fmt.Println("Your session has expired. Run 'brick --login' to re-authenticate.")
+			fmt.Println("Your session has expired. Run 'brick login' to re-authenticate.")
 			return nil
 		}
 		cfg.AccessToken = newAccess
@@ -732,7 +732,7 @@ func runWhoami(apiURL string) error {
 	profileResp, err := authedGet(apiURL, "/oauth2/userinfo", cfg.AccessToken, cfg)
 	if err != nil {
 		if errors.Is(err, errSessionExpired) {
-			fmt.Println("Your session has expired. Run 'brick --login' to re-authenticate.")
+			fmt.Println("Your session has expired. Run 'brick login' to re-authenticate.")
 			return nil
 		}
 		return fmt.Errorf("userinfo request failed: %w", err)

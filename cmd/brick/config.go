@@ -40,7 +40,7 @@ type Config struct {
 	IDToken      string `yaml:"idToken,omitempty"`
 
 	// ActiveAccountID is the account currently in effect; it always keys into
-	// Accounts. Switched via 'brick --switch-accounts'.
+	// Accounts. Switched via 'brick switch-accounts'.
 	ActiveAccountID string `yaml:"activeAccountId,omitempty"`
 
 	// Accounts holds one entry per account the user has ever synced, keyed by
@@ -238,24 +238,36 @@ func resolveStorageAPIURL() string {
 func printHelp() {
 	fmt.Printf("\n\033[38;5;226mWebbite Brick CLI\033[0m v%s\n\n", Version)
 	fmt.Println("Usage:")
-	fmt.Printf("  brick [options]\n\n")
-	fmt.Println("Options:")
-	fmt.Println("\nAccount Mgmt\n============")
-	fmt.Printf("      --login                 Log in via browser\n")
-	fmt.Printf("      --switch-accounts       Switch the active account\n")
-	fmt.Printf("      --whoami                Show logged-in user and account details\n")
-	fmt.Printf("      --restart               Clear existing settings and configure Brick from scratch\n")
-	fmt.Println("\nStorage Sync\n============")
-	fmt.Printf("  Running brick with no other options syncs storageSyncFolder with the Storage API and watches for changes\n")
-	fmt.Printf("  -d, --daemon                Detach into the background once logged in and the Storage API is reachable\n")
-	fmt.Printf("  -r, --remote-control        Allow remote control via Brick webapp (also possible to enable via config file)\n")
-	fmt.Printf("      --agent-root PATH       Directory to expose to remote clients when remote control is enabled (repeatable)\n")
-	fmt.Printf("  -s, --selective-sync        Choose which folders to exclude from sync (deletes their local copies)\n")
-	fmt.Printf("      --list-selective-sync   List the folders currently excluded from sync\n")
-	fmt.Println("\nOther\n=====")
-	fmt.Printf("      --no-upgrade-check      Disable automatic upgrade check\n")
-	fmt.Printf("      --no-control-api        Disable the local status/control API (used by tray apps)\n")
-	fmt.Printf("      --uninstall             Uninstall brick\n")
+	fmt.Printf("  brick [global flags] <command> [command flags] [args]\n\n")
+	fmt.Println("Global flags (must come before the command)")
+	fmt.Println("============================================")
 	fmt.Printf("  -h, --help                  Show help information\n")
 	fmt.Printf("  -v, --version               Show version information\n")
+	fmt.Printf("      --no-upgrade-check      Disable automatic upgrade check\n")
+	fmt.Printf("      --no-control-api        Disable the local status/control API (used by tray apps)\n")
+	fmt.Printf("      --self-test             Print a readiness check as JSON, without syncing\n")
+	fmt.Printf("      --setup-and-exit        Run interactive setup, then exit without syncing\n")
+	fmt.Println("\nAccount Mgmt\n============")
+	fmt.Printf("  login                       Log in via browser\n")
+	fmt.Printf("  switch-accounts             Switch the active account\n")
+	fmt.Printf("  whoami                      Show logged-in user and account details\n")
+	fmt.Printf("  restart                     Clear existing settings and configure Brick from scratch\n")
+	fmt.Println("\nStorage Sync\n============")
+	fmt.Printf("  sync [options]              Sync storageSyncFolder with the Storage API and watch for changes\n")
+	fmt.Printf("    -d, --daemon                Detach into the background once logged in and the Storage API is reachable\n")
+	fmt.Printf("        --json                  With -d: print one JSON status line instead of running interactively\n")
+	fmt.Printf("    -r, --remote-control        Allow remote control via Brick webapp (also possible to enable via config file)\n")
+	fmt.Printf("        --agent-root PATH       Directory to expose to remote clients when remote control is enabled (repeatable)\n")
+	fmt.Printf("    -s, --selective-sync        Choose which folders to exclude from sync (deletes their local copies)\n")
+	fmt.Printf("        --list-selective-sync   List the folders currently excluded from sync\n")
+	fmt.Println("\nTransfer\n========")
+	fmt.Printf("  upload <file|dir> [target]  Upload a local file or folder\n")
+	fmt.Printf("    -r, --recursive             Required to upload a folder\n")
+	fmt.Printf("    -s, --silent                Suppress all output except errors\n")
+	fmt.Printf("        --overwrite             Replace an existing remote file instead of creating a copy\n")
+	fmt.Printf("  download <uuid|path> [dir] Download a remote file or folder\n")
+	fmt.Printf("    -r, --recursive             Required to download a folder\n")
+	fmt.Printf("    -s, --silent                Suppress all output except errors\n")
+	fmt.Println("\nOther\n=====")
+	fmt.Printf("  uninstall                   Uninstall brick\n")
 }
