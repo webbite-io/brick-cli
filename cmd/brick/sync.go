@@ -1214,10 +1214,15 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 
 	// 2. Create missing local directories for remote folders, and record every
 	//    remote folder in the index so later passes can recognise which local
-	//    folders were once synced.
+	//    folders were once synced. Excluded folders are recorded (so pass 1's
+	//    "missing locally because it's excluded" check above has something to
+	//    match against) but never created on disk — that's the whole point of
+	//    excluding them.
 	for rel, node := range remoteFolders {
-		if err := os.MkdirAll(filepath.Join(e.folder, filepath.FromSlash(rel)), 0o755); err != nil {
-			log.Printf("mkdir %s: %v", rel, err)
+		if !isExcludedPath(rel, e.excludeDirs) {
+			if err := os.MkdirAll(filepath.Join(e.folder, filepath.FromSlash(rel)), 0o755); err != nil {
+				log.Printf("mkdir %s: %v", rel, err)
+			}
 		}
 		e.state.Folders[rel] = true
 		e.state.FolderIDs[rel] = node.ID
