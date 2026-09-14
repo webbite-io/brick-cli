@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/x/term"
 	"github.com/fsnotify/fsnotify"
@@ -2199,21 +2200,26 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 	}
 
 	// Interactive mode (foreground run attached to a real terminal) gets the
-	// colored banner, a fixed-height scrolling window for log output, and
-	// raw-mode keyboard shortcuts (Ctrl+C, D to detach, P to pause/resume).
-	// Anything else — the detached daemon child, or output/input that isn't a
-	// terminal — keeps the plain one-line banner and ordinary scrolling log
-	// output.
+	// full-screen sync TUI (see tui.go) with keyboard shortcuts (Ctrl+C, D to
+	// detach, P to pause/resume, / to search). Anything else — the detached
+	// daemon child, or output/input that isn't a terminal — keeps the plain
+	// one-line banner and ordinary scrolling log output.
 	interactive := !background && term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
-	printSyncBanner(folder, interactive)
+	if !interactive {
+		printSyncBanner(folder)
+	}
 
 	var detachRequested atomic.Bool
-	var rawState *term.State
+	var prog *tea.Program
 	var cleanupOnce sync.Once
 	cleanupInteractive := func() {
 		cleanupOnce.Do(func() {
-			if rawState != nil {
-				_ = term.Restore(os.Stdin.Fd(), rawState)
+			if prog != nil {
+				// Safe even if the program already quit on its own (e.g. the
+				// user pressed Ctrl+C/D inside it) — Quit is a no-op once the
+				// program has exited, and Wait then returns immediately.
+				prog.Quit()
+				prog.Wait()
 			}
 			if interactive {
 				log.SetOutput(os.Stderr)
@@ -2231,24 +2237,18 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 	}
 
 	if interactive {
-		if state, rawErr := term.MakeRaw(os.Stdin.Fd()); rawErr == nil {
-			rawState = state
-			// The commands/storage/separator block lives in the live window's
-			// header rather than being printed once, so the storage line can
-			// be repainted in place each time the quota is refreshed.
-			win := newLiveWindow(liveWindowSize)
-			win.setHeader(syncHeaderLines(nil))
-			eng.onQuota = func(q *storageQuota) { win.setHeader(syncHeaderLines(q)) }
-			log.SetOutput(win)
-			go readSyncKeys(os.Stdin, cancel, &detachRequested, togglePause)
-		} else {
-			// No raw mode, so no live window to own the header — print it once
-			// as ordinary output instead. The storage line can't be updated in
-			// place here, so it's left out entirely rather than shown stale.
-			for _, line := range syncHeaderLines(nil) {
-				fmt.Println(line)
+		model := newSyncTUIModel(Version, folder, cancel, &detachRequested, togglePause)
+		prog = tea.NewProgram(model, tea.WithAltScreen())
+		eng.onQuota = func(q *storageQuota) { prog.Send(quotaMsg{q}) }
+		log.SetOutput(&tuiLogWriter{prog: prog})
+		go func() {
+			if _, runErr := prog.Run(); runErr != nil {
+				// The TUI couldn't start (e.g. no usable terminal despite the
+				// isatty checks above) or crashed — nothing more to render,
+				// so unwind the loop the same way Ctrl+C would.
+				cancel()
 			}
-		}
+		}()
 	}
 
 	// Storage quota for the banner's "Storage: ..." line and the control API's
@@ -2271,9 +2271,9 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agentAddr, remoteControl)
 		defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)
 		if remoteControl {
-			// Logged rather than printed: in interactive mode the live window
-			// owns everything below the banner, and writing to stdout behind
-			// its back would be overwritten by its next redraw.
+			// Logged rather than printed: in interactive mode the sync TUI
+			// owns the whole screen, and writing to stdout behind its back
+			// would be clobbered by its next repaint.
 			log.Printf("Remote control enabled (roots: %s)", strings.Join(agentRoots, ", "))
 		}
 	}
@@ -2463,11 +2463,11 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 
 	<-ctx.Done()
 	eng.saveState()
-	// Restore the terminal and log output before printing the summary (or,
-	// on detach, before runStorageSync's "Detaching..." message), rather than
-	// leaving it to the deferred call below: raw mode disables output
-	// post-processing, so anything printed with a plain "\n" while it's still
-	// active renders as a staircase instead of ordinary lines.
+	// Tear down the TUI and restore log output before printing the summary
+	// (or, on detach, before runStorageSync's "Detaching..." message), rather
+	// than leaving it to the deferred call below: the alt screen (and raw
+	// input mode) needs to be fully exited first, or the summary/detach
+	// message would be drawn into a buffer nobody's showing.
 	cleanupInteractive()
 	if !detachRequested.Load() {
 		eng.printSummary()
