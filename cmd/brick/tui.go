@@ -332,11 +332,12 @@ func (m *syncTUIModel) View() string {
 	return b.String()
 }
 
-// topRow renders "Brick vX.Y.Z" on the left and the synced folder on the
-// right, ellipsizing the folder from the left (keeping its more identifying
-// tail) if the two don't both fit.
+// topRow renders "Webbite Brick CLI vX.Y.Z" on the left and the synced folder
+// on the right, ellipsizing the folder from the left (keeping its more
+// identifying tail) if the two don't both fit.
 func (m *syncTUIModel) topRow() string {
-	left := fmt.Sprintf("Brick v%s", m.version)
+	title := "Webbite Brick CLI"
+	left := fmt.Sprintf("%s v%s", title, m.version)
 	budget := m.width - lipgloss.Width(left) - 1
 	if budget < 0 {
 		budget = 0
@@ -346,7 +347,9 @@ func (m *syncTUIModel) topRow() string {
 	if gap < 0 {
 		gap = 0
 	}
-	return lipgloss.NewStyle().Bold(true).Render(left) + strings.Repeat(" ", gap) + right
+	styledLeft := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226")).Render(title) +
+		lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf(" v%s", m.version))
+	return styledLeft + strings.Repeat(" ", gap) + right
 }
 
 // ellipsizeLeft clips s to width columns, prefixing an ellipsis and keeping
