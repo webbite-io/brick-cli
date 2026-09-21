@@ -140,6 +140,18 @@ func exchangeCodeForToken(tokenEndpoint, code, codeVerifier, redirectURI, client
 	return tokenResp.AccessToken, tokenResp.RefreshToken, tokenResp.IDToken, nil
 }
 
+// deviceName returns a human-readable name for this device, based on its
+// hostname, for display in account-hq's device list (see runLogin). Returns
+// "" if the hostname can't be determined, in which case the server falls
+// back to the request's User-Agent header instead.
+func deviceName() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return name
+}
+
 // switchAccountsReloginPrompt and selectiveSyncReloginPrompt are the
 // re-authentication prompts for flows that were already mid-command when the
 // session expired.
@@ -184,6 +196,15 @@ func runLogin(apiURL string, checklist *onboardingChecklist) error {
 	scopes := getEnv("OAUTH_SCOPES", DefaultOAuthScopes)
 	callbackURL := getEnv("OAUTH_CALLBACK_URL", DefaultOAuthCallbackURL)
 
+	// Loaded up front (rather than after the token exchange, as before) so
+	// its InstanceKey is available for the authorize request below. Reused
+	// as-is once login succeeds, so a fresh config's InstanceKey survives
+	// unchanged from generation to being sent on this very first login.
+	cfg, err := loadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+
 	// Parse callback URL to determine where to listen.
 	parsedCB, err := url.Parse(callbackURL)
 	if err != nil {
@@ -214,6 +235,10 @@ func runLogin(apiURL string, checklist *onboardingChecklist) error {
 	authParams.Set("state", state)
 	authParams.Set("code_challenge", challenge)
 	authParams.Set("code_challenge_method", "S256")
+	authParams.Set("instance_key", cfg.InstanceKey)
+	if name := deviceName(); name != "" {
+		authParams.Set("device_name", name)
+	}
 	authURL := oidc.AuthorizationEndpoint + "?" + authParams.Encode()
 
 	// Start local callback server before opening the browser.
@@ -276,10 +301,6 @@ func runLogin(apiURL string, checklist *onboardingChecklist) error {
 	}
 
 	// Persist tokens in config.
-	cfg, err := loadOrCreateConfig()
-	if err != nil {
-		return err
-	}
 	cfg.AccessToken = accessToken
 	cfg.RefreshToken = refreshToken
 	cfg.IDToken = idToken

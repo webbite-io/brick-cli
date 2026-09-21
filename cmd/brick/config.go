@@ -39,6 +39,14 @@ type Config struct {
 	RefreshToken string `yaml:"refreshToken,omitempty"`
 	IDToken      string `yaml:"idToken,omitempty"`
 
+	// InstanceKey is an opaque per-install identifier sent on every OIDC
+	// login (see runLogin) so account-api can recognize this specific
+	// install across logins and let the user revoke it individually,
+	// rather than only being able to revoke the app's access as a whole.
+	// It must stay stable for the life of this install — only regenerate
+	// it on a genuine fresh install (i.e. never, once set).
+	InstanceKey string `yaml:"instanceKey,omitempty"`
+
 	// ActiveAccountID is the account currently in effect; it always keys into
 	// Accounts. Switched via 'brick switch-accounts'.
 	ActiveAccountID string `yaml:"activeAccountId,omitempty"`
@@ -182,6 +190,7 @@ func loadOrCreateConfigQuiet() (cfg *Config, created bool, err error) {
 			return nil, false, fmt.Errorf("could not create config directory: %w", mkErr)
 		}
 		c.ClientID = uuid.New().String()
+		c.InstanceKey = uuid.New().String()
 		if saveErr := saveConfig(&c); saveErr != nil {
 			return nil, false, saveErr
 		}
@@ -192,9 +201,18 @@ func loadOrCreateConfigQuiet() (cfg *Config, created bool, err error) {
 		return nil, false, fmt.Errorf("could not parse config file: %w", err)
 	}
 
-	// Populate missing clientId and persist.
+	// Populate missing clientId/instanceKey (e.g. a config file written by an
+	// older brick version) and persist.
+	dirty := false
 	if c.ClientID == "" {
 		c.ClientID = uuid.New().String()
+		dirty = true
+	}
+	if c.InstanceKey == "" {
+		c.InstanceKey = uuid.New().String()
+		dirty = true
+	}
+	if dirty {
 		if saveErr := saveConfig(&c); saveErr != nil {
 			return nil, false, saveErr
 		}
