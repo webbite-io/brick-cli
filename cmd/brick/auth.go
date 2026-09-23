@@ -140,16 +140,47 @@ func exchangeCodeForToken(tokenEndpoint, code, codeVerifier, redirectURI, client
 	return tokenResp.AccessToken, tokenResp.RefreshToken, tokenResp.IDToken, nil
 }
 
-// deviceName returns a human-readable name for this device, based on its
-// hostname, for display in account-hq's device list (see runLogin). Returns
-// "" if the hostname can't be determined, in which case the server falls
-// back to the request's User-Agent header instead.
+// deviceName returns a human-readable name for this device, for display in
+// account-hq's device list (see runLogin): "Brick CLI on {host}", plus a
+// parenthesized OS description when one can be determined (e.g. "Brick CLI
+// on myhost (Debian GNU/Linux 13)"). Returns "" if the hostname can't be
+// determined, in which case the server falls back to the request's
+// User-Agent header instead.
 func deviceName() string {
 	name, err := os.Hostname()
 	if err != nil {
 		return ""
 	}
-	return name
+	if osName := deviceOSName(); osName != "" {
+		return fmt.Sprintf("Brick CLI on %s (%s)", name, osName)
+	}
+	return fmt.Sprintf("Brick CLI on %s", name)
+}
+
+// deviceOSName returns a human-readable OS description for this device, or
+// "" if one can't be determined (in which case deviceName falls back to the
+// bare hostname, matching pre-existing behavior for OSes we don't handle
+// below or where the relevant command isn't installed).
+func deviceOSName() string {
+	switch runtime.GOOS {
+	case "linux":
+		// lsb_release isn't installed on every distro (notably minimal/
+		// container images), in which case we just omit the OS name.
+		out, err := exec.Command("lsb_release", "-ds").Output()
+		if err != nil {
+			return ""
+		}
+		return strings.Trim(strings.TrimSpace(string(out)), `"`)
+	case "darwin":
+		productName, nameErr := exec.Command("sw_vers", "-productName").Output()
+		productVersion, versionErr := exec.Command("sw_vers", "-productVersion").Output()
+		if nameErr != nil || versionErr != nil {
+			return "macOS"
+		}
+		return strings.TrimSpace(string(productName)) + " " + strings.TrimSpace(string(productVersion))
+	default:
+		return ""
+	}
 }
 
 // switchAccountsReloginPrompt and selectiveSyncReloginPrompt are the
