@@ -21,6 +21,7 @@ var (
 	DefaultOAuthClientID    = ""
 	DefaultOAuthScopes      = "openid email profile accounts offline_access brick:manage"
 	DefaultOAuthCallbackURL = "http://localhost:7332/auth/callback"
+	DefaultConfigFolder     = ""
 )
 
 // Environment variables daemon mode (-d) uses to hand the outcome of the
@@ -109,22 +110,29 @@ func (c *Config) ensureActiveAccount() *AccountConfig {
 }
 
 // configDir returns the directory brick stores its config and state files in:
-// %AppData%\brick on Windows, and ~/.config/brick on Linux/Darwin (matching
-// the convention most CLI tools use on macOS rather than ~/Library/Application
-// Support).
+// %AppData%\<folder> on Windows, and ~/.config/<folder> on Linux/Darwin
+// (matching the convention most CLI tools use on macOS rather than
+// ~/Library/Application Support). <folder> is CONFIG_FOLDER (runtime env var,
+// then the compile-time default baked in via CONFIG_FOLDER in .env.dev/
+// .env.prod — see Makefile), falling back to "brick" if neither is set, so a
+// dev build (CONFIG_FOLDER=brick-dev) never shares state with a prod build.
 func configDir() (string, error) {
+	folder := getEnv("CONFIG_FOLDER", DefaultConfigFolder)
+	if folder == "" {
+		folder = "brick"
+	}
 	if runtime.GOOS == "windows" {
 		dir, err := os.UserConfigDir()
 		if err != nil {
 			return "", fmt.Errorf("could not determine config directory: %w", err)
 		}
-		return filepath.Join(dir, "brick"), nil
+		return filepath.Join(dir, folder), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("could not determine home directory: %w", err)
 	}
-	return filepath.Join(home, ".config", "brick"), nil
+	return filepath.Join(home, ".config", folder), nil
 }
 
 // configPath returns the absolute path to brick's config.yaml.
@@ -153,7 +161,7 @@ func saveConfig(cfg *Config) error {
 	return os.Chmod(path, 0o600)
 }
 
-// loadOrCreateConfig reads ~/.config/brick/config.yaml, creating it with a
+// loadOrCreateConfig reads config.yaml from configDir(), creating it with a
 // fresh UUIDv4 clientId if it does not already exist.
 func loadOrCreateConfig() (*Config, error) {
 	cfg, created, err := loadOrCreateConfigQuiet()
@@ -163,7 +171,9 @@ func loadOrCreateConfig() (*Config, error) {
 	if created {
 		fmt.Println("\n👋 Hello and welcome to Brick - storage for all your devices!")
 		fmt.Println()
-		fmt.Println("Created default configuration file in ~/.config/brick/config.yaml")
+		if path, err := configPath(); err == nil {
+			fmt.Printf("Created default configuration file in %s\n", path)
+		}
 	}
 	return cfg, nil
 }

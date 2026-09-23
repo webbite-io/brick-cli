@@ -47,7 +47,8 @@ LDFLAGS := -s -w \
 	-X 'main.DefaultStorageAPIURL=$(STORAGE_API_URL)' \
 	-X 'main.DefaultOAuthClientID=$(OAUTH_CLIENT_ID)' \
 	-X 'main.DefaultOAuthScopes=$(OAUTH_SCOPES)' \
-	-X 'main.DefaultOAuthCallbackURL=$(OAUTH_CALLBACK_URL)'
+	-X 'main.DefaultOAuthCallbackURL=$(OAUTH_CALLBACK_URL)' \
+	-X 'main.DefaultConfigFolder=$(CONFIG_FOLDER)'
 
 BUILD_FLAGS := -ldflags="$(LDFLAGS)" -trimpath
 
