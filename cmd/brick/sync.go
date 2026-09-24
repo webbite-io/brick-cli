@@ -2194,6 +2194,24 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 		printSyncBanner(folder)
 	}
 
+	// Mirror everything logged during this sync into brick.log (see
+	// synclog.go) alongside whatever's shown in the terminal, so a user or
+	// support engineer can inspect recent sync activity after the fact.
+	// Non-fatal if it can't be opened (e.g. a read-only home) — sync
+	// proceeds with terminal-only logging.
+	var syncLog *syncLogWriter
+	if sl, slErr := newSyncLogWriter(); slErr != nil {
+		log.Printf("could not open %s: %v", syncLogFileName, slErr)
+	} else {
+		syncLog = sl
+		defer syncLog.Close()
+	}
+	baseLogOutput := io.Writer(os.Stderr)
+	if syncLog != nil {
+		baseLogOutput = io.MultiWriter(os.Stderr, syncLog)
+	}
+	log.SetOutput(baseLogOutput)
+
 	var detachRequested atomic.Bool
 	var prog *tea.Program
 	var cleanupOnce sync.Once
@@ -2207,7 +2225,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 				prog.Wait()
 			}
 			if interactive {
-				log.SetOutput(os.Stderr)
+				log.SetOutput(baseLogOutput)
 			}
 		})
 	}
@@ -2225,7 +2243,11 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 		model := newSyncTUIModel(Version, folder, cancel, &detachRequested, togglePause)
 		prog = tea.NewProgram(model, tea.WithAltScreen())
 		eng.onQuota = func(q *storageQuota) { prog.Send(quotaMsg{q}) }
-		log.SetOutput(&tuiLogWriter{prog: prog})
+		tuiOutput := io.Writer(&tuiLogWriter{prog: prog})
+		if syncLog != nil {
+			tuiOutput = io.MultiWriter(tuiOutput, syncLog)
+		}
+		log.SetOutput(tuiOutput)
 		go func() {
 			if _, runErr := prog.Run(); runErr != nil {
 				// The TUI couldn't start (e.g. no usable terminal despite the
