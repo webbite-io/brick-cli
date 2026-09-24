@@ -8,13 +8,11 @@ This is the repo of the Webbite Brick CLI, a command-line client for
 The CLI app `brick` keeps a local folder in two-way sync with Brick — it uploads
 local-only files, downloads remote-only files, and propagates deletions in
 either direction — deleting a file or folder locally moves it to trash on Brick,
-and a file or folder trashed on the server is removed locally. When both sides
-edit the same file, the online version wins.
+and a file or folder trashed on Brick is removed locally. When both sides edit
+the same file, the online version wins.
 
 After the initial pass it watches the folder for filesystem changes and polls
 Brick periodically, so both sides stay in sync until interrupted.
-
-Read more at <https://docs.webbite.io/>.
 
 [rb]: https://webbite.io
 
