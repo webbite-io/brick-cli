@@ -53,11 +53,13 @@ LDFLAGS := -s -w \
 BUILD_FLAGS := -ldflags="$(LDFLAGS)" -trimpath
 
 # Target platforms
+# windows/amd64 is disabled for now — it hasn't been properly tested, so
+# `make release` shouldn't ship a Windows binary yet. Uncomment once it has.
 PLATFORMS := \
 	darwin/amd64 \
 	darwin/arm64 \
-	linux/amd64 \
-	windows/amd64
+	linux/amd64
+	# windows/amd64
 
 # Output directories
 BUILD_DIR := build
