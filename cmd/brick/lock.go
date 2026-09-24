@@ -27,3 +27,30 @@ func instanceLockPath() (string, error) {
 	}
 	return filepath.Join(cfgDir, "brick.lock"), nil
 }
+
+// requireNoRunningInstance fails when another brick instance — this CLI or
+// the desktop app — currently holds the per-user lock.
+//
+// Commands that reconfigure the active account or delete files out from
+// under a running sync call this first. brick has no control API any more,
+// so it can't pause or stop that instance remotely; refusing is what keeps a
+// reconcile pass from racing the change (e.g. seeing a newly-excluded folder
+// disappear and pushing that as a real local delete). The lock is released
+// again immediately — it only answers "is anything running right now?", and
+// the caller goes on to take it for itself if it needs to.
+func requireNoRunningInstance(cmd string) error {
+	path, err := instanceLockPath()
+	if err != nil {
+		return err
+	}
+	lock, err := acquireInstanceLock(path)
+	if err != nil {
+		if errors.Is(err, errInstanceLocked) {
+			return fmt.Errorf("another brick instance is running for this user.\n"+
+				"Stop it (Ctrl+C in its terminal, or quit the Brick app) and run '%s' again", cmd)
+		}
+		return err
+	}
+	lock.Release()
+	return nil
+}

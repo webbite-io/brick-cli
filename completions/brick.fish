@@ -15,12 +15,6 @@ complete -c brick -n '__fish_use_subcommand' -s v -l version \
 complete -c brick -n '__fish_use_subcommand' -l no-upgrade-check \
     -d 'Disable automatic upgrade check'
 
-complete -c brick -n '__fish_use_subcommand' -l no-control-api \
-    -d 'Disable the local status/control API'
-
-complete -c brick -n '__fish_use_subcommand' -l self-test \
-    -d 'Print a readiness check as JSON, without syncing'
-
 complete -c brick -n '__fish_use_subcommand' -l setup-and-exit \
     -d 'Run interactive setup, then exit without syncing'
 

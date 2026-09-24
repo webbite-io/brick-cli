@@ -603,21 +603,19 @@ type syncEngine struct {
 	// paused gates reconcileAll calls from the debounce worker and poll
 	// ticker (sync.go's runStorageSync goroutines) without tearing down the
 	// fsnotify watcher, so resuming is instant rather than needing a full
-	// rescan. Controlled via the local control API's /v1/pause and /v1/resume.
+	// rescan. Toggled from the interactive TUI's pause shortcut.
 	paused atomic.Bool
 
-	// ctrlMu guards the live-status fields below, which are read by the
-	// control API's /v1/status handler from a separate goroutine. It is
-	// deliberately distinct from mu (which serializes reconcile passes) so a
-	// status read never blocks on an in-progress reconcile.
+	// ctrlMu guards the live-status fields below, which are read from
+	// goroutines other than the one reconciling. It is deliberately distinct
+	// from mu (which serializes reconcile passes) so a status read never
+	// blocks on an in-progress reconcile.
 	ctrlMu        sync.RWMutex
 	ctrlState     string // "starting" | "syncing" | "idle" | "error"
 	ctrlLastError string
 	ctrlLastSync  time.Time
 	ctrlInFlight  *controlInFlight
 	ctrlActivity  []controlActivityEvent
-	ctrlQuota     *storageQuota
-	ctrlQuotaAt   time.Time
 
 	// onQuota, when set, is called with each freshly fetched quota so the
 	// interactive banner can repaint its storage line. Runs on whichever
@@ -638,7 +636,7 @@ type controlInFlight struct {
 }
 
 // controlActivityEvent is one entry in the bounded recent-activity feed the
-// control API serves at /v1/activity.
+// engine keeps for the interactive banner.
 type controlActivityEvent struct {
 	Kind    string    `json:"kind"` // "upload" | "download" | "update" | "trash" | "remove" | "keep-both"
 	RelPath string    `json:"relPath"`
@@ -648,8 +646,8 @@ type controlActivityEvent struct {
 // controlActivityCap bounds the in-memory activity ring buffer.
 const controlActivityCap = 200
 
-// setState updates the coarse sync state reported by /v1/status. It does not
-// touch paused: the control API overlays "paused" on top of whatever state
+// setState updates the coarse sync state reported by statusSnapshot. It does
+// not touch paused: statusSnapshot overlays "paused" on top of whatever state
 // is recorded here for as long as e.paused is set.
 func (e *syncEngine) setState(s string) {
 	e.ctrlMu.Lock()
@@ -675,7 +673,7 @@ func (e *syncEngine) setSyncError(err error) {
 }
 
 // setInFlight/clearInFlight track the single file transfer in progress, if
-// any, for /v1/status's inFlight field.
+// any, for statusSnapshot's InFlight field.
 func (e *syncEngine) setInFlight(relPath, direction string) {
 	e.ctrlMu.Lock()
 	e.ctrlInFlight = &controlInFlight{RelPath: relPath, Direction: direction}
@@ -717,7 +715,7 @@ func (e *syncEngine) recentActivity(limit int) []controlActivityEvent {
 
 // setPaused toggles whether the debounce worker in runStorageSync is allowed
 // to call reconcileAll. Logs the transition, but only when it actually
-// changes state, so a redundant pause/resume call (e.g. two control-API
+// changes state, so a redundant pause/resume call (e.g. two
 // clients pausing at once) doesn't print twice.
 func (e *syncEngine) setPaused(p bool) {
 	if !e.paused.CompareAndSwap(!p, p) {
@@ -755,7 +753,7 @@ func (e *syncEngine) checkInterrupted(ctx context.Context) error {
 	return nil
 }
 
-// controlStatus is the JSON shape served at /v1/status.
+// controlStatus is the engine's live-status snapshot.
 type controlStatus struct {
 	State               string           `json:"state"`
 	Folder              string           `json:"folder"`
@@ -765,14 +763,6 @@ type controlStatus struct {
 	InFlight            *controlInFlight `json:"inFlight"`
 }
 
-// controlQuota is the JSON shape served at /v1/quota: the Storage API's quota
-// payload verbatim (so a client reads the same fields it would get from the
-// source API) plus when this process last fetched it.
-type controlQuota struct {
-	storageQuota
-	FetchedAt time.Time `json:"fetchedAt"`
-}
-
 type controlCounters struct {
 	Uploaded   int64 `json:"uploaded"`
 	Downloaded int64 `json:"downloaded"`
@@ -780,7 +770,7 @@ type controlCounters struct {
 	Moved      int64 `json:"moved"`
 }
 
-// statusSnapshot builds the current /v1/status payload. paused overlays the
+// statusSnapshot builds the current status payload. paused overlays the
 // underlying reconcile-derived state, matching setState's contract above.
 func (e *syncEngine) statusSnapshot() controlStatus {
 	e.ctrlMu.RLock()
@@ -804,8 +794,8 @@ func (e *syncEngine) statusSnapshot() controlStatus {
 	}
 }
 
-// refreshQuota fetches the account's storage usage and caches it for the
-// interactive banner and the control API's /v1/quota.
+// refreshQuota fetches the account's storage usage for the interactive
+// banner, delivering it through onQuota.
 func (e *syncEngine) refreshQuota(ctx context.Context) (*storageQuota, error) {
 	if e.sc == nil {
 		return nil, errors.New("no storage client")
@@ -814,11 +804,9 @@ func (e *syncEngine) refreshQuota(ctx context.Context) (*storageQuota, error) {
 	if err != nil {
 		return nil, err
 	}
-	e.ctrlMu.Lock()
-	e.ctrlQuota = q
-	e.ctrlQuotaAt = time.Now()
+	e.ctrlMu.RLock()
 	onQuota := e.onQuota
-	e.ctrlMu.Unlock()
+	e.ctrlMu.RUnlock()
 	if onQuota != nil {
 		onQuota(q)
 	}
@@ -834,14 +822,6 @@ func (e *syncEngine) refreshQuotaAsync(ctx context.Context) {
 			e.quotaErrOnce.Do(func() { log.Printf("could not read storage quota: %v", err) })
 		}
 	}()
-}
-
-// quotaSnapshot returns the cached quota and when it was fetched. The quota is
-// nil until the first successful fetch.
-func (e *syncEngine) quotaSnapshot() (*storageQuota, time.Time) {
-	e.ctrlMu.RLock()
-	defer e.ctrlMu.RUnlock()
-	return e.ctrlQuota, e.ctrlQuotaAt
 }
 
 func (e *syncEngine) markRecentlyWritten(abs string) {
@@ -1963,7 +1943,7 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 // selective-sync, the detached-daemon-child re-exec check, daemon start, and
 // finally the default foreground sync. None of that internal logic changed —
 // only its container moved out of main().
-func runSyncCmd(args []string, noUpgradeCheck, noControlAPI bool) {
+func runSyncCmd(args []string, noUpgradeCheck bool) {
 	syncFlags := flag.NewFlagSet("sync", flag.ExitOnError)
 	var (
 		daemon            bool
@@ -1999,7 +1979,7 @@ func runSyncCmd(args []string, noUpgradeCheck, noControlAPI bool) {
 	// in the foreground parent so they're applied here without prompting again.
 	if folder := os.Getenv(daemonFolderEnv); folder != "" {
 		isFirstSetup := os.Getenv(daemonFirstSetupEnv) == "1"
-		if err := runDaemonChild(apiURL, storageURL, remoteControl, noControlAPI, folder, os.Getenv(daemonConflictModeEnv), isFirstSetup); err != nil {
+		if err := runDaemonChild(apiURL, storageURL, remoteControl, folder, os.Getenv(daemonConflictModeEnv), isFirstSetup); err != nil {
 			if errors.Is(err, errLoginDeclined) {
 				return
 			}
@@ -2026,11 +2006,11 @@ func runSyncCmd(args []string, noUpgradeCheck, noControlAPI bool) {
 
 	if daemon {
 		if daemonJSON {
-			runAsDaemonJSON(apiURL, storageURL, remoteControl, noControlAPI)
+			runAsDaemonJSON(apiURL, storageURL, remoteControl)
 			return // unreachable: runAsDaemonJSON always exits the process itself
 		}
 		if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
-			return runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI)
+			return runAsDaemon(apiURL, storageURL, remoteControl)
 		}); err != nil {
 			if errors.Is(err, errLoginDeclined) {
 				return
@@ -2041,7 +2021,7 @@ func runSyncCmd(args []string, noUpgradeCheck, noControlAPI bool) {
 	}
 
 	if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
-		return runStorageSync(apiURL, storageURL, remoteControl, noControlAPI)
+		return runStorageSync(apiURL, storageURL, remoteControl)
 	}); err != nil {
 		if errors.Is(err, errLoginDeclined) {
 			return
@@ -2055,11 +2035,11 @@ func runSyncCmd(args []string, noUpgradeCheck, noControlAPI bool) {
 // interrupted. Creates, updates and deletes all push from whichever side made
 // the change to the other; simultaneous edits of the same file are the one
 // case where the API's copy wins.
-func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool) error {
+func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 	// Only one sync engine may run per user at a time — a second reconcileAll
 	// loop against the same folder would race the first. Acquired before
-	// anything else so a second invocation (e.g. a tray app trying to launch
-	// brick when it's already running) fails fast instead of corrupting
+	// anything else so a second invocation (e.g. the desktop app trying to
+	// launch brick when it's already running) fails fast instead of corrupting
 	// state. Released automatically by the OS if this process dies, so a
 	// crash never leaves a stale lock behind.
 	lockPath, err := instanceLockPath()
@@ -2083,14 +2063,14 @@ func runStorageSync(apiURL, storageURL string, remoteControl, noControlAPI bool)
 	// The lock is released as soon as the loop stops, rather than deferred to
 	// function exit, because the detach case below needs it free before
 	// startDaemonProcess (via runAsDaemon) tries to acquire its own copy.
-	detach, err := runSyncLoop(setup, remoteControl, noControlAPI, false)
+	detach, err := runSyncLoop(setup, remoteControl, false)
 	lock.Release()
 	if err != nil {
 		return err
 	}
 	if detach {
 		fmt.Println("Detaching sync into a background daemon...")
-		return runAsDaemon(apiURL, storageURL, remoteControl, noControlAPI)
+		return runAsDaemon(apiURL, storageURL, remoteControl)
 	}
 	return nil
 }
@@ -2161,7 +2141,7 @@ func newWatcherWithRetry() (*fsnotify.Watcher, error) {
 // false and stdin/stdout are a terminal); the caller is then responsible for
 // actually starting that daemon, since this function has no daemon-mode
 // knowledge of its own.
-func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool) (detach bool, err error) {
+func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool, err error) {
 	cfg, sc, folder := setup.cfg, setup.sc, setup.folder
 	// cfg.RemoteControl, set during onboarding (see promptForRemoteControl),
 	// makes remote control the default without needing -r on every run; -r
@@ -2256,8 +2236,8 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		}()
 	}
 
-	// Storage quota for the banner's "Storage: ..." line and the control API's
-	// /v1/quota, refreshed here at startup and again below whenever a remote
+	// Storage quota for the banner's "Storage: ..." line,
+	// refreshed here at startup and again below whenever a remote
 	// change lands.
 	eng.refreshQuotaAsync(ctx)
 
@@ -2326,18 +2306,6 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 		eng.addWatchesRecursive(watcher)
 	}
 
-	// Local status/control API: lets a local client (e.g. a tray app) read
-	// live sync status and issue pause/resume/quit without touching the
-	// terminal this process is attached to. Loopback-only (unix domain
-	// socket), token-gated; see controlapi.go for the full protocol.
-	if !noControlAPI {
-		if cs, csErr := startControlServer(eng, cancel, notify, background, remoteControl, agentRootsFlag); csErr != nil {
-			log.Printf("could not start control API: %v", csErr)
-		} else {
-			defer cs.Close()
-		}
-	}
-
 	// Debounced reconcile worker.
 	go func() {
 		var timer *time.Timer
@@ -2372,7 +2340,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 					}
 				} else {
 					// Local changes (uploads/deletes) just landed remotely, so
-					// the usage figures the banner and /v1/quota report are
+					// the usage figures the banner reports are
 					// now stale.
 					eng.refreshQuotaAsync(ctx)
 				}
@@ -2428,7 +2396,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, noControlAPI, background bool)
 				if reconciled {
 					eng.addWatchesRecursive(watcher)
 					// Remote changes just landed locally, so the usage figures
-					// the banner and /v1/quota report are now stale.
+					// the banner reports are now stale.
 					eng.refreshQuotaAsync(ctx)
 				}
 			}
@@ -2584,10 +2552,18 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config, check
 // runSelectiveSync lets the user update which top-level folders are excluded
 // from sync, pre-ticking whichever ones are already excluded. Folders newly
 // excluded by this run are deleted from local disk immediately (they're no
-// longer supposed to live on this device); the updated exclude list is
-// persisted to the active account's config, and any currently running brick
-// instance is stopped, restarting it in the background if it was a daemon.
+// longer supposed to live on this device) and the updated exclude list is
+// persisted to the active account's config.
+//
+// It refuses while another instance is running. That instance still has the
+// old exclude list in memory, so a reconcile pass racing the deletions below
+// would read them as real local deletes and soft-delete the folders on the
+// Storage API — data loss, not just a stale view.
 func runSelectiveSync(apiURL, storageURL string) error {
+	if err := requireNoRunningInstance("brick sync -s"); err != nil {
+		return err
+	}
+
 	cfg, err := ensureAuthenticated(apiURL, nil)
 	if err != nil {
 		return err
@@ -2642,18 +2618,8 @@ func runSelectiveSync(apiURL, storageURL string) error {
 		}
 	}
 
-	if len(newlyExcluded) > 0 {
-		// Pause any already-running daemon before touching local files: it
-		// still has the old (pre-exclusion) config in memory, so a reconcile
-		// pass racing against the removal below could mistake the deletion
-		// for a real local delete and push it to the storage API as a
-		// soft-delete. /v1/pause blocks until any in-flight pass finishes and
-		// prevents a new one starting until the daemon is stopped/restarted
-		// below with the updated config.
-		if _, err := pauseRunningInstance(); err != nil {
-			fmt.Printf("\033[33mWarning: could not pause the running brick instance: %v\033[0m\n", err)
-		}
-	}
+	// Safe to delete without pausing anything: requireNoRunningInstance above
+	// established that no engine is reconciling this folder.
 	for _, name := range newlyExcluded {
 		abs := filepath.Join(folder, filepath.FromSlash(name))
 		if err := os.RemoveAll(abs); err != nil {
@@ -2668,8 +2634,8 @@ func runSelectiveSync(apiURL, storageURL string) error {
 		return err
 	}
 	fmt.Println("Saved selective sync settings.")
-
-	return restartDaemonIfRunning(apiURL, storageURL)
+	fmt.Println("\nRun 'brick sync' to start syncing with the new selection.")
+	return nil
 }
 
 // runListSelectiveSync prints the folders currently excluded from sync for

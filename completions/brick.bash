@@ -11,8 +11,6 @@ _brick() {
         -h --help
         -v --version
         --no-upgrade-check
-        --no-control-api
-        --self-test
         --setup-and-exit
     )
     local commands=(login switch-accounts whoami restart uninstall sync upload download)

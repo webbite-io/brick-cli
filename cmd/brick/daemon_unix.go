@@ -34,8 +34,8 @@ func daemonLogPath() (string, error) {
 // meaning brick is logged in and the Storage API is reachable — does it
 // re-exec itself as a detached background process to perform the actual
 // sync, then return control to the caller's shell.
-func runAsDaemon(apiURL, storageURL string, remoteControl, noControlAPI bool) error {
-	pid, logPath, _, err := startDaemonProcess(apiURL, storageURL, remoteControl, noControlAPI, filterDaemonArgs(os.Args[1:]))
+func runAsDaemon(apiURL, storageURL string, remoteControl bool) error {
+	pid, logPath, _, err := startDaemonProcess(apiURL, storageURL, remoteControl, filterDaemonArgs(os.Args[1:]))
 	if err != nil {
 		if errors.Is(err, errInstanceLocked) {
 			return errors.New("brick is already running for this user")
@@ -55,7 +55,7 @@ func runAsDaemon(apiURL, storageURL string, remoteControl, noControlAPI bool) er
 // reports "setup_required" instead of falling back to onboarding. Exactly one
 // line of JSON is printed to stdout and the process exits from within this
 // function (via emitDaemonJSON) — it never returns.
-func runAsDaemonJSON(apiURL, storageURL string, remoteControl, noControlAPI bool) {
+func runAsDaemonJSON(apiURL, storageURL string, remoteControl bool) {
 	cfg, _, err := loadOrCreateConfigQuiet()
 	if err != nil {
 		emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "internal_error", Message: err.Error()})
@@ -75,7 +75,7 @@ func runAsDaemonJSON(apiURL, storageURL string, remoteControl, noControlAPI bool
 		return
 	}
 
-	pid, logPath, folder, err := startDaemonProcess(apiURL, storageURL, remoteControl, noControlAPI, filterDaemonArgs(os.Args[1:]))
+	pid, logPath, folder, err := startDaemonProcess(apiURL, storageURL, remoteControl, filterDaemonArgs(os.Args[1:]))
 	if err != nil {
 		if errors.Is(err, errInstanceLocked) {
 			emitDaemonJSON(daemonJSONOutput{Status: "error", Code: "already_running", Message: "brick is already running for this user"})
@@ -97,11 +97,10 @@ func runAsDaemonJSON(apiURL, storageURL string, remoteControl, noControlAPI bool
 // ExtraFiles (inherited as fd 3) rather than released and re-acquired, so no
 // other brick invocation can slip in and grab it during the handoff.
 //
-// cliArgs is the argument list the detached child re-execs itself with (see
-// filterDaemonArgs); callers starting a daemon from the current process's own
-// invocation pass filterDaemonArgs(os.Args[1:]), while relaunchDaemon builds
-// an explicit list from previously persisted flags instead.
-func startDaemonProcess(apiURL, storageURL string, remoteControl, noControlAPI bool, cliArgs []string) (pid int, logPath, folder string, err error) {
+// cliArgs is the argument list the detached child re-execs itself with:
+// callers pass filterDaemonArgs(os.Args[1:]), derived from the current
+// process's own invocation.
+func startDaemonProcess(apiURL, storageURL string, remoteControl bool, cliArgs []string) (pid int, logPath, folder string, err error) {
 	lockPath, err := instanceLockPath()
 	if err != nil {
 		return 0, "", "", err
@@ -166,7 +165,7 @@ func startDaemonProcess(apiURL, storageURL string, remoteControl, noControlAPI b
 // the outcome of starting the child).
 //
 // args is os.Args[1:] as the CLI was actually invoked, e.g.
-// ["--no-control-api", "sync", "-d", "-r"]. Root flags (anything before the
+// ["--no-upgrade-check", "sync", "-d", "-r"]. Root flags (anything before the
 // "sync" subcommand) and sync's own flags (from "sync" onward) must stay on
 // their respective sides of that boundary in the reassembled result — the
 // root flag.Parse() in the re-exec'd child only sees flags that precede the
@@ -229,7 +228,7 @@ func firstSetupEnvValue(v bool) string {
 // folder/conflictMode/isFirstSetup decisions made in the parent so the very
 // first reconcile pass resolves any pre-existing conflict exactly as the
 // user chose, rather than silently defaulting to "remote wins".
-func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool, folder, conflictMode string, isFirstSetup bool) error {
+func runDaemonChild(apiURL, storageURL string, remoteControl bool, folder, conflictMode string, isFirstSetup bool) error {
 	lockPath, err := instanceLockPath()
 	if err != nil {
 		return err
@@ -261,33 +260,6 @@ func runDaemonChild(apiURL, storageURL string, remoteControl, noControlAPI bool,
 	}
 	// background is true here, so runSyncLoop never enables interactive mode
 	// and detach (its bool return) is always false.
-	_, err = runSyncLoop(setup, remoteControl, noControlAPI, true)
+	_, err = runSyncLoop(setup, remoteControl, true)
 	return err
-}
-
-// relaunchDaemon starts a fresh detached daemon reusing the remoteControl and
-// agentRoots flags a previous instance was running with, used by
-// restartDaemonIfRunning after 'brick switch-accounts' stops a background
-// daemon so syncing resumes automatically under the new account.
-func relaunchDaemon(apiURL, storageURL string, remoteControl bool, agentRoots []string) error {
-	// --no-upgrade-check is a root flag and must precede the "sync"
-	// subcommand; -r/--agent-root are sync's own flags and must follow it.
-	args := []string{"--no-upgrade-check", "sync"}
-	if remoteControl {
-		args = append(args, "-r")
-	}
-	for _, root := range agentRoots {
-		args = append(args, "--agent-root", root)
-	}
-
-	pid, logPath, _, err := startDaemonProcess(apiURL, storageURL, remoteControl, false, args)
-	if err != nil {
-		if errors.Is(err, errInstanceLocked) {
-			return errors.New("brick is already running for this user")
-		}
-		return err
-	}
-	fmt.Printf("brick is syncing in the background again (pid %d).\n", pid)
-	fmt.Printf("Logs: %s\n", logPath)
-	return nil
 }

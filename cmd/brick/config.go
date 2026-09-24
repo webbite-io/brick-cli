@@ -271,8 +271,6 @@ func printHelp() {
 	fmt.Printf("  -h, --help                    Show help information\n")
 	fmt.Printf("  -v, --version                 Show version information\n")
 	fmt.Printf("      --no-upgrade-check        Disable automatic upgrade check\n")
-	fmt.Printf("      --no-control-api          Disable the local status/control API (used by tray apps)\n")
-	fmt.Printf("      --self-test               Print a readiness check as JSON, without syncing\n")
 	fmt.Printf("      --setup-and-exit          Run interactive setup, then exit without syncing\n")
 	fmt.Printf("\n%sAccount Mgmt:%s\n\n", ansiPurple, ansiReset)
 	fmt.Printf("  login                         Log in via browser\n")

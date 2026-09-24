@@ -9,8 +9,6 @@ _brick() {
         '(-h --help)'{-h,--help}'[Show help information]'
         '(-v --version)'{-v,--version}'[Show version information]'
         '(--no-upgrade-check)'--no-upgrade-check'[Disable automatic upgrade check]'
-        '(--no-control-api)'--no-control-api'[Disable the local status/control API]'
-        '(--self-test)'--self-test'[Print a readiness check as JSON, without syncing]'
         '(--setup-and-exit)'--setup-and-exit'[Run interactive setup, then exit without syncing]'
     )
 

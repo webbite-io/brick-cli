@@ -120,7 +120,7 @@ func TestReconcileAllPauseMidPassStopsBetweenFiles(t *testing.T) {
 	}
 
 	// The pause must not be recorded as a sync failure: setPaused already
-	// logged it, and /v1/status's "paused" overlay is the correct signal, not
+	// logged it, and statusSnapshot's "paused" overlay is the correct signal, not
 	// a lingering lastError.
 	eng.setPaused(false)
 	st := eng.statusSnapshot()

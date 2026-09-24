@@ -53,20 +53,6 @@ Suppress the automatic check for a newer version of
 that normally runs before
 .BR sync .
 .TP
-.B \-\-no\-control\-api
-Disable the local status/control API that
-.B "brick sync"
-otherwise starts alongside the sync loop. Local clients such as a tray app
-use this API to query sync status and to send commands (pause, quit,
-detach) to a running instance; with this flag such clients cannot find or
-control the process.
-.TP
-.B \-\-self\-test
-Print a single line of JSON reporting whether
-.B "brick sync"
-is expected to succeed right now (login, active account, sync folder, and
-API reachability), without starting a sync. Meant for a companion app.
-.TP
 .B \-\-setup\-and\-exit
 Run every interactive step a normal
 .B "brick sync"

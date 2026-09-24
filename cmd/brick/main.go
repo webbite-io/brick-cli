@@ -32,8 +32,6 @@ func main() {
 		showVersion    bool
 		showHelp       bool
 		noUpgradeCheck bool
-		noControlAPI   bool
-		selfTest       bool
 		setupAndExit   bool
 	)
 
@@ -47,11 +45,6 @@ func main() {
 	flag.BoolVar(&showHelp, "h", false, "")
 	flag.BoolVar(&showHelp, "help", false, "")
 	flag.BoolVar(&noUpgradeCheck, "no-upgrade-check", false, "")
-	flag.BoolVar(&noControlAPI, "no-control-api", false, "")
-	// Undocumented until recently, now documented under "Other": a read-only
-	// diagnostic for a companion app to check whether brick is expected to be
-	// able to sync right now, without actually starting a sync. See README.
-	flag.BoolVar(&selfTest, "self-test", false, "")
 	// Undocumented until recently, now documented under "Other": runs every
 	// interactive setup step a normal sync start would (login, sync-folder
 	// selection, first-run onboarding, a Storage API reachability check),
@@ -76,17 +69,6 @@ func main() {
 	if showHelp {
 		printHelp()
 		os.Exit(0)
-	}
-
-	// Self-test: run every readiness check and print a single JSON line,
-	// without prompting, checking for updates, or starting a sync. Placed
-	// ahead of any subcommand dispatch below since that can block on stdin
-	// for an upgrade prompt, which a companion app calling this must never
-	// hit.
-	if selfTest {
-		apiURL := resolveAPIURL()
-		storageURL := resolveStorageAPIURL()
-		emitSelfTestOutput(runSelfTest(apiURL, storageURL))
 	}
 
 	// Setup-and-exit: run every interactive step a normal sync start would —
@@ -137,7 +119,7 @@ func main() {
 
 	case "restart":
 		requireNoExtraArgs("restart")
-		runRestartCmd(noUpgradeCheck, noControlAPI)
+		runRestartCmd(noUpgradeCheck)
 		os.Exit(0)
 
 	case "uninstall":
@@ -146,7 +128,7 @@ func main() {
 		os.Exit(0)
 
 	case "sync":
-		runSyncCmd(flag.Args()[1:], noUpgradeCheck, noControlAPI)
+		runSyncCmd(flag.Args()[1:], noUpgradeCheck)
 		os.Exit(0)
 
 	case "upload":
@@ -404,7 +386,7 @@ func runUninstall() {
 // separate `brick sync` call afterward. Mirrors the fallthrough behavior the
 // old --restart flag got for free by sharing main()'s body with the default
 // sync path.
-func runRestartCmd(noUpgradeCheck, noControlAPI bool) {
+func runRestartCmd(noUpgradeCheck bool) {
 	proceed, err := runRestart()
 	if err != nil {
 		log.Fatalf("Restart failed: %v", err)
@@ -420,7 +402,7 @@ func runRestartCmd(noUpgradeCheck, noControlAPI bool) {
 	storageURL := resolveStorageAPIURL()
 
 	if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
-		return runStorageSync(apiURL, storageURL, false, noControlAPI)
+		return runStorageSync(apiURL, storageURL, false)
 	}); err != nil {
 		if errors.Is(err, errLoginDeclined) {
 			return
@@ -430,11 +412,19 @@ func runRestartCmd(noUpgradeCheck, noControlAPI bool) {
 }
 
 // runRestart clears brick's local settings so it can be configured from
-// scratch: it stops any running instance, offers to wipe each known
-// account's sync folder, then removes ~/.config/brick entirely. The bool
-// return is false if the user backed out at the initial confirmation, in
-// which case the caller should stop rather than fall through into setup.
+// scratch: it offers to wipe each known account's sync folder, then removes
+// ~/.config/brick entirely. The bool return is false if the user backed out
+// at the initial confirmation, in which case the caller should stop rather
+// than fall through into setup.
+//
+// It refuses outright while another instance is running: wiping the config
+// and sync folder under a live engine would have it reconcile against
+// settings that no longer exist.
 func runRestart() (bool, error) {
+	if err := requireNoRunningInstance("brick restart"); err != nil {
+		return false, err
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Print("This will clear existing settings and configure Brick from scratch. Continue (Y/n): ")
@@ -446,10 +436,6 @@ func runRestart() (bool, error) {
 	if resp == "n" || resp == "no" {
 		fmt.Println("Restart cancelled.")
 		return false, nil
-	}
-
-	if _, err := stopRunningInstance("\nStopping the running brick instance..."); err != nil {
-		return false, err
 	}
 
 	cfg, err := loadOrCreateConfig()

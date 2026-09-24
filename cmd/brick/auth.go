@@ -655,10 +655,16 @@ func authedPost(apiURL, path, accessToken string, body []byte, cfg *Config) (*ht
 
 // runSwitchAccounts lists the user's accounts and lets them pick one to store
 // as active. If the picked account has never been synced before, it runs the
-// same sync-folder/scope onboarding as a brand-new setup. Finally, if a brick
-// daemon is currently running, it's stopped and (if it was a background
-// daemon) relaunched so it picks up the new account without a manual restart.
+// same sync-folder/scope onboarding as a brand-new setup.
+//
+// It refuses while another instance is running: that instance holds the old
+// account in memory and would keep syncing under it, so the account has to
+// be switched with nothing running and syncing started again afterwards.
 func runSwitchAccounts(apiURL, storageURL string) error {
+	if err := requireNoRunningInstance("brick switch-accounts"); err != nil {
+		return err
+	}
+
 	cfg, err := ensureAuthenticated(apiURL, nil)
 	if err != nil {
 		return err
@@ -722,7 +728,8 @@ func runSwitchAccounts(apiURL, storageURL string) error {
 			}
 		}
 
-		return restartDaemonIfRunning(apiURL, storageURL)
+		fmt.Println("\nRun 'brick sync' to start syncing this account.")
+		return nil
 	}
 }
 
