@@ -57,13 +57,59 @@ type quotaMsg struct{ q *storageQuota }
 // running sync TUI program, splitting on '\n' the same way liveWindow used
 // to. Installed via log.SetOutput so every existing log.Printf call site
 // across the binary keeps working unchanged.
+//
+// Write must never block the calling goroutine on delivering to the TUI:
+// log.Printf can be called synchronously from the TUI's own Update goroutine
+// (e.g. pressing 'p' runs togglePause -> setPaused -> log.Printf on that
+// same goroutine), and prog.Send blocks until the eventLoop goroutine
+// receives it — a direct, synchronous Send from Write in that situation
+// would have the goroutine send to itself and deadlock the whole program.
+// Write instead only enqueues onto a buffered channel, and a separate
+// goroutine (started by newTUILogWriter) drains it and calls prog.Send.
 type tuiLogWriter struct {
-	prog *tea.Program
+	prog  *tea.Program
+	lines chan string
+}
+
+// tuiLogQueueCap bounds how many not-yet-delivered log lines tuiLogWriter
+// buffers before dropping the oldest to make room for new ones. Sized well
+// above logRingCap so an ordinary burst of activity never drops anything the
+// user would notice; a drop only skips a line in the on-screen TUI — the
+// brick.log mirror written alongside it via io.MultiWriter is unaffected.
+const tuiLogQueueCap = 4096
+
+// newTUILogWriter creates a tuiLogWriter and starts its forwarding
+// goroutine.
+func newTUILogWriter(prog *tea.Program) *tuiLogWriter {
+	w := &tuiLogWriter{prog: prog, lines: make(chan string, tuiLogQueueCap)}
+	go w.forward()
+	return w
+}
+
+// forward drains queued lines and sends them to the program one at a time,
+// on a goroutine of its own so Write is never the one blocked on prog.Send.
+func (w *tuiLogWriter) forward() {
+	for line := range w.lines {
+		w.prog.Send(logLineMsg(line))
+	}
 }
 
 func (w *tuiLogWriter) Write(p []byte) (int, error) {
 	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
-		w.prog.Send(logLineMsg(line))
+		select {
+		case w.lines <- line:
+		default:
+			// Queue is full — drop the oldest buffered line to make room
+			// rather than blocking the caller.
+			select {
+			case <-w.lines:
+			default:
+			}
+			select {
+			case w.lines <- line:
+			default:
+			}
+		}
 	}
 	return len(p), nil
 }

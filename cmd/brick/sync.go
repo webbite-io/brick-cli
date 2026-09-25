@@ -2244,7 +2244,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 		model := newSyncTUIModel(Version, folder, cancel, &detachRequested, togglePause)
 		prog = tea.NewProgram(model, tea.WithAltScreen())
 		eng.onQuota = func(q *storageQuota) { prog.Send(quotaMsg{q}) }
-		tuiOutput := io.Writer(&tuiLogWriter{prog: prog})
+		tuiOutput := io.Writer(newTUILogWriter(prog))
 		if syncLog != nil {
 			tuiOutput = io.MultiWriter(tuiOutput, syncLog)
 		}

@@ -208,6 +208,56 @@ func TestSyncTUIModelWindowResizeRelayoutsViewport(t *testing.T) {
 	}
 }
 
+func TestCommandsLineShowsPauseOrResumeLabel(t *testing.T) {
+	m := newSyncTUIModel("1.2.3", "/sync/folder", func() {}, new(atomic.Bool), func() {})
+	m.width, m.height = 80, 24
+
+	// The command letter itself is ANSI-colored separately from the label
+	// (e.g. "...\x1b[...mP\x1b[0m: Pause sync"), so check for the ": <label>"
+	// tail rather than a "P: <label>" substring split by escape codes.
+	line := m.commandsLine()
+	if !strings.Contains(line, ": Pause sync") {
+		t.Errorf("commandsLine() while running = %q, want it to contain %q", line, ": Pause sync")
+	}
+	if strings.Contains(line, "Resume sync") {
+		t.Errorf("commandsLine() while running = %q, should not mention Resume yet", line)
+	}
+
+	m.paused = true
+	line = m.commandsLine()
+	if !strings.Contains(line, ": Resume sync") {
+		t.Errorf("commandsLine() while paused = %q, want it to contain %q", line, ": Resume sync")
+	}
+	if strings.Contains(line, "Pause sync") {
+		t.Errorf("commandsLine() while paused = %q, should not still say Pause sync", line)
+	}
+}
+
+func TestTopRowShowsPausedNoticeOnlyWhenPaused(t *testing.T) {
+	m := newSyncTUIModel("1.2.3", "/sync/folder", func() {}, new(atomic.Bool), func() {})
+	m.width, m.height = 80, 24
+
+	row := m.topRow()
+	if strings.Contains(row, "Syncing is paused") {
+		t.Errorf("topRow() while running = %q, should not show the paused notice", row)
+	}
+
+	m.paused = true
+	row = m.topRow()
+	if strings.Contains(row, "\n") {
+		t.Fatalf("topRow() must be a single line, got %q", row)
+	}
+	if !strings.Contains(row, "⚠️ Syncing is paused") {
+		t.Errorf("topRow() while paused = %q, want it to contain the warning notice", row)
+	}
+	if verIdx, noticeIdx := strings.Index(row, "v1.2.3"), strings.Index(row, "⚠️"); noticeIdx < verIdx {
+		t.Errorf("paused notice must appear after the version in topRow(), got %q", row)
+	}
+	if !strings.Contains(row, "v1.2.3 · ⚠️") {
+		t.Errorf("topRow() = %q, want a \" · \" separator directly between the version and the notice", row)
+	}
+}
+
 func TestSyncTUIModelTopRowEllipsizesFolder(t *testing.T) {
 	m := newSyncTUIModel("1.2.3", "/very/long/path/that/does/not/fit/on/screen", func() {}, new(atomic.Bool), func() {})
 	m.width, m.height = 40, 24
