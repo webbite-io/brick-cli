@@ -2210,6 +2210,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 	if syncLog != nil {
 		baseLogOutput = io.MultiWriter(os.Stderr, syncLog)
 	}
+	baseLogOutput = newTimestampWriter(baseLogOutput)
 	log.SetOutput(baseLogOutput)
 
 	var detachRequested atomic.Bool
@@ -2247,7 +2248,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 		if syncLog != nil {
 			tuiOutput = io.MultiWriter(tuiOutput, syncLog)
 		}
-		log.SetOutput(tuiOutput)
+		log.SetOutput(newTimestampWriter(tuiOutput))
 		go func() {
 			if _, runErr := prog.Run(); runErr != nil {
 				// The TUI couldn't start (e.g. no usable terminal despite the
