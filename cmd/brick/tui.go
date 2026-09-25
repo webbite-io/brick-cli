@@ -338,6 +338,9 @@ func (m *syncTUIModel) View() string {
 func (m *syncTUIModel) topRow() string {
 	title := "Webbite Brick CLI"
 	left := fmt.Sprintf("%s v%s", title, m.version)
+	if m.paused {
+		left += pausedNoticePlain
+	}
 	budget := m.width - lipgloss.Width(left) - 1
 	if budget < 0 {
 		budget = 0
@@ -349,8 +352,17 @@ func (m *syncTUIModel) topRow() string {
 	}
 	styledLeft := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226")).Render(title) +
 		lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf(" v%s", m.version))
+	if m.paused {
+		styledLeft += " · " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208")).Render("⚠️ Syncing is paused")
+	}
 	return styledLeft + strings.Repeat(" ", gap) + right
 }
+
+// pausedNoticePlain is the unstyled form of the paused notice appended to
+// topRow's left side, used only to measure its width (via lipgloss.Width)
+// when computing layout — must be kept in sync with the styled text built in
+// topRow.
+const pausedNoticePlain = " · ⚠️ Syncing is paused"
 
 // ellipsizeLeft clips s to width columns, prefixing an ellipsis and keeping
 // the tail when it's too wide — for a path, the end is more identifying
@@ -383,11 +395,12 @@ func (m *syncTUIModel) commandsLine() string {
 	if daemonSupported {
 		colored += " • " + ansiLightGreen + "D" + ansiReset + ": Detach as daemon"
 	}
-	colored += " • " + ansiLightGreen + "P" + ansiReset + ": Pause/resume"
-	colored += " • " + ansiLightGreen + "/" + ansiReset + ": Search"
+	pauseLabel := "Pause sync"
 	if m.paused {
-		colored += "  " + ansiOrange + "[paused]" + ansiReset
+		pauseLabel = "Resume sync"
 	}
+	colored += " • " + ansiLightGreen + "P" + ansiReset + ": " + pauseLabel
+	colored += " • " + ansiLightGreen + "/" + ansiReset + ": Search"
 	return fmt.Sprintf("%sCommands:%s %s", ansiPurple, ansiReset, colored)
 }
 
