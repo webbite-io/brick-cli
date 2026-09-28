@@ -1,5 +1,7 @@
 # Webbite Brick CLI
 
+<img width="1500" height="938" alt="Image" src="https://github.com/user-attachments/assets/de2c788c-922b-4b3d-946b-bbd8b0b572e4" />
+
 ## About
 
 This is the repo of the Webbite Brick CLI, a command-line client for
