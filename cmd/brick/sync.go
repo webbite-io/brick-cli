@@ -2342,10 +2342,11 @@ func runWithSpinnerVia(render func(text string, final bool), label string, fn fu
 }
 
 // runWithSpinner prints label with an animated spinner directly on stdout
-// while fn runs — used by `sync --dry-run`, a plain one-shot command with no
-// TUI to route through. On a non-TTY stdout (piped/redirected/logged) it
-// prints label as a single static line instead and skips the animation
-// entirely, so the \r-driven redraw never corrupts non-interactive output.
+// while fn runs — used by `sync --dry-run`, a plain one-shot command whose
+// output carries no timestamps of its own, and has no TUI to route through.
+// On a non-TTY stdout (piped/redirected/logged) it prints label as a single
+// static line instead and skips the animation entirely, so the \r-driven
+// redraw never corrupts non-interactive output.
 func runWithSpinner(label string, fn func() error) error {
 	if !term.IsTerminal(os.Stdout.Fd()) {
 		fmt.Println(label)
@@ -2359,14 +2360,36 @@ func runWithSpinner(label string, fn func() error) error {
 	}, label, fn)
 }
 
+// runWithSpinnerPlain is runWithSpinner with every line prefixed by the
+// current timestamp (captured once, not re-stamped per frame), matching the
+// format every other line around it already carries via newTimestampWriter
+// (see logtime.go) — used for the real sync's plain/non-interactive terminal
+// output, as opposed to dry-run's own untimed runWithSpinner.
+func runWithSpinnerPlain(label string, fn func() error) error {
+	ts := time.Now().Format(logTimestampLayout)
+	if !term.IsTerminal(os.Stdout.Fd()) {
+		fmt.Println(ts + " " + label)
+		return fn()
+	}
+	return runWithSpinnerVia(func(text string, final bool) {
+		fmt.Printf("\r\033[K%s %s", ts, text)
+		if final {
+			fmt.Println()
+		}
+	}, label, fn)
+}
+
 // runWithSpinnerTUI runs fn while animating label as a single line in the
 // interactive sync TUI's log pane, replaced in place each frame (see
 // spinnerLineMsg in tui.go) rather than pushed as a new scrollback line every
 // tick. Sent directly to prog rather than through the log package, so unlike
-// every other line in that pane, it is never mirrored into brick.log.
+// every other line in that pane, it is never mirrored into brick.log —
+// timestamped by hand instead (captured once, not re-stamped per frame) to
+// match the format log.Printf lines around it get via newTimestampWriter.
 func runWithSpinnerTUI(prog *tea.Program, label string, fn func() error) error {
+	ts := time.Now().Format(logTimestampLayout)
 	return runWithSpinnerVia(func(text string, final bool) {
-		prog.Send(spinnerLineMsg{text: text, done: final})
+		prog.Send(spinnerLineMsg{text: ts + " " + text, done: final})
 	}, label, fn)
 }
 
@@ -2706,10 +2729,10 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 		}
 	} else {
 		eng.wrapFetchRemote = func(fn func() error) error {
-			return runWithSpinner("Fetching folder tree from Brick...", fn)
+			return runWithSpinnerPlain("Fetching folder tree from Brick...", fn)
 		}
 		eng.wrapCompareLocal = func(fn func() error) error {
-			return runWithSpinner("Comparing local files with folder tree...", fn)
+			return runWithSpinnerPlain("Comparing local files with folder tree...", fn)
 		}
 	}
 

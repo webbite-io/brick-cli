@@ -27,6 +27,18 @@ type logRing struct {
 }
 
 func (r *logRing) push(line string) {
+	r.pushReturningIndex(line)
+}
+
+// pushReturningIndex pushes line exactly like push, and additionally returns
+// the raw slot it landed in — for a caller (spinnerLineMsg handling) that
+// needs to keep updating that exact line later via setAt, regardless of how
+// many unrelated lines get pushed in between. Tracking a raw index rather
+// than assuming "the last line is still mine" matters because other log
+// lines can land concurrently — e.g. the agent connection's own log.Printf
+// races the bootstrap spinner in practice — and "last line" would then be
+// wrong the moment one of those interleaves.
+func (r *logRing) pushReturningIndex(line string) int {
 	idx := (r.start + r.count) % logRingCap
 	r.lines[idx] = line
 	if r.count < logRingCap {
@@ -34,18 +46,12 @@ func (r *logRing) push(line string) {
 	} else {
 		r.start = (r.start + 1) % logRingCap
 	}
+	return idx
 }
 
-// replaceLast overwrites the most recently pushed line in place instead of
-// appending a new one — how an in-progress spinnerLineMsg redraws itself each
-// frame without flooding the scrollback with one line per tick. Behaves like
-// push on an empty ring.
-func (r *logRing) replaceLast(line string) {
-	if r.count == 0 {
-		r.push(line)
-		return
-	}
-	idx := (r.start + r.count - 1) % logRingCap
+// setAt overwrites the raw slot idx (as returned by pushReturningIndex) in
+// place, without disturbing any other line.
+func (r *logRing) setAt(idx int, line string) {
 	r.lines[idx] = line
 }
 
@@ -66,9 +72,9 @@ type logLineMsg string
 // (done == true) of an in-progress spinner — see runWithSpinnerTUI — sent
 // directly to the program rather than through the log package, so unlike an
 // ordinary logLineMsg it is never mirrored into brick.log. Each frame
-// replaces the previous one in the log pane in place (logRing.replaceLast),
-// mimicking a real terminal spinner instead of pushing a new scrollback line
-// on every tick.
+// replaces the previous one in the log pane in place (tracked by ring index —
+// see syncTUIModel.spinnerRingIdx), mimicking a real terminal spinner instead
+// of pushing a new scrollback line on every tick.
 type spinnerLineMsg struct {
 	text string
 	done bool
@@ -159,14 +165,17 @@ type syncTUIModel struct {
 	viewport  viewport.Model
 	following bool // true = auto-scroll to the newest line as it arrives
 
-	// spinnerActive is true while the ring's last line is an in-progress
-	// spinnerLineMsg's own frame, so the next spinnerLineMsg replaces it in
-	// place instead of pushing a new scrollback line. Cleared once that
-	// spinner reports done, and defensively by any ordinary logLineMsg too,
-	// so an unrelated log line landing mid-spinner (which nothing currently
-	// does concurrently, but nothing prevents it either) can never be
-	// mistaken for the spinner's own line and overwritten.
-	spinnerActive bool
+	// spinnerActive is true while a spinner (see spinnerLineMsg) is running;
+	// spinnerRingIdx is the exact ring slot (from logRing.pushReturningIndex)
+	// its next frame updates in place via logRing.setAt. Tracked by index
+	// rather than "the ring's last line", because other lines routinely land
+	// concurrently — e.g. the agent connection's own log.Printf races the
+	// bootstrap spinner in practice — and "last line" would then either
+	// clobber that unrelated line or, worse, make the spinner think it needs
+	// to start a whole new line of its own, duplicating itself on screen
+	// every time something else logs mid-spin.
+	spinnerActive  bool
+	spinnerRingIdx int
 
 	quota  *storageQuota
 	paused bool
@@ -212,15 +221,14 @@ func (m *syncTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case logLineMsg:
 		m.ring.push(string(msg))
-		m.spinnerActive = false
 		m.refreshContent()
 		return m, nil
 
 	case spinnerLineMsg:
 		if m.spinnerActive {
-			m.ring.replaceLast(msg.text)
+			m.ring.setAt(m.spinnerRingIdx, msg.text)
 		} else {
-			m.ring.push(msg.text)
+			m.spinnerRingIdx = m.ring.pushReturningIndex(msg.text)
 			m.spinnerActive = true
 		}
 		if msg.done {

@@ -36,23 +36,17 @@ func TestLogRingBelowCapacity(t *testing.T) {
 	}
 }
 
-func TestLogRingReplaceLastOverwritesMostRecentLine(t *testing.T) {
+func TestLogRingSetAtOverwritesTrackedSlot(t *testing.T) {
 	var r logRing
 	r.push("a")
-	r.push("b")
-	r.replaceLast("b-updated")
+	idx := r.pushReturningIndex("b")
+	r.push("c")
+	// Overwriting "b"'s tracked slot must land exactly there, not on "c" —
+	// the slot may no longer be the ring's last line by the time this fires.
+	r.setAt(idx, "b-updated")
 	all := r.all()
-	if got := strings.Join(all, ","); got != "a,b-updated" {
-		t.Errorf("all() = %q, want \"a,b-updated\"", got)
-	}
-}
-
-func TestLogRingReplaceLastOnEmptyRingPushes(t *testing.T) {
-	var r logRing
-	r.replaceLast("first")
-	all := r.all()
-	if got := strings.Join(all, ","); got != "first" {
-		t.Errorf("all() = %q, want \"first\"", got)
+	if got := strings.Join(all, ","); got != "a,b-updated,c" {
+		t.Errorf("all() = %q, want \"a,b-updated,c\"", got)
 	}
 }
 
@@ -96,24 +90,27 @@ func TestSyncTUIModelSpinnerDoneThenNewSpinnerStartsFreshLine(t *testing.T) {
 	}
 }
 
-// An ordinary log line arriving while a spinner is mid-animation (which
-// nothing currently does concurrently, but nothing prevents either) must not
-// be clobbered by the spinner's next frame update.
-func TestSyncTUIModelLogLineDuringSpinnerIsNotOverwritten(t *testing.T) {
+// A regression test for a real bug: an ordinary log line landing mid-spinner
+// (e.g. the agent connection's own log.Printf, which races the bootstrap
+// spinner in practice) must neither be clobbered by the spinner's next frame
+// update, nor make that frame duplicate the spinner onto a whole new line —
+// it has to find its own original line again and keep updating that one in
+// place, wherever the log line landed relative to it.
+func TestSyncTUIModelLogLineDuringSpinnerDoesNotDuplicateSpinner(t *testing.T) {
 	m := newSyncTUIModel("1.2.3", "/sync/folder", func() {}, new(atomic.Bool), func() {})
 	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... ⠋", done: false})
 	m.Update(logLineMsg("2026-09-30 12:00:00 unrelated log line"))
 	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... ⠙", done: false})
 
 	all := m.ring.all()
-	if len(all) != 3 {
-		t.Fatalf("ring has %d lines, want 3: %v", len(all), all)
+	if len(all) != 2 {
+		t.Fatalf("ring has %d lines, want 2 (the spinner's one line, updated in place, plus the log line) — got: %v", len(all), all)
+	}
+	if want := "Fetching folder tree from Brick... ⠙"; all[0] != want {
+		t.Errorf("first line = %q, want %q (the spinner's original slot, updated to the new frame)", all[0], want)
 	}
 	if want := "2026-09-30 12:00:00 unrelated log line"; all[1] != want {
-		t.Errorf("middle line = %q, want %q (must survive untouched)", all[1], want)
-	}
-	if want := "Fetching folder tree from Brick... ⠙"; all[2] != want {
-		t.Errorf("last line = %q, want %q (a new line, not a replacement of the log line)", all[2], want)
+		t.Errorf("second line = %q, want %q (untouched)", all[1], want)
 	}
 }
 
