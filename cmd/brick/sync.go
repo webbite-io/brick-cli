@@ -1591,6 +1591,80 @@ func (e *syncEngine) verifyUnsyncedFileMatches(ctx context.Context, remoteFiles 
 	return verified
 }
 
+// dryRunClassify is the read-only counterpart of reconcileFile's decision
+// tree, used by `brick sync --dry-run` to report what a real pass would do to
+// rel without doing it. It mirrors reconcileFile's cases one-for-one (folder
+// plumbing aside — a dry run reports file-level transfers, not the remote
+// parent folders an upload would create on demand) and must be kept in sync
+// with it if that logic ever changes.
+//
+// Returns ok=false for a path reconcileFile would leave untouched: excluded,
+// already in sync, verified identical with nothing to record, or gone on both
+// sides.
+func dryRunClassify(e *syncEngine, rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, verifiedIdentical map[string]bool) (label string, ok bool) {
+	if isExcludedPath(rel, e.excludeDirs) {
+		return "", false
+	}
+
+	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
+	remoteNode, hasRemote := remoteFiles[rel]
+	_, localExists := localFiles[rel]
+	entry, hasEntry := e.state.Entries[rel]
+
+	switch {
+	case hasRemote && !localExists:
+		if hasEntry {
+			return "To be deleted remotely. Removed locally.", true
+		}
+		return "To be downloaded. Exists remotely but not locally.", true
+
+	case !hasRemote && localExists:
+		if hasEntry {
+			if localHash, err := hashFile(abs); err == nil && entry.LocalHash == localHash {
+				return "To be removed locally. Deleted on the server.", true
+			}
+		}
+		return "To be uploaded. Exists locally but not remotely.", true
+
+	case hasRemote && localExists:
+		localHash, err := hashFile(abs)
+		if err != nil {
+			return fmt.Sprintf("Could not be checked: %v", err), true
+		}
+		remoteChanged := !hasEntry || entry.RemoteEtag != remoteNode.Etag
+		localChanged := !hasEntry || entry.LocalHash != localHash
+		switch {
+		case !remoteChanged && !localChanged:
+			return "", false // already in sync
+		case !hasEntry && verifiedIdentical[rel]:
+			return "", false // confirmed identical via md5, nothing to transfer
+		case !hasEntry:
+			// No sync history and content unverifiable either way (no stored
+			// MD5 on one side, or the two just genuinely differ) — reconcileFile
+			// resolves this per e.conflictMode, but only on a true first sync;
+			// afterwards it's a plain remote-wins, same as any other
+			// remote-changed file below.
+			verb := "downloaded"
+			if e.firstSync {
+				switch e.conflictMode {
+				case "brick":
+					verb = "uploaded"
+				case "copy":
+					verb = "kept as both copies (local renamed aside)"
+				}
+			}
+			return fmt.Sprintf("To be %s. Exists both locally and remotely but lacks MD5 checksum.", verb), true
+		case localChanged && !remoteChanged:
+			return "To be uploaded. Local copy changed since last sync.", true
+		default:
+			return "To be downloaded. Remote copy changed since last sync.", true
+		}
+
+	default:
+		return "", false // gone on both sides
+	}
+}
+
 // reconcileFile applies the per-path reconciliation rules: creates, updates and
 // deletes push from whichever side changed to the other; on a genuine content
 // conflict (both sides changed the same file), remote wins.
@@ -2141,6 +2215,7 @@ func runSyncCmd(args []string, noUpgradeCheck bool) {
 		remoteControl     bool
 		selectiveSync     bool
 		listSelectiveSync bool
+		dryRun            bool
 	)
 	syncFlags.BoolVar(&daemon, "d", false, "")
 	syncFlags.BoolVar(&daemon, "daemon", false, "")
@@ -2152,6 +2227,7 @@ func runSyncCmd(args []string, noUpgradeCheck bool) {
 	syncFlags.BoolVar(&selectiveSync, "s", false, "")
 	syncFlags.BoolVar(&selectiveSync, "selective-sync", false, "")
 	syncFlags.BoolVar(&listSelectiveSync, "list-selective-sync", false, "")
+	syncFlags.BoolVar(&dryRun, "dry-run", false, "")
 	syncFlags.Var(&agentRootsFlag, "agent-root", "")
 	_ = syncFlags.Parse(args)
 
@@ -2190,6 +2266,20 @@ func runSyncCmd(args []string, noUpgradeCheck bool) {
 	if listSelectiveSync {
 		if err := runListSelectiveSync(); err != nil {
 			log.Fatalf("List selective sync failed: %v", err)
+		}
+		return
+	}
+
+	// Dry run: report what a real sync would do right now, without
+	// transferring, deleting or writing anything.
+	if dryRun {
+		if err := runWithAutoRelogin(apiURL, authFailedReloginPrompt, func() error {
+			return runSyncDryRun(apiURL, storageURL)
+		}); err != nil {
+			if errors.Is(err, errLoginDeclined) {
+				return
+			}
+			log.Fatalf("Dry run failed: %v", err)
 		}
 		return
 	}
@@ -2261,6 +2351,83 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 	if detach {
 		fmt.Println("Detaching sync into a background daemon...")
 		return runAsDaemon(apiURL, storageURL, remoteControl)
+	}
+	return nil
+}
+
+// runSyncDryRun reports what `brick sync` would do right now — every file
+// that would be uploaded, downloaded, or otherwise changed — without
+// transferring, deleting, or writing anything: no instance lock is taken, no
+// blob moves in either direction, and the sync-state file is neither read for
+// writing nor saved. It runs the exact same tree comparison and MD5
+// verification the real sync uses (see verifyUnsyncedFileMatches), then
+// classifies each file with dryRunClassify instead of acting on it.
+func runSyncDryRun(apiURL, storageURL string) error {
+	setup, err := prepareSync(apiURL, storageURL)
+	if err != nil {
+		return err
+	}
+	cfg, sc, folder := setup.cfg, setup.sc, setup.folder
+	ac := cfg.ensureActiveAccount()
+
+	eng := &syncEngine{
+		sc:           sc,
+		folder:       folder,
+		accountID:    cfg.ActiveAccountID,
+		rootID:       setup.rootID,
+		excludeDirs:  ac.ExcludeDirs,
+		firstSync:    setup.isFirstSetup,
+		conflictMode: setup.conflictMode,
+		state:        loadSyncState(cfg.ActiveAccountID, folder),
+	}
+
+	ctx := context.Background()
+	fmt.Println("Comparing local and remote files...")
+	remoteFiles, _, _, err := eng.buildRemoteTree(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read remote files: %w", err)
+	}
+	localFiles, _, err := eng.buildLocalTree()
+	if err != nil {
+		return fmt.Errorf("could not read local files: %w", err)
+	}
+	// Same batched content-MD5 lookup the real sync would make, so a dry run
+	// reports the same skip decisions it would actually make.
+	verifiedIdentical := eng.verifyUnsyncedFileMatches(ctx, remoteFiles, localFiles)
+
+	keys := map[string]struct{}{}
+	for k := range remoteFiles {
+		keys[k] = struct{}{}
+	}
+	for k := range localFiles {
+		keys[k] = struct{}{}
+	}
+	for k := range eng.state.Entries {
+		keys[k] = struct{}{}
+	}
+	rels := make([]string, 0, len(keys))
+	for k := range keys {
+		rels = append(rels, k)
+	}
+	sort.Strings(rels)
+
+	fmt.Println()
+	count := 0
+	for _, rel := range rels {
+		label, ok := dryRunClassify(eng, rel, remoteFiles, localFiles, verifiedIdentical)
+		if !ok {
+			continue
+		}
+		count++
+		fmt.Println(rel)
+		fmt.Printf("  - %s\n", label)
+	}
+
+	fmt.Println()
+	if count == 0 {
+		fmt.Println("Nothing to sync — the local folder and the server already match.")
+	} else {
+		fmt.Printf("%d file(s) would be synced.\n", count)
 	}
 	return nil
 }

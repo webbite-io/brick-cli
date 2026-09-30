@@ -44,6 +44,7 @@ _brick() {
                         '(--agent-root)'--agent-root'[Additional directory to expose to remote clients when remote control is enabled]:directory:_files -/'
                         '(-s --selective-sync)'{-s,--selective-sync}'[Choose which folders to exclude from sync]'
                         '(--list-selective-sync)'--list-selective-sync'[List the folders currently excluded from sync]'
+                        '(--dry-run)'--dry-run'[Report what would be synced without transferring, deleting or writing anything]'
                     )
                     _arguments -s $sync_flags
                     ;;

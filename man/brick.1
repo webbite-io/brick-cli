@@ -151,6 +151,11 @@ instance is restarted to pick up the change.
 .TP
 .B \-\-list\-selective\-sync
 Print the folders currently excluded from sync for the active account.
+.TP
+.B \-\-dry\-run
+Report what a real sync would do right now \(em every file that would be
+uploaded, downloaded, or otherwise changed \(em without transferring,
+deleting, or writing anything.
 .SS "upload \fR[\fIoptions\fR] \fIfile\fR|\fIdir\fR [\fItarget\-path\fR|\fIuuid\fR]"
 Upload a local file or folder to Brick, outside of the two-way sync loop.
 .I target

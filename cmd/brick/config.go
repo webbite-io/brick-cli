@@ -285,6 +285,7 @@ func printHelp() {
 	fmt.Printf("        --agent-root PATH       Directory to expose to remote clients when remote control is enabled (repeatable)\n")
 	fmt.Printf("    -s, --selective-sync        Choose which folders to exclude from sync (deletes their local copies)\n")
 	fmt.Printf("        --list-selective-sync   List the folders currently excluded from sync\n")
+	fmt.Printf("        --dry-run               Report what would be synced without transferring, deleting or writing anything\n")
 	fmt.Printf("\n%sTransfer:%s\n\n", ansiPurple, ansiReset)
 	fmt.Printf("  upload <file|dir> [target]    Upload a local file or folder\n")
 	fmt.Printf("    -r, --recursive             Required to upload a folder\n")

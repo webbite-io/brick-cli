@@ -62,6 +62,9 @@ complete -c brick -n '__fish_seen_subcommand_from sync' -s s -l selective-sync \
 complete -c brick -n '__fish_seen_subcommand_from sync' -l list-selective-sync \
     -d 'List the folders currently excluded from sync'
 
+complete -c brick -n '__fish_seen_subcommand_from sync' -l dry-run \
+    -d 'Report what would be synced without transferring, deleting or writing anything'
+
 # ── upload ───────────────────────────────────────────────────────────────────
 complete -c brick -n '__fish_seen_subcommand_from upload' -s r -l recursive \
     -d 'Required to upload a folder'

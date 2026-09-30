@@ -44,7 +44,7 @@ _brick() {
                     ;;
             esac
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-d --daemon --json -r --remote-control --agent-root -s --selective-sync --list-selective-sync" -- "$cur") )
+                COMPREPLY=( $(compgen -W "-d --daemon --json -r --remote-control --agent-root -s --selective-sync --list-selective-sync --dry-run" -- "$cur") )
             fi
             ;;
         upload)
