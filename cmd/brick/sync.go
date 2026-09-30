@@ -2331,7 +2331,6 @@ func runSyncDryRun(apiURL, storageURL string) error {
 	}
 
 	ctx := context.Background()
-	fmt.Println("Comparing local and remote files...")
 
 	var remoteFiles map[string]storageNode
 	if err := runWithSpinner("Fetching folder tree from Brick...", func() error {
@@ -2374,6 +2373,11 @@ func runSyncDryRun(apiURL, storageURL string) error {
 	}
 	sort.Strings(rels)
 
+	// Exactly one blank row separates the spinners above from whatever comes
+	// next, whether that's the file list or (count == 0) the "nothing to
+	// sync" line — so no second blank row is printed between the list and
+	// the closing summary either; the list has already left the cursor
+	// after its last line.
 	fmt.Println()
 	count := 0
 	for _, rel := range rels {
@@ -2386,10 +2390,10 @@ func runSyncDryRun(apiURL, storageURL string) error {
 		fmt.Printf("  - %s\n", label)
 	}
 
-	fmt.Println()
 	if count == 0 {
 		fmt.Println("Nothing to sync — the local folder and the server already match.")
 	} else {
+		fmt.Println()
 		fmt.Printf("%d file(s) would be synced.\n", count)
 	}
 	return nil
