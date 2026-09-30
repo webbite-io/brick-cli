@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -282,9 +281,9 @@ func TestReconcileAllHonorsConflictModeWhileFirstSyncTrue(t *testing.T) {
 	}
 }
 
-// A file present on both sides at first sync, whose content the server
-// confirms is byte-identical to the specific remote node at that exact path
-// (via the batch content-MD5 lookup), must not be transferred at all —
+// A file present on both sides at first sync, whose content-MD5 (as already
+// returned by GET .../children, on the specific remote node at that exact
+// path) matches the local file's own MD5, must not be transferred at all —
 // neither downloaded nor uploaded — just recorded as already synced. This is
 // the "populate the folder from another device, then run brick sync" scenario
 // that used to re-transfer every file regardless of whether it was already
@@ -309,33 +308,16 @@ func TestReconcileAllSkipsFirstSyncConflictWhenMD5Verified(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/accounts/acct-1/nodes/root/children", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, storageNodeList{
-			Data:  []storageNode{{ID: "f-same", ParentID: "root", Name: "same.txt", NodeType: "file", Etag: "etag-remote", SizeBytes: int64(len(content))}},
+			Data:  []storageNode{{ID: "f-same", ParentID: "root", Name: "same.txt", NodeType: "file", Etag: "etag-remote", SizeBytes: int64(len(content)), ContentMD5: localMD5}},
 			Count: 1,
 		})
 	})
+	// Must never be called: verifyUnsyncedFileMatches compares against the
+	// content-MD5 the children listing above already carries, with no
+	// separate lookup.
 	mux.HandleFunc("/v1/accounts/acct-1/files/exists/md5", func(w http.ResponseWriter, r *http.Request) {
 		existsChecked.Store(true)
-		var req struct {
-			Files []struct {
-				MD5 string `json:"md5"`
-			} `json:"files"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Errorf("decode exists/md5 request: %v", err)
-		}
-		if len(req.Files) != 1 || req.Files[0].MD5 != localMD5 {
-			t.Errorf("exists/md5 request = %+v, want one file with md5 %q", req.Files, localMD5)
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"results": []map[string]any{
-				{
-					"exists": true,
-					"matches": []map[string]any{
-						{"nodeId": "f-same", "path": "/same.txt", "name": "same.txt", "sizeBytes": len(content)},
-					},
-				},
-			},
-		})
+		http.Error(w, "unexpected call", http.StatusInternalServerError)
 	})
 	mux.HandleFunc("/v1/accounts/acct-1/files/f-same", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -373,8 +355,8 @@ func TestReconcileAllSkipsFirstSyncConflictWhenMD5Verified(t *testing.T) {
 	if err := eng.reconcileAll(context.Background()); err != nil {
 		t.Fatalf("reconcileAll error = %v, want nil", err)
 	}
-	if !existsChecked.Load() {
-		t.Error("exists/md5 was never called")
+	if existsChecked.Load() {
+		t.Error("exists/md5 was called — verification should use the content-MD5 already in the children listing, no extra request")
 	}
 	if uploaded.Load() {
 		t.Error("local copy was uploaded even though content was verified identical")
@@ -391,12 +373,11 @@ func TestReconcileAllSkipsFirstSyncConflictWhenMD5Verified(t *testing.T) {
 	}
 }
 
-// A file present on both sides at first sync whose content-MD5 lookup comes
-// back with no match at all (e.g. the remote copy predates content-MD5
-// support, or genuinely has different bytes) must still fall through to the
-// ordinary conflict-mode resolution — a miss is "unverifiable", never treated
-// as proof of a difference that skips the transfer, but it must not skip the
-// transfer either.
+// A file present on both sides at first sync whose remote node carries no
+// stored content-MD5 (e.g. it predates content-MD5 support) is unverifiable
+// and must still fall through to the ordinary conflict-mode resolution — no
+// stored hash is never treated as proof of a difference that skips the
+// transfer, but it must not skip the transfer either.
 func TestReconcileAllFallsBackToConflictModeWhenMD5NotMatched(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -414,13 +395,6 @@ func TestReconcileAllFallsBackToConflictModeWhenMD5NotMatched(t *testing.T) {
 		writeJSON(w, http.StatusOK, storageNodeList{
 			Data:  []storageNode{{ID: "f-differs", ParentID: "root", Name: "differs.txt", NodeType: "file", Etag: "etag-remote"}},
 			Count: 1,
-		})
-	})
-	mux.HandleFunc("/v1/accounts/acct-1/files/exists/md5", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"results": []map[string]any{
-				{"exists": false, "matches": []map[string]any{}},
-			},
 		})
 	})
 	mux.HandleFunc("/v1/accounts/acct-1/files/f-differs", func(w http.ResponseWriter, r *http.Request) {
@@ -483,33 +457,15 @@ func TestReconcileAllSkipsUnsyncedFileWhenMD5VerifiedAfterOnboarding(t *testing.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/accounts/acct-1/nodes/root/children", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, storageNodeList{
-			Data:  []storageNode{{ID: "f-same", ParentID: "root", Name: "same.txt", NodeType: "file", Etag: "etag-remote", SizeBytes: int64(len(content))}},
+			Data:  []storageNode{{ID: "f-same", ParentID: "root", Name: "same.txt", NodeType: "file", Etag: "etag-remote", SizeBytes: int64(len(content)), ContentMD5: localMD5}},
 			Count: 1,
 		})
 	})
+	// Must never be called: verification compares against the content-MD5
+	// the children listing above already carries, with no separate lookup.
 	mux.HandleFunc("/v1/accounts/acct-1/files/exists/md5", func(w http.ResponseWriter, r *http.Request) {
 		existsChecked.Store(true)
-		var req struct {
-			Files []struct {
-				MD5 string `json:"md5"`
-			} `json:"files"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Errorf("decode exists/md5 request: %v", err)
-		}
-		if len(req.Files) != 1 || req.Files[0].MD5 != localMD5 {
-			t.Errorf("exists/md5 request = %+v, want one file with md5 %q", req.Files, localMD5)
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"results": []map[string]any{
-				{
-					"exists": true,
-					"matches": []map[string]any{
-						{"nodeId": "f-same", "path": "/same.txt", "name": "same.txt", "sizeBytes": len(content)},
-					},
-				},
-			},
-		})
+		http.Error(w, "unexpected call", http.StatusInternalServerError)
 	})
 	mux.HandleFunc("/v1/accounts/acct-1/files/f-same", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -546,8 +502,8 @@ func TestReconcileAllSkipsUnsyncedFileWhenMD5VerifiedAfterOnboarding(t *testing.
 	if err := eng.reconcileAll(context.Background()); err != nil {
 		t.Fatalf("reconcileAll error = %v, want nil", err)
 	}
-	if !existsChecked.Load() {
-		t.Error("exists/md5 was never called even though same.txt had no sync-state entry")
+	if existsChecked.Load() {
+		t.Error("exists/md5 was called — verification should use the content-MD5 already in the children listing, no extra request")
 	}
 	if downloaded.Load() {
 		t.Error("remote copy was downloaded even though content was verified identical")

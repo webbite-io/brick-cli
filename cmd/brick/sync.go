@@ -48,6 +48,15 @@ type storageNode struct {
 	Path      string    `json:"path"`
 	IsDeleted bool      `json:"isDeleted"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// ContentMD5 is the whole-file MD5 the server already has on record for
+	// this node (see brick-api's model.Node.ContentMD5), returned as part of
+	// the ordinary node listing — empty when unknown (a file uploaded before
+	// content-MD5 support existed, or whose resumable chunks arrived out of
+	// order). Comparing it against a local file's own MD5 (hashFileMD5) is
+	// how verifyUnsyncedFileMatches confirms two files are identical without
+	// any extra request: the node fetched from GET /children already carries
+	// its own hash, so there's nothing left to ask the server.
+	ContentMD5 string `json:"contentMd5,omitempty"`
 }
 
 type storageNodeList struct {
@@ -257,82 +266,6 @@ func (sc *storageClient) download(ctx context.Context, nodeID string) ([]byte, s
 		return nil, "", err
 	}
 	return data, strings.Trim(resp.Header.Get("ETag"), `"`), nil
-}
-
-// existenceByMD5MaxBatch mirrors the server's own cap on how many files one
-// POST /files/exists/md5 request may carry (see brick-api's
-// maxExistenceBatchSize).
-const existenceByMD5MaxBatch = 100
-
-// existenceMatch is one file in the account whose content matched a queried
-// MD5 — not necessarily at the path the caller expected, since the lookup is
-// account-wide, not scoped to a parent folder.
-type existenceMatch struct {
-	NodeID    string `json:"nodeId"`
-	Path      string `json:"path"`
-	Name      string `json:"name"`
-	SizeBytes int64  `json:"sizeBytes"`
-}
-
-type existenceResult struct {
-	Exists  bool             `json:"exists"`
-	Matches []existenceMatch `json:"matches"`
-}
-
-// checkExistsByMD5 asks the server which of the given content MD5s already
-// exist somewhere in the account, batching at existenceByMD5MaxBatch per
-// request. The returned slice is aligned with md5s: same length, same order.
-//
-// A file uploaded before content-MD5 support existed (or whose resumable
-// chunks arrived out of order) has no stored hash and will never be reported
-// as a match here, even if its content is actually identical — callers must
-// treat "no match" as "unknown", never as proof the content differs.
-func (sc *storageClient) checkExistsByMD5(ctx context.Context, md5s []string) ([]existenceResult, error) {
-	out := make([]existenceResult, 0, len(md5s))
-	for start := 0; start < len(md5s); start += existenceByMD5MaxBatch {
-		end := start + existenceByMD5MaxBatch
-		if end > len(md5s) {
-			end = len(md5s)
-		}
-		batch := md5s[start:end]
-
-		type fileQuery struct {
-			MD5 string `json:"md5"`
-		}
-		files := make([]fileQuery, len(batch))
-		for i, h := range batch {
-			files[i] = fileQuery{MD5: h}
-		}
-		body, err := json.Marshal(struct {
-			Files []fileQuery `json:"files"`
-		}{Files: files})
-		if err != nil {
-			return nil, err
-		}
-
-		resp, err := sc.request(ctx, "POST", "/files/exists/md5", body, map[string]string{"Content-Type": "application/json"})
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode != http.StatusOK {
-			e := sc.errFrom(resp)
-			resp.Body.Close()
-			return nil, e
-		}
-		var page struct {
-			Results []existenceResult `json:"results"`
-		}
-		decErr := json.NewDecoder(resp.Body).Decode(&page)
-		resp.Body.Close()
-		if decErr != nil {
-			return nil, decErr
-		}
-		if len(page.Results) != len(batch) {
-			return nil, fmt.Errorf("exists/md5: server returned %d results for %d files", len(page.Results), len(batch))
-		}
-		out = append(out, page.Results...)
-	}
-	return out, nil
 }
 
 func (sc *storageClient) upload(ctx context.Context, parentID, name string, data []byte) (*storageNode, error) {
@@ -1303,13 +1236,11 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 	// file was reset/lost, or a folder was repopulated from another
 	// already-synced device after onboarding — would otherwise always be
 	// blindly transferred (per e.conflictMode on a true first sync, or
-	// "remote wins" otherwise; see reconcileFile). Check up front, once, in a
-	// single batched call rather than per file, whether such files are
-	// already byte-identical to their remote counterpart so the transfer can
-	// be skipped. verifyUnsyncedFileMatches itself no-ops (no request sent)
-	// when there are no such candidates, which is the common case on every
-	// pass after the first.
-	verifiedIdentical := e.verifyUnsyncedFileMatches(ctx, remoteFiles, localFiles)
+	// "remote wins" otherwise; see reconcileFile). Check up front, once,
+	// whether such files are already byte-identical to their remote
+	// counterpart (by comparing content-MD5 the remote tree walk above
+	// already returned — no extra request) so the transfer can be skipped.
+	verifiedIdentical := e.verifyUnsyncedFileMatches(remoteFiles, localFiles)
 	for rel := range keys {
 		if err := e.checkInterrupted(ctx); err != nil {
 			return err
@@ -1515,77 +1446,49 @@ func isExcludedPath(rel string, excludeDirs []string) bool {
 // no sync-state entry (the case reconcileFile would otherwise resolve by
 // blind transfer — per e.conflictMode on a true first sync, or "remote wins"
 // on any later pass — see reconcileFile), whether its content already matches
-// the specific remote file at that path. It does this via the server's batch
-// content-MD5 lookup rather than a full download/upload, so a folder that
-// ends up holding files with no sync-state entry — the account's very first
-// sync, the state file having been reset, or files copied in from another
-// already-synced device well after onboarding — doesn't pay to re-transfer
-// every one of them just to record them as synced.
+// the specific remote file at that path — so a folder that ends up holding
+// files with no sync-state entry (the account's very first sync, the state
+// file having been reset, or files copied in from another already-synced
+// device well after onboarding) doesn't pay to re-transfer every one of them
+// just to record them as synced.
+//
+// This costs no extra request: the remote tree walk that produced
+// remoteFiles (buildRemoteTree, backed by GET .../children) already returns
+// each node's own stored content-MD5 (storageNode.ContentMD5), so verifying
+// is just hashing the local file and comparing two strings. There is nothing
+// a dedicated existence lookup could add here — this candidate's remote node
+// is already known by ID, not merely "some file somewhere with this hash",
+// and a node with no stored MD5 of its own would never be found by such a
+// lookup either.
 //
 // Returns the set of rel paths confirmed identical. A rel's absence from the
-// returned set is not proof its content differs: it may simply be
-// unverifiable (no stored MD5 for that upload, or the lookup call itself
-// failed — an older server without the endpoint, say) — callers must keep
-// falling back to the ordinary resolution for those. Cheap to call on every
-// pass: it no-ops without a request when there are no such candidates, which
-// is the common case once a folder is fully synced.
-func (e *syncEngine) verifyUnsyncedFileMatches(ctx context.Context, remoteFiles map[string]storageNode, localFiles map[string]int64) map[string]bool {
-	var candidates []string
+// returned set is not proof its content differs: the remote node may simply
+// have no stored MD5 to compare against (a file uploaded before content-MD5
+// support existed, or whose resumable chunks arrived out of order) — callers
+// must keep falling back to the ordinary resolution for those.
+func (e *syncEngine) verifyUnsyncedFileMatches(remoteFiles map[string]storageNode, localFiles map[string]int64) map[string]bool {
+	var verified map[string]bool
 	for rel := range localFiles {
 		if isExcludedPath(rel, e.excludeDirs) {
 			continue // reconcileExcludedFile handles these, never the conflict case
 		}
-		if _, hasRemote := remoteFiles[rel]; !hasRemote {
+		remoteNode, hasRemote := remoteFiles[rel]
+		if !hasRemote || remoteNode.ContentMD5 == "" {
 			continue
 		}
 		if _, hasEntry := e.state.Entries[rel]; hasEntry {
 			continue
 		}
-		candidates = append(candidates, rel)
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	md5s := make([]string, 0, len(candidates))
-	relByMD5 := make(map[string][]string, len(candidates))
-	for _, rel := range candidates {
 		abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 		h, err := hashFileMD5(abs)
 		if err != nil {
 			continue // unreadable right now -> let the ordinary path handle/report it
 		}
-		if _, seen := relByMD5[h]; !seen {
-			md5s = append(md5s, h)
-		}
-		relByMD5[h] = append(relByMD5[h], rel)
-	}
-	if len(md5s) == 0 {
-		return nil
-	}
-
-	results, err := e.sc.checkExistsByMD5(ctx, md5s)
-	if err != nil {
-		// Older server without the endpoint, or a transient failure -> fall
-		// back to the ordinary conflict-mode resolution for every candidate,
-		// exactly as if this check had never been attempted.
-		log.Printf("md5 existence check: %v (falling back to conflict mode for pre-existing files)", err)
-		return nil
-	}
-
-	verified := map[string]bool{}
-	for i, h := range md5s {
-		if i >= len(results) || !results[i].Exists {
-			continue
-		}
-		for _, rel := range relByMD5[h] {
-			remoteNode := remoteFiles[rel]
-			for _, m := range results[i].Matches {
-				if m.NodeID == remoteNode.ID {
-					verified[rel] = true
-					break
-				}
+		if h == remoteNode.ContentMD5 {
+			if verified == nil {
+				verified = map[string]bool{}
 			}
+			verified[rel] = true
 		}
 	}
 	return verified
@@ -2391,9 +2294,9 @@ func runSyncDryRun(apiURL, storageURL string) error {
 	if err != nil {
 		return fmt.Errorf("could not read local files: %w", err)
 	}
-	// Same batched content-MD5 lookup the real sync would make, so a dry run
+	// Same content-MD5 comparison the real sync would make, so a dry run
 	// reports the same skip decisions it would actually make.
-	verifiedIdentical := eng.verifyUnsyncedFileMatches(ctx, remoteFiles, localFiles)
+	verifiedIdentical := eng.verifyUnsyncedFileMatches(remoteFiles, localFiles)
 
 	keys := map[string]struct{}{}
 	for k := range remoteFiles {
@@ -3356,8 +3259,8 @@ func hashFile(path string) (string, error) {
 
 // hashFileMD5 returns the whole-file MD5 of path, hex-encoded, in the same
 // form the server stores as a node's contentMd5 (see brick-api's
-// FileService.writeVersion) — matched against that column by
-// storageClient.checkExistsByMD5. Distinct from hashFile's sha256, which is
+// FileService.writeVersion) — compared directly against storageNode.ContentMD5
+// by verifyUnsyncedFileMatches. Distinct from hashFile's sha256, which is
 // purely local bookkeeping and never sent to the server.
 func hashFileMD5(path string) (string, error) {
 	f, err := os.Open(path)
