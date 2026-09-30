@@ -707,8 +707,11 @@ func proxyAgentStream(stream net.Conn, agentAddr string) {
 // connectAgentOnce dials the storage API, takes the yamux server role, and
 // proxies incoming streams to the local agent until the session ends or ctx is
 // cancelled. It reads cfg.AccessToken fresh so reconnects pick up refreshed
-// tokens, and refreshes once on a 401/403.
-func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string, remoteControl bool) error {
+// tokens, and refreshes once on a 401/403. onConnected, if non-nil, is called
+// once the connection is actually established (right after the "Brick CLI
+// connected..." log line) — see connectAgentWithReconnect's doc comment for
+// why.
+func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string, remoteControl bool, onConnected func()) error {
 	hostname, _ := os.Hostname()
 	q := url.Values{}
 	q.Set("clientId", cfg.ClientID)
@@ -770,6 +773,9 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 	}()
 
 	log.Printf("Brick CLI connected to Brick Online (clientId=%s)", cfg.ClientID)
+	if onConnected != nil {
+		onConnected()
+	}
 
 	streamCh := make(chan net.Conn)
 	errCh := make(chan error, 1)
@@ -806,10 +812,25 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 // connectAgentWithReconnect keeps the agent connected, retrying with backoff
 // until ctx is cancelled. Unlike a tunnel's reconnect logic it never gives up,
 // since the agent is a long-lived background service alongside sync.
-func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string, remoteControl bool) {
+//
+// connected, if non-nil, is closed the first time a connection actually
+// succeeds — runSyncLoop gives it a short bounded wait right after starting
+// this goroutine so "Brick CLI connected..." reliably lands ahead of the
+// initial reconcile pass's own output in the common case (a fast local
+// network), without letting a slow or unreachable connection delay sync
+// startup by more than that bound; this goroutine's own retry loop keeps
+// going regardless of whether anyone was waiting.
+func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string, remoteControl bool, connected chan<- struct{}) {
+	var signalOnce sync.Once
+	signalConnected := func() {
+		if connected != nil {
+			signalOnce.Do(func() { close(connected) })
+		}
+	}
+
 	attempt := 0
 	for {
-		err := connectAgentOnce(ctx, storageURL, apiURL, cfg, secret, agentAddr, remoteControl)
+		err := connectAgentOnce(ctx, storageURL, apiURL, cfg, secret, agentAddr, remoteControl, signalConnected)
 		if ctx.Err() != nil {
 			return
 		}

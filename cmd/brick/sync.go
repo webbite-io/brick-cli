@@ -1169,10 +1169,36 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 
 	var localFiles map[string]int64
 	var localDirs map[string]bool
+	// verifiedIdentical is set inside compareLocal, right alongside
+	// buildLocalTree — see the comment in there for why. Read at the file
+	// reconcile pass below.
+	var verifiedIdentical map[string]bool
 	compareLocal := func() error {
 		var buildErr error
 		localFiles, localDirs, buildErr = e.buildLocalTree()
-		return buildErr
+		if buildErr != nil {
+			return buildErr
+		}
+		// A file present on both sides with no sync-state entry — whether
+		// that's because this is the account's very first sync, or because
+		// the state file was reset/lost, or a folder was repopulated from
+		// another already-synced device after onboarding — would otherwise
+		// always be blindly transferred (per e.conflictMode on a true first
+		// sync, or "remote wins" otherwise; see reconcileFile). Check up
+		// front, once, whether such files are already byte-identical to
+		// their remote counterpart (by comparing content-MD5 the remote tree
+		// walk above already returned — no extra request) so the transfer
+		// can be skipped.
+		//
+		// Deliberately grouped into this same step rather than run
+		// separately afterward: hashing every candidate file's full content
+		// is the CPU-heavy half of "comparing local files with folder
+		// tree" (buildLocalTree itself is just a directory walk), so
+		// running it after wrapCompareLocal's spinner has already reported
+		// "done" would make that done a lie — the visible CPU spike from
+		// hashing would land after the step claimed to be finished.
+		verifiedIdentical = e.verifyUnsyncedFileMatches(remoteFiles, localFiles)
+		return nil
 	}
 	if e.wrapCompareLocal != nil {
 		err = e.wrapCompareLocal(compareLocal)
@@ -1267,16 +1293,6 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 	for k := range e.state.Entries {
 		keys[k] = struct{}{}
 	}
-	// A file present on both sides with no sync-state entry — whether that's
-	// because this is the account's very first sync, or because the state
-	// file was reset/lost, or a folder was repopulated from another
-	// already-synced device after onboarding — would otherwise always be
-	// blindly transferred (per e.conflictMode on a true first sync, or
-	// "remote wins" otherwise; see reconcileFile). Check up front, once,
-	// whether such files are already byte-identical to their remote
-	// counterpart (by comparing content-MD5 the remote tree walk above
-	// already returned — no extra request) so the transfer can be skipped.
-	verifiedIdentical := e.verifyUnsyncedFileMatches(remoteFiles, localFiles)
 	for rel := range keys {
 		if err := e.checkInterrupted(ctx); err != nil {
 			return err
@@ -2689,13 +2705,24 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 	} else {
 		agentAddr := agentLn.Addr().String()
 		defer agentLn.Close()
-		go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agentAddr, remoteControl)
+		agentConnected := make(chan struct{})
+		go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agentAddr, remoteControl, agentConnected)
 		defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)
 		if remoteControl {
 			// Logged rather than printed: in interactive mode the sync TUI
 			// owns the whole screen, and writing to stdout behind its back
 			// would be clobbered by its next repaint.
 			log.Printf("Remote control enabled (roots: %s)", strings.Join(agentRoots, ", "))
+		}
+		// Give the agent connection a short head start so its own "Brick CLI
+		// connected..." line reliably lands ahead of the initial reconcile
+		// pass's own output below — purely for readable log ordering, capped
+		// so a slow or unreachable connection never meaningfully delays sync
+		// startup (it keeps retrying in the background regardless).
+		select {
+		case <-agentConnected:
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
 		}
 	}
 
