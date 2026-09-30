@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -256,6 +257,82 @@ func (sc *storageClient) download(ctx context.Context, nodeID string) ([]byte, s
 		return nil, "", err
 	}
 	return data, strings.Trim(resp.Header.Get("ETag"), `"`), nil
+}
+
+// existenceByMD5MaxBatch mirrors the server's own cap on how many files one
+// POST /files/exists/md5 request may carry (see brick-api's
+// maxExistenceBatchSize).
+const existenceByMD5MaxBatch = 100
+
+// existenceMatch is one file in the account whose content matched a queried
+// MD5 — not necessarily at the path the caller expected, since the lookup is
+// account-wide, not scoped to a parent folder.
+type existenceMatch struct {
+	NodeID    string `json:"nodeId"`
+	Path      string `json:"path"`
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"sizeBytes"`
+}
+
+type existenceResult struct {
+	Exists  bool             `json:"exists"`
+	Matches []existenceMatch `json:"matches"`
+}
+
+// checkExistsByMD5 asks the server which of the given content MD5s already
+// exist somewhere in the account, batching at existenceByMD5MaxBatch per
+// request. The returned slice is aligned with md5s: same length, same order.
+//
+// A file uploaded before content-MD5 support existed (or whose resumable
+// chunks arrived out of order) has no stored hash and will never be reported
+// as a match here, even if its content is actually identical — callers must
+// treat "no match" as "unknown", never as proof the content differs.
+func (sc *storageClient) checkExistsByMD5(ctx context.Context, md5s []string) ([]existenceResult, error) {
+	out := make([]existenceResult, 0, len(md5s))
+	for start := 0; start < len(md5s); start += existenceByMD5MaxBatch {
+		end := start + existenceByMD5MaxBatch
+		if end > len(md5s) {
+			end = len(md5s)
+		}
+		batch := md5s[start:end]
+
+		type fileQuery struct {
+			MD5 string `json:"md5"`
+		}
+		files := make([]fileQuery, len(batch))
+		for i, h := range batch {
+			files[i] = fileQuery{MD5: h}
+		}
+		body, err := json.Marshal(struct {
+			Files []fileQuery `json:"files"`
+		}{Files: files})
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := sc.request(ctx, "POST", "/files/exists/md5", body, map[string]string{"Content-Type": "application/json"})
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			e := sc.errFrom(resp)
+			resp.Body.Close()
+			return nil, e
+		}
+		var page struct {
+			Results []existenceResult `json:"results"`
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&page)
+		resp.Body.Close()
+		if decErr != nil {
+			return nil, decErr
+		}
+		if len(page.Results) != len(batch) {
+			return nil, fmt.Errorf("exists/md5: server returned %d results for %d files", len(page.Results), len(batch))
+		}
+		out = append(out, page.Results...)
+	}
+	return out, nil
 }
 
 func (sc *storageClient) upload(ctx context.Context, parentID, name string, data []byte) (*storageNode, error) {
@@ -638,7 +715,7 @@ type controlInFlight struct {
 // controlActivityEvent is one entry in the bounded recent-activity feed the
 // engine keeps for the interactive banner.
 type controlActivityEvent struct {
-	Kind    string    `json:"kind"` // "upload" | "download" | "update" | "trash" | "remove" | "keep-both"
+	Kind    string    `json:"kind"` // "upload" | "download" | "update" | "trash" | "remove" | "keep-both" | "verify"
 	RelPath string    `json:"relPath"`
 	At      time.Time `json:"at"`
 }
@@ -1221,11 +1298,23 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 	for k := range e.state.Entries {
 		keys[k] = struct{}{}
 	}
+	// A file present on both sides with no sync-state entry — whether that's
+	// because this is the account's very first sync, or because the state
+	// file was reset/lost, or a folder was repopulated from another
+	// already-synced device after onboarding — would otherwise always be
+	// blindly transferred (per e.conflictMode on a true first sync, or
+	// "remote wins" otherwise; see reconcileFile). Check up front, once, in a
+	// single batched call rather than per file, whether such files are
+	// already byte-identical to their remote counterpart so the transfer can
+	// be skipped. verifyUnsyncedFileMatches itself no-ops (no request sent)
+	// when there are no such candidates, which is the common case on every
+	// pass after the first.
+	verifiedIdentical := e.verifyUnsyncedFileMatches(ctx, remoteFiles, localFiles)
 	for rel := range keys {
 		if err := e.checkInterrupted(ctx); err != nil {
 			return err
 		}
-		if err := e.reconcileFile(ctx, rel, remoteFiles, localFiles, remoteFolders, folderID); err != nil {
+		if err := e.reconcileFile(ctx, rel, remoteFiles, localFiles, remoteFolders, folderID, verifiedIdentical); err != nil {
 			if errors.Is(err, errSessionExpired) {
 				return err
 			}
@@ -1422,10 +1511,90 @@ func isExcludedPath(rel string, excludeDirs []string) bool {
 	return false
 }
 
+// verifyUnsyncedFileMatches checks, for every file present on both sides with
+// no sync-state entry (the case reconcileFile would otherwise resolve by
+// blind transfer — per e.conflictMode on a true first sync, or "remote wins"
+// on any later pass — see reconcileFile), whether its content already matches
+// the specific remote file at that path. It does this via the server's batch
+// content-MD5 lookup rather than a full download/upload, so a folder that
+// ends up holding files with no sync-state entry — the account's very first
+// sync, the state file having been reset, or files copied in from another
+// already-synced device well after onboarding — doesn't pay to re-transfer
+// every one of them just to record them as synced.
+//
+// Returns the set of rel paths confirmed identical. A rel's absence from the
+// returned set is not proof its content differs: it may simply be
+// unverifiable (no stored MD5 for that upload, or the lookup call itself
+// failed — an older server without the endpoint, say) — callers must keep
+// falling back to the ordinary resolution for those. Cheap to call on every
+// pass: it no-ops without a request when there are no such candidates, which
+// is the common case once a folder is fully synced.
+func (e *syncEngine) verifyUnsyncedFileMatches(ctx context.Context, remoteFiles map[string]storageNode, localFiles map[string]int64) map[string]bool {
+	var candidates []string
+	for rel := range localFiles {
+		if isExcludedPath(rel, e.excludeDirs) {
+			continue // reconcileExcludedFile handles these, never the conflict case
+		}
+		if _, hasRemote := remoteFiles[rel]; !hasRemote {
+			continue
+		}
+		if _, hasEntry := e.state.Entries[rel]; hasEntry {
+			continue
+		}
+		candidates = append(candidates, rel)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	md5s := make([]string, 0, len(candidates))
+	relByMD5 := make(map[string][]string, len(candidates))
+	for _, rel := range candidates {
+		abs := filepath.Join(e.folder, filepath.FromSlash(rel))
+		h, err := hashFileMD5(abs)
+		if err != nil {
+			continue // unreadable right now -> let the ordinary path handle/report it
+		}
+		if _, seen := relByMD5[h]; !seen {
+			md5s = append(md5s, h)
+		}
+		relByMD5[h] = append(relByMD5[h], rel)
+	}
+	if len(md5s) == 0 {
+		return nil
+	}
+
+	results, err := e.sc.checkExistsByMD5(ctx, md5s)
+	if err != nil {
+		// Older server without the endpoint, or a transient failure -> fall
+		// back to the ordinary conflict-mode resolution for every candidate,
+		// exactly as if this check had never been attempted.
+		log.Printf("md5 existence check: %v (falling back to conflict mode for pre-existing files)", err)
+		return nil
+	}
+
+	verified := map[string]bool{}
+	for i, h := range md5s {
+		if i >= len(results) || !results[i].Exists {
+			continue
+		}
+		for _, rel := range relByMD5[h] {
+			remoteNode := remoteFiles[rel]
+			for _, m := range results[i].Matches {
+				if m.NodeID == remoteNode.ID {
+					verified[rel] = true
+					break
+				}
+			}
+		}
+	}
+	return verified
+}
+
 // reconcileFile applies the per-path reconciliation rules: creates, updates and
 // deletes push from whichever side changed to the other; on a genuine content
 // conflict (both sides changed the same file), remote wins.
-func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, remoteFolders map[string]storageNode, folderID map[string]string) error {
+func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, remoteFolders map[string]storageNode, folderID map[string]string, verifiedIdentical map[string]bool) error {
 	if isExcludedPath(rel, e.excludeDirs) {
 		return e.reconcileExcludedFile(rel, remoteFiles, localFiles)
 	}
@@ -1474,9 +1643,30 @@ func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles 
 		switch {
 		case !remoteChanged && !localChanged:
 			return nil // in sync
+		case !hasEntry && verifiedIdentical[rel]:
+			// No local record of this file being synced, but the server's
+			// content-MD5 lookup confirms it's byte-identical to the remote
+			// file at this exact path (see verifyUnsyncedFileMatches) ->
+			// nothing to transfer, just record it as synced. Applies whether
+			// or not this is the account's very first sync: a folder can end
+			// up holding files with no sync-state entry well after onboarding
+			// too — e.g. the state file was reset, or files were copied in
+			// from another already-synced device.
+			e.state.Entries[rel] = SyncEntry{
+				RelPath:    rel,
+				NodeID:     remoteNode.ID,
+				RemoteEtag: remoteNode.Etag,
+				LocalHash:  localHash,
+				LocalSize:  localFiles[rel],
+				SyncedAt:   time.Now(),
+			}
+			log.Printf("✓  %s already in sync (content verified)", rel)
+			e.publishActivity("verify", rel)
+			return nil
 		case e.firstSync && !hasEntry:
-			// Present on both sides with no prior sync history: this is the
-			// pre-existing-folder conflict the onboarding wizard asked about.
+			// Present on both sides with no prior sync history and not
+			// verified identical above: this is the pre-existing-folder
+			// conflict the onboarding wizard asked about.
 			return e.applyFirstSyncConflict(ctx, rel, remoteNode, remoteFolders, folderID)
 		case localChanged && !remoteChanged:
 			return e.replaceFile(ctx, rel, remoteNode.ID)
@@ -2991,6 +3181,24 @@ func hashFile(path string) (string, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashFileMD5 returns the whole-file MD5 of path, hex-encoded, in the same
+// form the server stores as a node's contentMd5 (see brick-api's
+// FileService.writeVersion) — matched against that column by
+// storageClient.checkExistsByMD5. Distinct from hashFile's sha256, which is
+// purely local bookkeeping and never sent to the server.
+func hashFileMD5(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := md5.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}

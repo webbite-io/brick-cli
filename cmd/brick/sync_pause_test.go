@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -278,5 +279,284 @@ func TestReconcileAllHonorsConflictModeWhileFirstSyncTrue(t *testing.T) {
 	}
 	if downloaded.Load() {
 		t.Error("remote copy was downloaded: fell through to remote-wins instead of honoring conflictMode \"brick\"")
+	}
+}
+
+// A file present on both sides at first sync, whose content the server
+// confirms is byte-identical to the specific remote node at that exact path
+// (via the batch content-MD5 lookup), must not be transferred at all —
+// neither downloaded nor uploaded — just recorded as already synced. This is
+// the "populate the folder from another device, then run brick sync" scenario
+// that used to re-transfer every file regardless of whether it was already
+// identical.
+func TestReconcileAllSkipsFirstSyncConflictWhenMD5Verified(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".config", "brick"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	syncFolder := t.TempDir()
+	content := []byte("identical content")
+	if err := os.WriteFile(filepath.Join(syncFolder, "same.txt"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	localMD5, err := hashFileMD5(filepath.Join(syncFolder, "same.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var uploaded, downloaded, existsChecked atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/accounts/acct-1/nodes/root/children", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, storageNodeList{
+			Data:  []storageNode{{ID: "f-same", ParentID: "root", Name: "same.txt", NodeType: "file", Etag: "etag-remote", SizeBytes: int64(len(content))}},
+			Count: 1,
+		})
+	})
+	mux.HandleFunc("/v1/accounts/acct-1/files/exists/md5", func(w http.ResponseWriter, r *http.Request) {
+		existsChecked.Store(true)
+		var req struct {
+			Files []struct {
+				MD5 string `json:"md5"`
+			} `json:"files"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode exists/md5 request: %v", err)
+		}
+		if len(req.Files) != 1 || req.Files[0].MD5 != localMD5 {
+			t.Errorf("exists/md5 request = %+v, want one file with md5 %q", req.Files, localMD5)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"results": []map[string]any{
+				{
+					"exists": true,
+					"matches": []map[string]any{
+						{"nodeId": "f-same", "path": "/same.txt", "name": "same.txt", "sizeBytes": len(content)},
+					},
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/v1/accounts/acct-1/files/f-same", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut: // would mean the file was re-uploaded despite matching
+			uploaded.Store(true)
+			writeJSON(w, http.StatusOK, storageUploadResult{Node: storageNode{ID: "f-same", Etag: "etag-new"}})
+		case http.MethodGet: // would mean the file was re-downloaded despite matching
+			downloaded.Store(true)
+			w.Header().Set("ETag", `"etag-remote"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(content)
+		default:
+			http.Error(w, "unexpected method "+r.Method, http.StatusMethodNotAllowed)
+		}
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	eng := &syncEngine{
+		sc: &storageClient{
+			baseURL:   server.URL,
+			apiURL:    server.URL,
+			accountID: "acct-1",
+			cfg:       &Config{AccessToken: "test-token"},
+		},
+		folder:          syncFolder,
+		accountID:       "acct-1",
+		rootID:          "root",
+		firstSync:       true,
+		conflictMode:    "device",
+		state:           &SyncState{Folder: syncFolder, Entries: map[string]SyncEntry{}, Folders: map[string]bool{}, FolderIDs: map[string]string{}},
+		recentlyWritten: map[string]time.Time{},
+	}
+
+	if err := eng.reconcileAll(context.Background()); err != nil {
+		t.Fatalf("reconcileAll error = %v, want nil", err)
+	}
+	if !existsChecked.Load() {
+		t.Error("exists/md5 was never called")
+	}
+	if uploaded.Load() {
+		t.Error("local copy was uploaded even though content was verified identical")
+	}
+	if downloaded.Load() {
+		t.Error("remote copy was downloaded even though content was verified identical")
+	}
+	entry, ok := eng.state.Entries["same.txt"]
+	if !ok {
+		t.Fatal("same.txt has no sync entry after a verified-identical pass")
+	}
+	if entry.NodeID != "f-same" || entry.RemoteEtag != "etag-remote" {
+		t.Errorf("entry = %+v, want NodeID f-same, RemoteEtag etag-remote", entry)
+	}
+}
+
+// A file present on both sides at first sync whose content-MD5 lookup comes
+// back with no match at all (e.g. the remote copy predates content-MD5
+// support, or genuinely has different bytes) must still fall through to the
+// ordinary conflict-mode resolution — a miss is "unverifiable", never treated
+// as proof of a difference that skips the transfer, but it must not skip the
+// transfer either.
+func TestReconcileAllFallsBackToConflictModeWhenMD5NotMatched(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".config", "brick"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	syncFolder := t.TempDir()
+	if err := os.WriteFile(filepath.Join(syncFolder, "differs.txt"), []byte("local bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var uploaded atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/accounts/acct-1/nodes/root/children", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, storageNodeList{
+			Data:  []storageNode{{ID: "f-differs", ParentID: "root", Name: "differs.txt", NodeType: "file", Etag: "etag-remote"}},
+			Count: 1,
+		})
+	})
+	mux.HandleFunc("/v1/accounts/acct-1/files/exists/md5", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"results": []map[string]any{
+				{"exists": false, "matches": []map[string]any{}},
+			},
+		})
+	})
+	mux.HandleFunc("/v1/accounts/acct-1/files/f-differs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "unexpected method "+r.Method, http.StatusMethodNotAllowed)
+			return
+		}
+		uploaded.Store(true)
+		writeJSON(w, http.StatusOK, storageUploadResult{Node: storageNode{ID: "f-differs", Etag: "etag-new"}})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	eng := &syncEngine{
+		sc: &storageClient{
+			baseURL:   server.URL,
+			apiURL:    server.URL,
+			accountID: "acct-1",
+			cfg:       &Config{AccessToken: "test-token"},
+		},
+		folder:          syncFolder,
+		accountID:       "acct-1",
+		rootID:          "root",
+		firstSync:       true,
+		conflictMode:    "brick",
+		state:           &SyncState{Folder: syncFolder, Entries: map[string]SyncEntry{}, Folders: map[string]bool{}, FolderIDs: map[string]string{}},
+		recentlyWritten: map[string]time.Time{},
+	}
+
+	if err := eng.reconcileAll(context.Background()); err != nil {
+		t.Fatalf("reconcileAll error = %v, want nil", err)
+	}
+	if !uploaded.Load() {
+		t.Error("local copy was not uploaded: an unmatched md5 lookup should still fall back to conflictMode resolution")
+	}
+}
+
+// The MD5 verification must not be limited to the account's very first ever
+// sync (e.firstSync). A folder can end up holding a file with no sync-state
+// entry well after onboarding too — e.g. the state file was reset, or a file
+// was copied in from another already-synced device — and that case must be
+// verified against the server just the same, not silently re-downloaded.
+func TestReconcileAllSkipsUnsyncedFileWhenMD5VerifiedAfterOnboarding(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".config", "brick"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	syncFolder := t.TempDir()
+	content := []byte("identical content")
+	if err := os.WriteFile(filepath.Join(syncFolder, "same.txt"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	localMD5, err := hashFileMD5(filepath.Join(syncFolder, "same.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var downloaded, existsChecked atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/accounts/acct-1/nodes/root/children", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, storageNodeList{
+			Data:  []storageNode{{ID: "f-same", ParentID: "root", Name: "same.txt", NodeType: "file", Etag: "etag-remote", SizeBytes: int64(len(content))}},
+			Count: 1,
+		})
+	})
+	mux.HandleFunc("/v1/accounts/acct-1/files/exists/md5", func(w http.ResponseWriter, r *http.Request) {
+		existsChecked.Store(true)
+		var req struct {
+			Files []struct {
+				MD5 string `json:"md5"`
+			} `json:"files"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode exists/md5 request: %v", err)
+		}
+		if len(req.Files) != 1 || req.Files[0].MD5 != localMD5 {
+			t.Errorf("exists/md5 request = %+v, want one file with md5 %q", req.Files, localMD5)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"results": []map[string]any{
+				{
+					"exists": true,
+					"matches": []map[string]any{
+						{"nodeId": "f-same", "path": "/same.txt", "name": "same.txt", "sizeBytes": len(content)},
+					},
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/v1/accounts/acct-1/files/f-same", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "unexpected method "+r.Method, http.StatusMethodNotAllowed)
+			return
+		}
+		downloaded.Store(true)
+		w.Header().Set("ETag", `"etag-remote"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	eng := &syncEngine{
+		sc: &storageClient{
+			baseURL:   server.URL,
+			apiURL:    server.URL,
+			accountID: "acct-1",
+			cfg:       &Config{AccessToken: "test-token"},
+		},
+		folder:    syncFolder,
+		accountID: "acct-1",
+		rootID:    "root",
+		// The gap this test guards against: firstSync is false, as it would
+		// be for any brick sync run after onboarding — yet same.txt still has
+		// no sync-state entry (state file reset, or file copied in fresh).
+		firstSync:       false,
+		conflictMode:    "device",
+		state:           &SyncState{Folder: syncFolder, Entries: map[string]SyncEntry{}, Folders: map[string]bool{}, FolderIDs: map[string]string{}},
+		recentlyWritten: map[string]time.Time{},
+	}
+
+	if err := eng.reconcileAll(context.Background()); err != nil {
+		t.Fatalf("reconcileAll error = %v, want nil", err)
+	}
+	if !existsChecked.Load() {
+		t.Error("exists/md5 was never called even though same.txt had no sync-state entry")
+	}
+	if downloaded.Load() {
+		t.Error("remote copy was downloaded even though content was verified identical")
+	}
+	entry, ok := eng.state.Entries["same.txt"]
+	if !ok {
+		t.Fatal("same.txt has no sync entry after a verified-identical pass")
+	}
+	if entry.NodeID != "f-same" || entry.RemoteEtag != "etag-remote" {
+		t.Errorf("entry = %+v, want NodeID f-same, RemoteEtag etag-remote", entry)
 	}
 }
