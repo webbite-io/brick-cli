@@ -2258,6 +2258,52 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 	return nil
 }
 
+// spinnerFrames animates runWithSpinner — the standard Braille spinner used
+// by many other CLIs, which reads as motion in effectively every terminal.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// runWithSpinner prints label with an animated spinner while fn runs, then
+// replaces the spinner in place with "done" (or the error) once it returns.
+// On a non-TTY stdout (piped/redirected/logged) it prints label as a single
+// static line instead and skips the animation entirely, so the \r-driven
+// redraw never corrupts non-interactive output.
+func runWithSpinner(label string, fn func() error) error {
+	if !term.IsTerminal(os.Stdout.Fd()) {
+		fmt.Println(label)
+		return fn()
+	}
+
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(80 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		fmt.Printf("\r\033[K%s %s", label, spinnerFrames[i])
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				i = (i + 1) % len(spinnerFrames)
+				fmt.Printf("\r\033[K%s %s", label, spinnerFrames[i])
+			}
+		}
+	}()
+
+	err := fn()
+	close(stop)
+	<-stopped // wait for the goroutine's last write before printing the result, or the two would interleave
+
+	if err != nil {
+		fmt.Printf("\r\033[K%s failed: %v\n", label, err)
+	} else {
+		fmt.Printf("\r\033[K%s done\n", label)
+	}
+	return err
+}
+
 // runSyncDryRun reports what `brick sync` would do right now — every file
 // that would be uploaded, downloaded, or otherwise changed — without
 // transferring, deleting, or writing anything: no instance lock is taken, no
@@ -2286,17 +2332,31 @@ func runSyncDryRun(apiURL, storageURL string) error {
 
 	ctx := context.Background()
 	fmt.Println("Comparing local and remote files...")
-	remoteFiles, _, _, err := eng.buildRemoteTree(ctx)
-	if err != nil {
+
+	var remoteFiles map[string]storageNode
+	if err := runWithSpinner("Fetching folder tree from Brick...", func() error {
+		var buildErr error
+		remoteFiles, _, _, buildErr = eng.buildRemoteTree(ctx)
+		return buildErr
+	}); err != nil {
 		return fmt.Errorf("could not read remote files: %w", err)
 	}
-	localFiles, _, err := eng.buildLocalTree()
-	if err != nil {
-		return fmt.Errorf("could not read local files: %w", err)
-	}
+
+	var localFiles map[string]int64
 	// Same content-MD5 comparison the real sync would make, so a dry run
 	// reports the same skip decisions it would actually make.
-	verifiedIdentical := eng.verifyUnsyncedFileMatches(remoteFiles, localFiles)
+	var verifiedIdentical map[string]bool
+	if err := runWithSpinner("Comparing local files with folder tree...", func() error {
+		var buildErr error
+		localFiles, _, buildErr = eng.buildLocalTree()
+		if buildErr != nil {
+			return buildErr
+		}
+		verifiedIdentical = eng.verifyUnsyncedFileMatches(remoteFiles, localFiles)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("could not read local files: %w", err)
+	}
 
 	keys := map[string]struct{}{}
 	for k := range remoteFiles {
