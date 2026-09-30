@@ -645,6 +645,23 @@ func (c *wsConn) Write(b []byte) (int, error) {
 
 func (c *wsConn) Close() error { return c.ws.Close() }
 
+// closeGracefully sends a proper WebSocket close control frame before the
+// connection is torn down, so the storage API sees an intentional disconnect
+// (code 1000 "normal closure") instead of the raw TCP drop that
+// yamux.Session.Close()/wsConn.Close() alone produces — which the server logs
+// as an alarming-looking "close 1006 (abnormal closure): unexpected EOF",
+// even on an entirely ordinary Ctrl-C. Bounded by a short write deadline so a
+// slow or already-dead peer can never block shutdown on it. Guarded by the
+// same mutex as every other write: gorilla's *websocket.Conn forbids
+// concurrent writers, and both the ping goroutine and yamux (via Write) write
+// to this same connection.
+func (c *wsConn) closeGracefully() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "client shutting down")
+	_ = c.ws.WriteControl(websocket.CloseMessage, msg, time.Now().Add(2*time.Second))
+}
+
 // proxyAgentStream reads a single HTTP request off stream, forwards it to the
 // local agent HTTP API at agentAddr, and writes the response back. The storage
 // API opens one yamux stream per proxied request, so this handles exactly one
@@ -770,6 +787,13 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 	for {
 		select {
 		case <-ctx.Done():
+			// A deliberate local shutdown (Ctrl-C, detach, ...) — send a
+			// proper close frame before the deferred session.Close()/ws.Close()
+			// above drop the raw connection, so the server logs a clean
+			// disconnect rather than an abnormal-closure error. Only this
+			// branch does: the errCh case below means the connection is
+			// already gone, with nothing left to send a close frame over.
+			conn.closeGracefully()
 			return nil
 		case err := <-errCh:
 			return fmt.Errorf("Session closed: %w", err)
