@@ -637,6 +637,19 @@ type syncEngine struct {
 	// without the endpoint, say — from logging on every remote change. Quota
 	// is decoration around syncing, so one report of the problem is enough.
 	quotaErrOnce sync.Once
+
+	// wrapFetchRemote and wrapCompareLocal, when set, wrap reconcileAll's
+	// buildRemoteTree/buildLocalTree calls with a spinner — the same
+	// "Fetching folder tree from Brick..." / "Comparing local files with
+	// folder tree..." rows `sync --dry-run` shows, rendered either into the
+	// interactive TUI's log pane or directly on stdout (see runWithSpinner
+	// and runWithSpinnerTUI). runSyncLoop sets these only around the initial
+	// bootstrap reconcileAll call and clears them immediately after, so later
+	// debounce- or poll-triggered passes run silently as before — those are
+	// normally fast enough that a spinner would just be noise. nil (the
+	// default) for every pass, in which case the wrapped call runs directly.
+	wrapFetchRemote  func(fn func() error) error
+	wrapCompareLocal func(fn func() error) error
 }
 
 // controlInFlight describes the single file transfer in progress, if any.
@@ -648,7 +661,7 @@ type controlInFlight struct {
 // controlActivityEvent is one entry in the bounded recent-activity feed the
 // engine keeps for the interactive banner.
 type controlActivityEvent struct {
-	Kind    string    `json:"kind"` // "upload" | "download" | "update" | "trash" | "remove" | "keep-both" | "verify"
+	Kind    string    `json:"kind"` // "upload" | "download" | "update" | "trash" | "remove" | "keep-both"
 	RelPath string    `json:"relPath"`
 	At      time.Time `json:"at"`
 }
@@ -1138,11 +1151,34 @@ func (e *syncEngine) reconcileAll(ctx context.Context) (err error) {
 		}
 	}()
 
-	remoteFiles, remoteFolders, folderID, err := e.buildRemoteTree(ctx)
+	var remoteFiles, remoteFolders map[string]storageNode
+	var folderID map[string]string
+	fetchRemote := func() error {
+		var buildErr error
+		remoteFiles, remoteFolders, folderID, buildErr = e.buildRemoteTree(ctx)
+		return buildErr
+	}
+	if e.wrapFetchRemote != nil {
+		err = e.wrapFetchRemote(fetchRemote)
+	} else {
+		err = fetchRemote()
+	}
 	if err != nil {
 		return err
 	}
-	localFiles, localDirs, err := e.buildLocalTree()
+
+	var localFiles map[string]int64
+	var localDirs map[string]bool
+	compareLocal := func() error {
+		var buildErr error
+		localFiles, localDirs, buildErr = e.buildLocalTree()
+		return buildErr
+	}
+	if e.wrapCompareLocal != nil {
+		err = e.wrapCompareLocal(compareLocal)
+	} else {
+		err = compareLocal()
+	}
 	if err != nil {
 		return err
 	}
@@ -1629,6 +1665,12 @@ func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles 
 			// up holding files with no sync-state entry well after onboarding
 			// too — e.g. the state file was reset, or files were copied in
 			// from another already-synced device.
+			// Deliberately silent: this is normal steady-state (everything
+			// pre-existing that already matches), not an event worth a log
+			// line or an activity-feed entry — those are reserved for files
+			// actually transferred. On a folder copied over from another
+			// device this can be nearly every file, and logging each one
+			// would drown out the handful that actually needed syncing.
 			e.state.Entries[rel] = SyncEntry{
 				RelPath:    rel,
 				NodeID:     remoteNode.ID,
@@ -1637,8 +1679,6 @@ func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles 
 				LocalSize:  localFiles[rel],
 				SyncedAt:   time.Now(),
 			}
-			log.Printf("✓  %s already in sync (content verified)", rel)
-			e.publishActivity("verify", rel)
 			return nil
 		case e.firstSync && !hasEntry:
 			// Present on both sides with no prior sync history and not
@@ -2258,21 +2298,18 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 	return nil
 }
 
-// spinnerFrames animates runWithSpinner — the standard Braille spinner used
-// by many other CLIs, which reads as motion in effectively every terminal.
+// spinnerFrames animates runWithSpinnerVia — the standard Braille spinner
+// used by many other CLIs, which reads as motion in effectively every
+// terminal.
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-// runWithSpinner prints label with an animated spinner while fn runs, then
-// replaces the spinner in place with "done" (or the error) once it returns.
-// On a non-TTY stdout (piped/redirected/logged) it prints label as a single
-// static line instead and skips the animation entirely, so the \r-driven
-// redraw never corrupts non-interactive output.
-func runWithSpinner(label string, fn func() error) error {
-	if !term.IsTerminal(os.Stdout.Fd()) {
-		fmt.Println(label)
-		return fn()
-	}
-
+// runWithSpinnerVia calls render every 80ms with label and the current
+// spinner frame while fn runs, then once more with the finished result
+// ("label done", or "label failed: <err>") once it returns — agnostic to
+// where those actually get drawn, so the same animation loop can drive both a
+// plain terminal (runWithSpinner, \r-redraw) and the interactive sync TUI's
+// log pane (runWithSpinnerTUI, a replace-in-place scrollback line).
+func runWithSpinnerVia(render func(text string, final bool), label string, fn func() error) error {
 	stop := make(chan struct{})
 	stopped := make(chan struct{})
 	go func() {
@@ -2280,28 +2317,57 @@ func runWithSpinner(label string, fn func() error) error {
 		ticker := time.NewTicker(80 * time.Millisecond)
 		defer ticker.Stop()
 		i := 0
-		fmt.Printf("\r\033[K%s %s", label, spinnerFrames[i])
+		render(fmt.Sprintf("%s %s", label, spinnerFrames[i]), false)
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
 				i = (i + 1) % len(spinnerFrames)
-				fmt.Printf("\r\033[K%s %s", label, spinnerFrames[i])
+				render(fmt.Sprintf("%s %s", label, spinnerFrames[i]), false)
 			}
 		}
 	}()
 
 	err := fn()
 	close(stop)
-	<-stopped // wait for the goroutine's last write before printing the result, or the two would interleave
+	<-stopped // wait for the goroutine's last frame before the final render, or the two would interleave
 
 	if err != nil {
-		fmt.Printf("\r\033[K%s failed: %v\n", label, err)
+		render(fmt.Sprintf("%s failed: %v", label, err), true)
 	} else {
-		fmt.Printf("\r\033[K%s done\n", label)
+		render(fmt.Sprintf("%s done", label), true)
 	}
 	return err
+}
+
+// runWithSpinner prints label with an animated spinner directly on stdout
+// while fn runs — used by `sync --dry-run`, a plain one-shot command with no
+// TUI to route through. On a non-TTY stdout (piped/redirected/logged) it
+// prints label as a single static line instead and skips the animation
+// entirely, so the \r-driven redraw never corrupts non-interactive output.
+func runWithSpinner(label string, fn func() error) error {
+	if !term.IsTerminal(os.Stdout.Fd()) {
+		fmt.Println(label)
+		return fn()
+	}
+	return runWithSpinnerVia(func(text string, final bool) {
+		fmt.Printf("\r\033[K%s", text)
+		if final {
+			fmt.Println()
+		}
+	}, label, fn)
+}
+
+// runWithSpinnerTUI runs fn while animating label as a single line in the
+// interactive sync TUI's log pane, replaced in place each frame (see
+// spinnerLineMsg in tui.go) rather than pushed as a new scrollback line every
+// tick. Sent directly to prog rather than through the log package, so unlike
+// every other line in that pane, it is never mirrored into brick.log.
+func runWithSpinnerTUI(prog *tea.Program, label string, fn func() error) error {
+	return runWithSpinnerVia(func(text string, final bool) {
+		prog.Send(spinnerLineMsg{text: text, done: final})
+	}, label, fn)
 }
 
 // runSyncDryRun reports what `brick sync` would do right now — every file
@@ -2620,17 +2686,47 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 		log.Printf("could not read server time for incremental sync: %v", btErr)
 	}
 
+	// Wrap just this bootstrap pass's tree-fetch and local-compare steps with
+	// a spinner — the same "Fetching folder tree from Brick..." / "Comparing
+	// local files with folder tree..." rows `sync --dry-run` shows for the
+	// same two steps, so a slow account doesn't look hung during what's
+	// normally the slowest reconcile pass of the whole run. Rendered directly
+	// into the TUI's log pane (interactive) or straight to stdout (plain
+	// mode) rather than through the log package, so — unlike every actual
+	// change reconcileAll goes on to log (uploads, downloads, ...) — neither
+	// row is ever written to brick.log. Cleared right after so any later
+	// debounce- or poll-triggered pass this sync's lifetime runs silently, as
+	// those are normally fast enough that a spinner would just be noise.
+	if interactive {
+		eng.wrapFetchRemote = func(fn func() error) error {
+			return runWithSpinnerTUI(prog, "Fetching folder tree from Brick...", fn)
+		}
+		eng.wrapCompareLocal = func(fn func() error) error {
+			return runWithSpinnerTUI(prog, "Comparing local files with folder tree...", fn)
+		}
+	} else {
+		eng.wrapFetchRemote = func(fn func() error) error {
+			return runWithSpinner("Fetching folder tree from Brick...", fn)
+		}
+		eng.wrapCompareLocal = func(fn func() error) error {
+			return runWithSpinner("Comparing local files with folder tree...", fn)
+		}
+	}
+
 	// Initial full reconciliation (pulls everything, pushes local-only files).
 	// If the user pauses partway through (see checkInterrupted), this returns
 	// errPausedMidPass having synced only some files; eng.firstSync stays true
 	// until a pass actually completes (set inside reconcileAll itself), and
 	// resuming re-triggers the debounce worker below to pick up the rest.
-	if err := eng.reconcileAll(ctx); err != nil {
-		if errors.Is(err, errSessionExpired) {
-			return false, err
+	reconcileErr := eng.reconcileAll(ctx)
+	eng.wrapFetchRemote = nil
+	eng.wrapCompareLocal = nil
+	if reconcileErr != nil {
+		if errors.Is(reconcileErr, errSessionExpired) {
+			return false, reconcileErr
 		}
-		if ctx.Err() == nil && !errors.Is(err, errPausedMidPass) {
-			log.Printf("initial sync error: %v", err)
+		if ctx.Err() == nil && !errors.Is(reconcileErr, errPausedMidPass) {
+			log.Printf("initial sync error: %v", reconcileErr)
 		}
 	}
 	if bootstrapTime > 0 {

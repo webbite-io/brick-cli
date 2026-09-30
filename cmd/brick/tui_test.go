@@ -36,6 +36,87 @@ func TestLogRingBelowCapacity(t *testing.T) {
 	}
 }
 
+func TestLogRingReplaceLastOverwritesMostRecentLine(t *testing.T) {
+	var r logRing
+	r.push("a")
+	r.push("b")
+	r.replaceLast("b-updated")
+	all := r.all()
+	if got := strings.Join(all, ","); got != "a,b-updated" {
+		t.Errorf("all() = %q, want \"a,b-updated\"", got)
+	}
+}
+
+func TestLogRingReplaceLastOnEmptyRingPushes(t *testing.T) {
+	var r logRing
+	r.replaceLast("first")
+	all := r.all()
+	if got := strings.Join(all, ","); got != "first" {
+		t.Errorf("all() = %q, want \"first\"", got)
+	}
+}
+
+// Successive spinner frames for the same in-progress spinner must redraw one
+// line in place, not flood the scrollback with one line per tick — see
+// runWithSpinnerTUI.
+func TestSyncTUIModelSpinnerFramesReplaceInPlace(t *testing.T) {
+	m := newSyncTUIModel("1.2.3", "/sync/folder", func() {}, new(atomic.Bool), func() {})
+	m.Update(logLineMsg("2026-09-30 12:00:00 sync starting"))
+	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... ⠋", done: false})
+	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... ⠙", done: false})
+	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... ⠹", done: false})
+
+	all := m.ring.all()
+	if len(all) != 2 {
+		t.Fatalf("ring has %d lines, want 2 (the log line, plus one spinner line kept in place across 3 frames): %v", len(all), all)
+	}
+	if want := "Fetching folder tree from Brick... ⠹"; all[1] != want {
+		t.Errorf("last line = %q, want %q", all[1], want)
+	}
+}
+
+// The finished frame (done: true) still replaces the spinner's own line, but
+// afterward a new spinner (a fresh label) must start its own new line rather
+// than continuing to overwrite the finished one.
+func TestSyncTUIModelSpinnerDoneThenNewSpinnerStartsFreshLine(t *testing.T) {
+	m := newSyncTUIModel("1.2.3", "/sync/folder", func() {}, new(atomic.Bool), func() {})
+	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... ⠋", done: false})
+	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... done", done: true})
+	m.Update(spinnerLineMsg{text: "Comparing local files with folder tree... ⠋", done: false})
+
+	all := m.ring.all()
+	if len(all) != 2 {
+		t.Fatalf("ring has %d lines, want 2 (one finished spinner line, one new in-progress spinner line): %v", len(all), all)
+	}
+	if want := "Fetching folder tree from Brick... done"; all[0] != want {
+		t.Errorf("first line = %q, want %q", all[0], want)
+	}
+	if want := "Comparing local files with folder tree... ⠋"; all[1] != want {
+		t.Errorf("second line = %q, want %q", all[1], want)
+	}
+}
+
+// An ordinary log line arriving while a spinner is mid-animation (which
+// nothing currently does concurrently, but nothing prevents either) must not
+// be clobbered by the spinner's next frame update.
+func TestSyncTUIModelLogLineDuringSpinnerIsNotOverwritten(t *testing.T) {
+	m := newSyncTUIModel("1.2.3", "/sync/folder", func() {}, new(atomic.Bool), func() {})
+	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... ⠋", done: false})
+	m.Update(logLineMsg("2026-09-30 12:00:00 unrelated log line"))
+	m.Update(spinnerLineMsg{text: "Fetching folder tree from Brick... ⠙", done: false})
+
+	all := m.ring.all()
+	if len(all) != 3 {
+		t.Fatalf("ring has %d lines, want 3: %v", len(all), all)
+	}
+	if want := "2026-09-30 12:00:00 unrelated log line"; all[1] != want {
+		t.Errorf("middle line = %q, want %q (must survive untouched)", all[1], want)
+	}
+	if want := "Fetching folder tree from Brick... ⠙"; all[2] != want {
+		t.Errorf("last line = %q, want %q (a new line, not a replacement of the log line)", all[2], want)
+	}
+}
+
 func TestFilterLinesHidesNonMatches(t *testing.T) {
 	lines := []string{
 		"downloaded Obsidian/Matinköp.md",

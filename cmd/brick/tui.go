@@ -36,6 +36,19 @@ func (r *logRing) push(line string) {
 	}
 }
 
+// replaceLast overwrites the most recently pushed line in place instead of
+// appending a new one — how an in-progress spinnerLineMsg redraws itself each
+// frame without flooding the scrollback with one line per tick. Behaves like
+// push on an empty ring.
+func (r *logRing) replaceLast(line string) {
+	if r.count == 0 {
+		r.push(line)
+		return
+	}
+	idx := (r.start + r.count - 1) % logRingCap
+	r.lines[idx] = line
+}
+
 // all returns every buffered line, oldest first.
 func (r *logRing) all() []string {
 	out := make([]string, r.count)
@@ -48,6 +61,18 @@ func (r *logRing) all() []string {
 // logLineMsg carries one already-formatted log line (as produced by the
 // standard log package, see tuiLogWriter) into the TUI's Update loop.
 type logLineMsg string
+
+// spinnerLineMsg carries one frame (done == false) or the finished result
+// (done == true) of an in-progress spinner — see runWithSpinnerTUI — sent
+// directly to the program rather than through the log package, so unlike an
+// ordinary logLineMsg it is never mirrored into brick.log. Each frame
+// replaces the previous one in the log pane in place (logRing.replaceLast),
+// mimicking a real terminal spinner instead of pushing a new scrollback line
+// on every tick.
+type spinnerLineMsg struct {
+	text string
+	done bool
+}
 
 // quotaMsg carries a refreshed storage quota into the TUI's Update loop; see
 // syncEngine.onQuota.
@@ -134,6 +159,15 @@ type syncTUIModel struct {
 	viewport  viewport.Model
 	following bool // true = auto-scroll to the newest line as it arrives
 
+	// spinnerActive is true while the ring's last line is an in-progress
+	// spinnerLineMsg's own frame, so the next spinnerLineMsg replaces it in
+	// place instead of pushing a new scrollback line. Cleared once that
+	// spinner reports done, and defensively by any ordinary logLineMsg too,
+	// so an unrelated log line landing mid-spinner (which nothing currently
+	// does concurrently, but nothing prevents it either) can never be
+	// mistaken for the spinner's own line and overwritten.
+	spinnerActive bool
+
 	quota  *storageQuota
 	paused bool
 
@@ -178,6 +212,20 @@ func (m *syncTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case logLineMsg:
 		m.ring.push(string(msg))
+		m.spinnerActive = false
+		m.refreshContent()
+		return m, nil
+
+	case spinnerLineMsg:
+		if m.spinnerActive {
+			m.ring.replaceLast(msg.text)
+		} else {
+			m.ring.push(msg.text)
+			m.spinnerActive = true
+		}
+		if msg.done {
+			m.spinnerActive = false
+		}
 		m.refreshContent()
 		return m, nil
 
