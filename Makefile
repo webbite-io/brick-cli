@@ -172,10 +172,14 @@ release: build-all
 	@echo ""
 	@echo "$(COLOR_BOLD)$(COLOR_BLUE)Generating checksums...$(COLOR_RESET)"
 	@cd $(DIST_DIR) && \
+	archives=""; \
+	for f in *.tar.gz *.zip; do \
+		[ -f "$$f" ] && archives="$$archives $$f"; \
+	done; \
 	if command -v shasum >/dev/null 2>&1; then \
-		shasum -a 256 *.tar.gz *.zip 2>/dev/null > SHA256SUMS; \
+		shasum -a 256 $$archives > SHA256SUMS; \
 	else \
-		sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS; \
+		sha256sum $$archives > SHA256SUMS; \
 	fi
 	@echo "$(COLOR_GREEN)✓ Release archives created$(COLOR_RESET)"
 	@echo ""
