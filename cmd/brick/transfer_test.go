@@ -33,6 +33,9 @@ type fakeStorageAPI struct {
 	mu     sync.Mutex
 	nodes  map[string]*fakeNode
 	nextID int
+	// failNextDownload makes that many subsequent file downloads fail with a
+	// 500, for exercising a transfer that fails and has to be retried.
+	failNextDownload int
 }
 
 func newFakeStorageAPI() *fakeStorageAPI {
@@ -168,6 +171,11 @@ func (fs *fakeStorageAPI) mux(accountID string) http.Handler {
 		}
 		switch r.Method {
 		case http.MethodGet:
+			if fs.failNextDownload > 0 {
+				fs.failNextDownload--
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "injected failure"})
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(n.data)
 		case http.MethodPut:

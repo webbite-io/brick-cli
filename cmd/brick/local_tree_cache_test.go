@@ -184,3 +184,39 @@ func TestReconcileLocalChangesExpandsRemovedDirectoryContents(t *testing.T) {
 		t.Error(`state.Folders["gone"] still true, want it dropped once the folder itself was trashed`)
 	}
 }
+
+// A transfer that fails leaves nothing for a later pass to notice: the file
+// changes no further, so it appears in no later check-updates delta and in no
+// later watcher event. The pass it failed in therefore has to leave the next one
+// on the full key union, which is what retries it — otherwise it waits for the
+// ~30 minute periodic backstop.
+func TestFailedTransferIsRetriedByTheNextScopedPass(t *testing.T) {
+	eng, fs := newLocalTreeCacheTestEngine(t)
+	ctx := context.Background()
+
+	fs.mu.Lock()
+	fs.nodes["r1"] = &fakeNode{
+		storageNode: storageNode{ID: "r1", ParentID: "root", Name: "a.txt", NodeType: "file", SizeBytes: 1},
+		data:        []byte("A"),
+	}
+	fs.failNextDownload = 1
+	fs.mu.Unlock()
+
+	if err := eng.reconcileAll(ctx); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(eng.folder, "a.txt")); err == nil {
+		t.Fatal("the download should have failed")
+	}
+
+	// Nothing is reported as changed on either side, so scoping this pass would
+	// have it check nothing at all.
+	if err := eng.reconcileLocalChanges(ctx, nil); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(eng.folder, "a.txt"))
+	if err != nil || string(data) != "A" {
+		t.Errorf("a.txt = %q (err=%v), want it retried and downloaded", data, err)
+	}
+}

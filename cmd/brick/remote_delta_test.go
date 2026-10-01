@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // newDeltaTestEngine builds a syncEngine with a pre-populated remote-tree
 // cache (as if a prior full walk or delta had already seeded it), with no
@@ -128,5 +131,53 @@ func TestApplyRemoteDeltaRelocatesMovedFile(t *testing.T) {
 		if !got[rel] {
 			t.Errorf("affected missing %q", rel)
 		}
+	}
+}
+
+// A folder this client created itself, then moved remotely before check-updates
+// ever reported its creation. The move's row carries only the new path, so the
+// ID index ensureRemoteFolder maintains is the only thing that can say which rel
+// the folder moved away from. Without it the old rel survives in the cache as a
+// folder that no longer exists — recreated on disk by pass 2, and then claimed
+// by the same node ID as the new rel, leaving applyRemoteFolderMoves to choose
+// between the two by map-iteration order and rename the folder back and forth
+// until the next full walk.
+func TestEnsureRemoteFolderIndexesCreatedFolderForLaterMoves(t *testing.T) {
+	sc, _ := newTestTransferClient(t)
+	e := &syncEngine{
+		sc:                 sc,
+		rootID:             "root",
+		remoteTreeFiles:    map[string]storageNode{},
+		remoteTreeFolders:  map[string]storageNode{},
+		remoteTreeFolderID: map[string]string{"": "root"},
+		state: &SyncState{
+			Entries:   map[string]SyncEntry{},
+			Folders:   map[string]bool{},
+			FolderIDs: map[string]string{},
+		},
+	}
+	e.remoteTreeIDToRel = buildRemoteIDIndex(e.remoteTreeFiles, e.remoteTreeFolders)
+
+	id, err := e.ensureRemoteFolder(context.Background(), "Docs", e.remoteTreeFolders, e.remoteTreeFolderID)
+	if err != nil {
+		t.Fatalf("ensureRemoteFolder: %v", err)
+	}
+	if e.remoteTreeIDToRel[id] != "Docs" {
+		t.Fatalf("remoteTreeIDToRel[%q] = %q, want %q right after creating it", id, e.remoteTreeIDToRel[id], "Docs")
+	}
+
+	e.applyRemoteDelta([]storageNode{{ID: id, NodeType: "folder", Path: "/Archive"}})
+
+	if _, ok := e.remoteTreeFolders["Docs"]; ok {
+		t.Error(`remoteTreeFolders["Docs"] still cached after the move: a phantom folder`)
+	}
+	if _, ok := e.remoteTreeFolderID["Docs"]; ok {
+		t.Error(`remoteTreeFolderID["Docs"] still cached after the move`)
+	}
+	if node, ok := e.remoteTreeFolders["Archive"]; !ok || node.ID != id {
+		t.Errorf(`remoteTreeFolders["Archive"] = %+v (ok=%v), want the moved folder`, node, ok)
+	}
+	if e.remoteTreeIDToRel[id] != "Archive" {
+		t.Errorf(`remoteTreeIDToRel[%q] = %q, want "Archive"`, id, e.remoteTreeIDToRel[id])
 	}
 }

@@ -756,12 +756,13 @@ type syncEngine struct {
 	// it" without a linear scan of the tree, by finding the rel path a
 	// node's ID was cached under before this delta arrived. Kept in sync
 	// incrementally by applyRemoteDelta and rewriteRemotePrefix; rebuilt
-	// from scratch alongside every full buildRemoteTree walk. A stale entry
-	// left behind by an in-pass mutation reconcileAllImpl makes directly to
-	// remoteTreeFiles/Folders (ensureRemoteFolder, pruneRemoteSubtree) is
-	// harmless and self-heals the next time that node's own change is
-	// reported, since check-updates always echoes back a client's own writes
-	// too.
+	// from scratch alongside every full buildRemoteTree walk, and maintained
+	// incrementally by everything that moves a cached node: applyRemoteDelta,
+	// rewriteRemotePrefix, ensureRemoteFolder and pruneRemoteSubtree. An
+	// uploaded *file* needs no entry here — recordUpload caches nothing for the
+	// delta to contradict, so the first report of it is simply a new node — but
+	// a folder this client created does, since it is in the cached tree already
+	// and a move of it has to be told apart from a first sighting.
 	remoteTreeIDToRel map[string]string
 
 	// localTree{Files,Dirs} mirror the local sync folder the same way
@@ -1877,6 +1878,7 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullWalk bool, c
 			keys[k] = struct{}{}
 		}
 	}
+	filesFailed := false
 	for rel := range keys {
 		if err := e.checkInterrupted(ctx); err != nil {
 			return err
@@ -1885,13 +1887,18 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullWalk bool, c
 			if errors.Is(err, errSessionExpired) {
 				return err
 			}
+			filesFailed = true
 			log.Printf("sync %s: %v", rel, err)
 		}
 	}
-	// The file pass above ran to completion without being interrupted —
-	// every currently-known file has now been reconciled, so the next pass
-	// may safely trust a scoped affected-rels set again (see wasConverged).
-	e.filesConverged = true
+	// Every currently-known file has now been reconciled, so the next pass may
+	// safely trust a scoped affected-rels set again (see wasConverged) — unless
+	// one of them failed. A failed transfer is in exactly the same position as
+	// a file an interrupted pass never reached: nothing about it changes again,
+	// so it appears in no later delta and no later watcher event, and only a
+	// full-union pass comes back to it. Leaving this false is what keeps the
+	// retry-on-next-pass that the full union used to provide for free.
+	e.filesConverged = !filesFailed
 
 	// 4. Push genuinely new local folders (not on the server and never synced).
 	//    This is what carries up empty directories the user just created; folders
@@ -2496,6 +2503,18 @@ func (e *syncEngine) ensureRemoteFolder(ctx context.Context, rel string, remoteF
 	}
 	folderID[rel] = node.ID
 	remoteFolders[rel] = *node
+	// The ID index has to learn about a folder we create as surely as about one
+	// check-updates reports, because the two can race: if this folder is moved
+	// remotely before its creation is ever reported, that delta carries only its
+	// new path, with nothing to say which rel it moved *from* — so applyRemoteDelta
+	// would add the new rel and leave the old one cached as a folder that no
+	// longer exists. Pass 2 then recreates it on disk, and from then on two rels
+	// claim this one node ID, leaving applyRemoteFolderMoves to pick between them
+	// by map-iteration order and rename the folder back and forth.
+	if e.remoteTreeIDToRel == nil {
+		e.remoteTreeIDToRel = map[string]string{}
+	}
+	e.remoteTreeIDToRel[node.ID] = rel
 	e.state.Folders[rel] = true
 	e.state.FolderIDs[rel] = node.ID
 	return node.ID, nil
