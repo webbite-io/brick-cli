@@ -127,10 +127,15 @@ func (fs *fakeStorageAPI) mux(accountID string) http.Handler {
 			return
 		}
 		fs.mu.Lock()
+		defer fs.mu.Unlock()
 		n, ok := fs.nodes[rest]
-		fs.mu.Unlock()
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		if r.Method == http.MethodDelete {
+			n.IsDeleted = true
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		writeJSON(w, http.StatusOK, n.storageNode)

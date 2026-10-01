@@ -242,6 +242,77 @@ func (sc *storageClient) checkUpdates(ctx context.Context, since int64) (changed
 	}
 }
 
+// checkUpdatesDeltaMaxPages bounds how many /check-updates pages
+// checkUpdatesDelta will collect before giving up on patching the cached
+// remote tree in place and telling its caller to fall back to a real walk
+// instead. A handful of pages (a few thousand rows) safely covers the
+// ordinary "someone edited a few files" case incremental patching exists
+// for; a backlog bigger than that (e.g. after being offline a long time, or
+// a bulk operation on the account) is cheaper and far less risky to resolve
+// with one real recursive walk than by carefully replaying thousands of
+// individual moves/renames onto an in-memory tree.
+const checkUpdatesDeltaMaxPages = 4
+
+// checkUpdatesDelta is checkUpdates' payload-carrying sibling: instead of
+// stopping at the first sign of a change, it collects every changed node
+// from `since` onward (following nextCursor across empty, filtered-out pages
+// exactly as checkUpdates does) so the caller can patch its own cached tree
+// directly instead of re-walking every folder with GET .../children just to
+// rediscover the same handful of nodes it was already told about.
+//
+// tooManyPages is true when the feed didn't finish within
+// checkUpdatesDeltaMaxPages pages; nodes is nil in that case and the caller
+// should fall back to a real walk rather than trust a partial delta.
+// serverTime is always the first page's, the same "earliest snapshot"
+// invariant checkUpdates documents, so adopting it as the next `since` can
+// never skip a change that landed mid-pagination.
+func (sc *storageClient) checkUpdatesDelta(ctx context.Context, since int64) (nodes []storageNode, serverTime int64, tooManyPages bool, err error) {
+	cursor := ""
+	haveServerTime := false
+	pages := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, false, err
+		}
+		path := fmt.Sprintf("/check-updates?since=%d&limit=%d", since, checkUpdatesPageLimit)
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		resp, reqErr := sc.request(ctx, "GET", path, nil, nil)
+		if reqErr != nil {
+			return nil, 0, false, reqErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			e := sc.errFrom(resp)
+			resp.Body.Close()
+			return nil, 0, false, e
+		}
+		var out struct {
+			Data       []storageNode `json:"data"`
+			ServerTime int64         `json:"serverTime"`
+			NextCursor string        `json:"nextCursor"`
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if decErr != nil {
+			return nil, 0, false, decErr
+		}
+		if !haveServerTime {
+			serverTime = out.ServerTime
+			haveServerTime = true
+		}
+		nodes = append(nodes, out.Data...)
+		pages++
+		if out.NextCursor == "" {
+			return nodes, serverTime, false, nil
+		}
+		if pages >= checkUpdatesDeltaMaxPages {
+			return nil, serverTime, true, nil
+		}
+		cursor = out.NextCursor
+	}
+}
+
 // serverNow returns the server's current clock (unix seconds) via a
 // /check-updates probe with a far-future `since`, so it comes back with an
 // empty change set in a single request. Used to seed the incremental cursor
@@ -678,6 +749,50 @@ type syncEngine struct {
 	remoteTreeFolders  map[string]storageNode
 	remoteTreeFolderID map[string]string
 	remoteTreeAsOf     int64
+	// remoteTreeIDToRel maps a remote node's ID to its current cached rel
+	// path, across both remoteTreeFiles and remoteTreeFolders. It exists
+	// solely so applyRemoteDelta can tell "this changed node is at a new
+	// path" (a move/rename) apart from "this is the first time we've seen
+	// it" without a linear scan of the tree, by finding the rel path a
+	// node's ID was cached under before this delta arrived. Kept in sync
+	// incrementally by applyRemoteDelta and rewriteRemotePrefix; rebuilt
+	// from scratch alongside every full buildRemoteTree walk. A stale entry
+	// left behind by an in-pass mutation reconcileAllImpl makes directly to
+	// remoteTreeFiles/Folders (ensureRemoteFolder, pruneRemoteSubtree) is
+	// harmless and self-heals the next time that node's own change is
+	// reported, since check-updates always echoes back a client's own writes
+	// too.
+	remoteTreeIDToRel map[string]string
+
+	// localTree{Files,Dirs} mirror the local sync folder the same way
+	// remoteTree{Files,Folders} mirror the remote one: a persistent snapshot,
+	// kept fresh either by a full buildLocalTree walk or by patching just the
+	// paths the filesystem watcher reported changed (see applyLocalChanges),
+	// so a single local edit doesn't require re-stat'ing every file in the
+	// folder to notice it. localTreeValid is false until the first walk
+	// populates them (also forced false is never needed after that: once
+	// this engine's process is watching the folder, every local change flows
+	// through markLocalChange/applyLocalChanges, so the cache never goes
+	// stale on its own). Guarded by e.mu like remoteTreeCache.
+	localTreeFiles map[string]int64
+	localTreeDirs  map[string]bool
+	localTreeValid bool
+
+	// filesConverged is true once a reconcileAllImpl pass has run its file
+	// pass (pass 3) to completion without being interrupted. See
+	// reconcileAllImpl's wasConverged comment for why pass 3's
+	// scoped-affected-rels shortcut requires this to have been true going
+	// into the pass, not just remoteIncremental/localIncremental.
+	filesConverged bool
+
+	// pendingMu guards pendingLocal, the set of rel paths the filesystem
+	// watcher has reported changed since the debounce worker last drained
+	// it. Deliberately a separate lock from e.mu: watcher events arrive on
+	// their own goroutine at any time, including while a reconcile pass
+	// already holds e.mu, and must never block on one just to record which
+	// path changed.
+	pendingMu    sync.Mutex
+	pendingLocal map[string]bool
 }
 
 // controlInFlight describes the single file transfer in progress, if any.
@@ -895,6 +1010,145 @@ func (e *syncEngine) isRecentlyWritten(abs string) bool {
 	return true
 }
 
+// markLocalChange records that the filesystem watcher saw activity at rel
+// (relative to e.folder, slash-separated) since the debounce worker last drained
+// the set. Safe to call from the watcher's own goroutine while a reconcile pass
+// is in progress.
+func (e *syncEngine) markLocalChange(rel string) {
+	if rel == "" || rel == "." {
+		return
+	}
+	e.pendingMu.Lock()
+	if e.pendingLocal == nil {
+		e.pendingLocal = map[string]bool{}
+	}
+	e.pendingLocal[rel] = true
+	e.pendingMu.Unlock()
+}
+
+// drainLocalChanges returns every rel path marked by markLocalChange since the
+// last drain and clears the set, so the debounce worker can reconcile exactly
+// what changed rather than treat every trigger as "something, somewhere,
+// changed". Returns nil (not just empty) when nothing was pending, which
+// callers use to distinguish "no known local changes" from "some local
+// changes".
+func (e *syncEngine) drainLocalChanges() []string {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	if len(e.pendingLocal) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(e.pendingLocal))
+	for p := range e.pendingLocal {
+		paths = append(paths, p)
+	}
+	e.pendingLocal = nil
+	return paths
+}
+
+// applyLocalChanges patches localTreeFiles/localTreeDirs for exactly the rel
+// paths the filesystem watcher reported, instead of a full filepath.WalkDir of
+// the whole sync folder — the local counterpart of applyRemoteDelta. Returns
+// the file rels reconcileAllImpl's file pass needs to check this round: each
+// changed path itself (if it's a file), plus — for a directory that just
+// appeared — every file discovered by a walk scoped to that new subtree alone
+// (fsnotify fires one Create event for a directory moved or copied in from
+// elsewhere, never one per file already inside it), plus — for a directory
+// that's now gone — every file this engine last knew to live under it, read
+// from the sync index and the outgoing cache rather than the disk, since the
+// disk copy no longer exists to walk.
+//
+// Callers must hold e.mu (localTreeFiles/localTreeDirs follow the same rule as
+// remoteTreeCache).
+func (e *syncEngine) applyLocalChanges(changedPaths []string) []string {
+	seen := map[string]bool{}
+	var affected []string
+	add := func(rel string) {
+		if !seen[rel] {
+			seen[rel] = true
+			affected = append(affected, rel)
+		}
+	}
+
+	for _, rel := range changedPaths {
+		if rel == "" || rel == "." || strings.HasSuffix(rel, tmpSuffix) {
+			continue
+		}
+		abs := filepath.Join(e.folder, filepath.FromSlash(rel))
+		info, err := os.Lstat(abs)
+		if err != nil {
+			if e.localTreeDirs[rel] {
+				// A whole directory vanished (removed, or renamed away) —
+				// expand to every file we knew lived under it, since there's
+				// no disk copy left to walk.
+				prefix := rel + "/"
+				delete(e.localTreeDirs, rel)
+				for k := range e.localTreeDirs {
+					if strings.HasPrefix(k, prefix) {
+						delete(e.localTreeDirs, k)
+					}
+				}
+				for k := range e.localTreeFiles {
+					if k == rel || strings.HasPrefix(k, prefix) {
+						delete(e.localTreeFiles, k)
+						add(k)
+					}
+				}
+				// The index may know about descendants the local-tree cache
+				// doesn't (e.g. a file that was only ever synced, never
+				// itself part of an incremental patch) — sweep it too so a
+				// stale entry doesn't survive the removal unnoticed.
+				for k := range e.state.Entries {
+					if k == rel || strings.HasPrefix(k, prefix) {
+						add(k)
+					}
+				}
+			} else {
+				delete(e.localTreeFiles, rel)
+				add(rel)
+			}
+			continue
+		}
+		if info.IsDir() {
+			// A file at this exact rel a moment ago, replaced by a directory
+			// of the same name -> drop the stale file entry so a later
+			// lookup at rel doesn't see both.
+			delete(e.localTreeFiles, rel)
+			e.localTreeDirs[rel] = true
+			_ = filepath.WalkDir(abs, func(p string, d fs.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if p == abs {
+					return nil
+				}
+				if strings.HasSuffix(p, tmpSuffix) {
+					return nil
+				}
+				childRel := filepath.ToSlash(mustRel(e.folder, p))
+				if d.IsDir() {
+					e.localTreeDirs[childRel] = true
+					return nil
+				}
+				childInfo, infoErr := d.Info()
+				if infoErr != nil {
+					return infoErr
+				}
+				e.localTreeFiles[childRel] = childInfo.Size()
+				add(childRel)
+				return nil
+			})
+			continue
+		}
+		// Symmetric to the directory case above: a directory at this rel a
+		// moment ago, replaced by a file of the same name.
+		delete(e.localTreeDirs, rel)
+		e.localTreeFiles[rel] = info.Size()
+		add(rel)
+	}
+	return affected
+}
+
 // buildRemoteTree walks the remote node tree and returns files and folders keyed
 // by slash-separated path relative to the root, plus a folderID lookup ("" = root).
 func (e *syncEngine) buildRemoteTree(ctx context.Context) (files, folders map[string]storageNode, folderID map[string]string, err error) {
@@ -933,6 +1187,141 @@ func (e *syncEngine) buildRemoteTree(ctx context.Context) (files, folders map[st
 		}
 	}
 	return files, folders, folderID, nil
+}
+
+// buildRemoteIDIndex returns the ID -> rel path index applyRemoteDelta needs,
+// covering both files and folders. Rebuilt from scratch alongside every full
+// buildRemoteTree walk (see fetchRemote in reconcileAllImpl).
+func buildRemoteIDIndex(files, folders map[string]storageNode) map[string]string {
+	idx := make(map[string]string, len(files)+len(folders))
+	for rel, n := range files {
+		idx[n.ID] = rel
+	}
+	for rel, n := range folders {
+		idx[n.ID] = rel
+	}
+	return idx
+}
+
+// applyRemoteDelta patches remoteTreeFiles/remoteTreeFolders/remoteTreeFolderID
+// (and remoteTreeIDToRel) in place from a batch of changed nodes returned by
+// /check-updates, in place of a full recursive GET .../children walk of every
+// folder — the point of checkUpdatesDelta existing at all. nodes is expected to
+// be one checkUpdatesDelta call's worth (bounded by checkUpdatesDeltaMaxPages);
+// a backlog too big to fit that is handled by falling back to a real walk
+// instead of calling this, not by calling this repeatedly.
+//
+// A node with IsDeleted true is a trash (soft delete, or a purge of something
+// already trashed). brick-api's SoftDeleteNode bumps updated_at on every
+// descendant of a trashed folder too, not just the folder itself, so each one
+// is reported here individually — no manual subtree cascade is needed the way
+// pruneRemoteSubtree needs one when trashing a folder from this client.
+//
+// A node whose path changed without being deleted is either genuinely new
+// (no prior cached rel) or a move/rename (a prior cached rel under a
+// different path) — the latter needs the folder case to also carry its
+// already-cached descendants along, via rewriteRemotePrefix, since
+// check-updates does not bump a descendant's own updated_at just because an
+// ancestor moved: only the moved node's own row does.
+//
+// Returns the rel path of every file-type node the delta touched — the new
+// path for a live file, the path it was removed from for a trashed one —
+// which is exactly what reconcileAllImpl's file pass needs to know to react
+// (folders need no such list: passes 0-2/4/5 already scan the full, now
+// up-to-date, folder maps unconditionally).
+func (e *syncEngine) applyRemoteDelta(nodes []storageNode) (affectedFiles []string) {
+	if e.remoteTreeIDToRel == nil {
+		e.remoteTreeIDToRel = map[string]string{}
+	}
+	for _, n := range nodes {
+		rel := strings.Trim(n.Path, "/")
+		oldRel, hadOld := e.remoteTreeIDToRel[n.ID]
+		if n.IsDeleted {
+			removedRel := rel
+			if hadOld {
+				removedRel = oldRel
+				delete(e.remoteTreeFiles, oldRel)
+				delete(e.remoteTreeFolders, oldRel)
+				delete(e.remoteTreeFolderID, oldRel)
+				delete(e.remoteTreeIDToRel, n.ID)
+			} else if rel != "" {
+				// Not previously cached under any rel (e.g. it arrived and
+				// left within the same delta, or predates this process) —
+				// still worth a defensive delete at its reported path in
+				// case it's there under a stale assumption.
+				delete(e.remoteTreeFiles, rel)
+				delete(e.remoteTreeFolders, rel)
+				delete(e.remoteTreeFolderID, rel)
+			}
+			if n.NodeType == "file" && removedRel != "" {
+				affectedFiles = append(affectedFiles, removedRel)
+			}
+			continue
+		}
+		if rel == "" {
+			continue // no readable path on a live node shouldn't happen; skip rather than mis-file it at the root
+		}
+		switch n.NodeType {
+		case "folder":
+			if hadOld && oldRel != rel {
+				e.rewriteRemotePrefix(oldRel, rel)
+				delete(e.remoteTreeFolders, oldRel)
+				delete(e.remoteTreeFolderID, oldRel)
+			}
+			e.remoteTreeFolders[rel] = n
+			e.remoteTreeFolderID[rel] = n.ID
+			e.remoteTreeIDToRel[n.ID] = rel
+		case "file":
+			if hadOld && oldRel != rel {
+				delete(e.remoteTreeFiles, oldRel)
+				// The file itself may already have been mirrored to its new
+				// local path by pass 0 (applyRemoteFileMoves), which also
+				// migrates its index entry — but not always (no local copy to
+				// move, or the destination was already occupied). Include the
+				// old rel too so the file pass gets a chance to drop a stale
+				// index entry left behind at it either way.
+				affectedFiles = append(affectedFiles, oldRel)
+			}
+			e.remoteTreeFiles[rel] = n
+			e.remoteTreeIDToRel[n.ID] = rel
+			affectedFiles = append(affectedFiles, rel)
+		}
+	}
+	return affectedFiles
+}
+
+// rewriteRemotePrefix mirrors a folder's move/rename onto every remote-tree
+// entry cached under its old path (itself already handled by the caller),
+// the remote-cache counterpart of rewritePrefix — needed because
+// check-updates reports only the moved folder's own row, never its
+// descendants', whose *computed* paths change just the same.
+func (e *syncEngine) rewriteRemotePrefix(oldRel, newRel string) {
+	oldPrefix, newPrefix := oldRel+"/", newRel+"/"
+	rewrite := func(rel string) string {
+		return newPrefix + strings.TrimPrefix(rel, oldPrefix)
+	}
+	for k, v := range e.remoteTreeFolders {
+		if !strings.HasPrefix(k, oldPrefix) {
+			continue
+		}
+		nk := rewrite(k)
+		delete(e.remoteTreeFolders, k)
+		e.remoteTreeFolders[nk] = v
+		if id, ok := e.remoteTreeFolderID[k]; ok {
+			delete(e.remoteTreeFolderID, k)
+			e.remoteTreeFolderID[nk] = id
+		}
+		e.remoteTreeIDToRel[v.ID] = nk
+	}
+	for k, v := range e.remoteTreeFiles {
+		if !strings.HasPrefix(k, oldPrefix) {
+			continue
+		}
+		nk := rewrite(k)
+		delete(e.remoteTreeFiles, k)
+		e.remoteTreeFiles[nk] = v
+		e.remoteTreeIDToRel[v.ID] = nk
+	}
 }
 
 // buildLocalTree walks the sync folder and returns file paths (with sizes) and
@@ -1157,27 +1546,57 @@ func (e *syncEngine) rewritePrefix(oldRel, newRel string, localDirs map[string]b
 // remote delete/trash removes it locally); on content conflicts (both sides
 // changed the same file), remote wins.
 func (e *syncEngine) reconcileAll(ctx context.Context) error {
-	return e.reconcileAllImpl(ctx, false)
+	return e.reconcileAllImpl(ctx, false, nil)
 }
 
-// reconcileAllImpl is reconcileAll's actual body. forceFullRemoteWalk, when
-// true, makes the remote-tree-fetch step below always perform a real
-// recursive GET .../children walk of every folder, bypassing
-// remoteTreeCache entirely — set only by forceReconcile, for its periodic
-// hard-delete backstop pass (see forceReconcile's doc comment for why a
-// cached or check-updates-gated walk can't substitute for a true one
-// there). Deliberately a parameter rather than a shared engine field: this
+// reconcileLocalChanges is reconcileAll for the common case a filesystem
+// watcher event triggers: changedPaths are the rel paths the watcher actually
+// reported since the debounce worker last drained them (see markLocalChange/
+// drainLocalChanges in runSyncLoop), letting the local-tree-fetch step below
+// patch just those instead of a full filepath.WalkDir of the whole sync
+// folder. Falls back to that full walk on its own the first time it's ever
+// called (localTreeValid starts false), so callers don't need to special-case
+// a cold cache.
+func (e *syncEngine) reconcileLocalChanges(ctx context.Context, changedPaths []string) error {
+	return e.reconcileAllImpl(ctx, false, changedPaths)
+}
+
+// reconcileAllImpl is reconcileAll's actual body. forceFullWalk, when true,
+// makes both the remote- and local-tree-fetch steps below always perform a
+// real walk — a recursive GET .../children of every folder, and a real
+// filepath.WalkDir of the sync folder — bypassing remoteTreeCache and
+// localTreeFiles/localTreeDirs entirely. Set only by forceReconcile, for its
+// periodic backstop pass: the remote hard-deletes /check-updates can never
+// report (see forceReconcile's doc comment), and, symmetrically, any local
+// change a watcher gap (a dropped inotify event, a watch that failed to
+// register in time, running in poll-only mode) might have missed.
+// changedPaths is the local-tree-fetch counterpart of forceFullWalk's remote
+// side when it's false: the rel paths known to have changed locally this
+// round (nil when none are known, e.g. a pass triggered purely by a remote
+// change). Deliberately parameters rather than shared engine fields: this
 // method's own e.mu below only serializes the body, not however a caller
-// decided to invoke it, and forceReconcile runs on a different goroutine
-// than the debounce worker — a field set outside the lock could race a
-// concurrent call reading it inside the lock.
-func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullRemoteWalk bool) (err error) {
+// decided to invoke it, and forceReconcile runs on a different goroutine than
+// the debounce worker — a field set outside the lock could race a concurrent
+// call reading it inside the lock.
+func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullWalk bool, changedPaths []string) (err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if err := e.checkInterrupted(ctx); err != nil {
 		return err
 	}
+
+	// wasConverged records whether the *previous* pass ran its file pass (3,
+	// below) to completion. e.filesConverged itself is set false the instant
+	// this pass starts and only flips back to true once this pass's own file
+	// pass finishes without being interrupted — see the scoping decision in
+	// pass 3 for why an incomplete prior pass forces this one to fall back to
+	// the full key union: a file left unprocessed by an aborted pass (a mid-
+	// batch pause, a context cancellation) won't reappear in any future
+	// incremental delta or watcher event, since nothing about it changes
+	// again, so only a full scan is guaranteed to still notice it.
+	wasConverged := e.filesConverged
+	e.filesConverged = false
 
 	e.setState("syncing")
 	defer func() {
@@ -1196,6 +1615,14 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullRemoteWalk b
 
 	var remoteFiles, remoteFolders map[string]storageNode
 	var folderID map[string]string
+	// remoteIncremental is true when this pass knows the *complete* set of
+	// remote files that changed (nothing changed at all, or a bounded delta
+	// was patched in) rather than having just rebuilt the tree from a real
+	// walk. Combined with localIncremental below to decide whether pass 3 can
+	// scope itself to just the affected rels or must fall back to the full
+	// union it's always been correct to use — see that pass's own comment.
+	var remoteIncremental bool
+	var remoteAffected []string
 	fetchRemote := func() error {
 		// Reuse the last full remote tree walk when a cheap /check-updates
 		// probe confirms nothing has changed remotely since it was
@@ -1203,23 +1630,31 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullRemoteWalk b
 		// GET .../children walk of every folder on every single reconcile
 		// — including ones triggered purely by a local filesystem change
 		// (see the debounce worker in runSyncLoop), where the remote side
-		// is almost always untouched. See remoteTreeCache's doc comment for
-		// why this is safe, and forceFullRemoteWalk's for the one case that
-		// must bypass it.
+		// is almost always untouched. When something *did* change but it's a
+		// small enough delta to fit checkUpdatesDelta's page budget, patch
+		// the cached tree with applyRemoteDelta instead of falling back to a
+		// walk — that's the common case of a handful of edits landing
+		// elsewhere. See remoteTreeCache's doc comment for why reuse is
+		// safe, and forceFullWalk's for the one case that must bypass all of
+		// this.
 		var walkSeed int64
 		haveSeed := false
-		if !forceFullRemoteWalk && e.remoteTreeAsOf > 0 {
-			changed, serverTime, checkErr := e.sc.checkUpdates(ctx, e.remoteTreeAsOf)
-			if checkErr == nil {
-				if !changed {
-					remoteFiles, remoteFolders, folderID = e.remoteTreeFiles, e.remoteTreeFolders, e.remoteTreeFolderID
-					e.remoteTreeAsOf = serverTime
-					return nil
+		if !forceFullWalk && e.remoteTreeAsOf > 0 {
+			deltaNodes, serverTime, tooMany, checkErr := e.sc.checkUpdatesDelta(ctx, e.remoteTreeAsOf)
+			if checkErr == nil && !tooMany {
+				if len(deltaNodes) > 0 {
+					remoteAffected = e.applyRemoteDelta(deltaNodes)
 				}
-				// Something did change -> a real walk is needed below, but
-				// this probe's serverTime still seeds the refreshed cache,
-				// sparing a second request just to ask the same question
-				// again.
+				remoteFiles, remoteFolders, folderID = e.remoteTreeFiles, e.remoteTreeFolders, e.remoteTreeFolderID
+				e.remoteTreeAsOf = serverTime
+				remoteIncremental = true
+				return nil
+			}
+			if checkErr == nil && tooMany {
+				// Too big a backlog to patch safely -> a real walk is needed
+				// below, but this probe's serverTime still seeds the
+				// refreshed cache, sparing a second request just to ask the
+				// same question again.
 				walkSeed, haveSeed = serverTime, true
 			}
 			// A failed probe falls through to a real walk too: the cache
@@ -1238,6 +1673,7 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullRemoteWalk b
 			return buildErr
 		}
 		e.remoteTreeFiles, e.remoteTreeFolders, e.remoteTreeFolderID = remoteFiles, remoteFolders, folderID
+		e.remoteTreeIDToRel = buildRemoteIDIndex(remoteFiles, remoteFolders)
 		if haveSeed {
 			e.remoteTreeAsOf = walkSeed
 		} else {
@@ -1260,15 +1696,35 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullRemoteWalk b
 
 	var localFiles map[string]int64
 	var localDirs map[string]bool
+	// localIncremental mirrors remoteIncremental above, for the local side:
+	// true when localFiles/localDirs were refreshed by patching just the
+	// watcher-reported changedPaths rather than a full walk.
+	var localIncremental bool
+	var localAffected []string
 	// verifiedIdentical is set inside compareLocal, right alongside
 	// buildLocalTree — see the comment in there for why. Read at the file
 	// reconcile pass below.
 	var verifiedIdentical map[string]bool
 	compareLocal := func() error {
-		var buildErr error
-		localFiles, localDirs, buildErr = e.buildLocalTree()
-		if buildErr != nil {
-			return buildErr
+		if !forceFullWalk && e.localTreeValid {
+			// The watcher already told us exactly what changed (see
+			// markLocalChange/drainLocalChanges in runSyncLoop) -> patch the
+			// cached local tree for just those paths instead of a full
+			// filepath.WalkDir of the whole sync folder on every single
+			// reconcile, mirroring how fetchRemote avoids a full remote walk
+			// above. changedPaths is nil (not just empty) for a pass
+			// triggered purely by a remote change, which is a no-op patch:
+			// the cache is already correct.
+			localAffected = e.applyLocalChanges(changedPaths)
+			localFiles, localDirs = e.localTreeFiles, e.localTreeDirs
+			localIncremental = true
+		} else {
+			var buildErr error
+			localFiles, localDirs, buildErr = e.buildLocalTree()
+			if buildErr != nil {
+				return buildErr
+			}
+			e.localTreeFiles, e.localTreeDirs, e.localTreeValid = localFiles, localDirs, true
 		}
 		// A file present on both sides with no sync-state entry — whether
 		// that's because this is the account's very first sync, or because
@@ -1365,36 +1821,77 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullRemoteWalk b
 		if !isExcludedPath(rel, e.excludeDirs) {
 			if err := os.MkdirAll(filepath.Join(e.folder, filepath.FromSlash(rel)), 0o755); err != nil {
 				log.Printf("mkdir %s: %v", rel, err)
+			} else {
+				// Keep localTreeDirs (potentially the persistent cache, not a
+				// fresh walk — see compareLocal) in step with a directory this
+				// pass just created or confirmed exists, the same reason
+				// downloadFile patches localFiles/localDirs directly instead
+				// of relying on a future walk to notice.
+				localDirs[rel] = true
 			}
 		}
 		e.state.Folders[rel] = true
 		e.state.FolderIDs[rel] = node.ID
 	}
 
-	// 3. Reconcile every file across the union of remote, local and index keys.
-	//    File uploads create any missing remote parent folders on demand (see
-	//    ensureRemoteFolder), so this runs before the folder push/delete passes.
+	// 3. Reconcile every file the union of remote, local and index keys could
+	//    have something to say about. File uploads create any missing remote
+	//    parent folders on demand (see ensureRemoteFolder), so this runs
+	//    before the folder push/delete passes.
+	//
+	//    Using the full union is always correct — reconcileFile is a no-op
+	//    for any rel nothing actually changed for — but paying to hash every
+	//    file present on both sides just to confirm that is exactly the cost
+	//    this method exists to avoid for the common case. When both sides
+	//    know the *complete* set of files that could have changed this round
+	//    (remoteIncremental: nothing changed remotely, or a bounded delta was
+	//    patched in; localIncremental: the watcher's changedPaths were
+	//    patched in) *and* the last pass that ran actually finished
+	//    (wasConverged) — scope this one to just remoteAffected ∪
+	//    localAffected instead. Any other rel is, by construction, unchanged
+	//    on both sides since the last pass that already reconciled it, so
+	//    skipping it here loses nothing. wasConverged matters because a
+	//    prior pass that was interrupted (a mid-batch pause, a context
+	//    cancellation) can leave already-known files not yet processed, and
+	//    those won't reappear in any future delta or watcher event since
+	//    nothing about them changes again — only a full scan is guaranteed to
+	//    still notice them. Falls back to the full union whenever any of that
+	//    isn't true — exactly reconcileAll's behavior before this scoping
+	//    existed.
 	keys := map[string]struct{}{}
-	for k := range remoteFiles {
-		keys[k] = struct{}{}
-	}
-	for k := range localFiles {
-		keys[k] = struct{}{}
-	}
-	for k := range e.state.Entries {
-		keys[k] = struct{}{}
+	if remoteIncremental && localIncremental && wasConverged {
+		for _, rel := range remoteAffected {
+			keys[rel] = struct{}{}
+		}
+		for _, rel := range localAffected {
+			keys[rel] = struct{}{}
+		}
+	} else {
+		for k := range remoteFiles {
+			keys[k] = struct{}{}
+		}
+		for k := range localFiles {
+			keys[k] = struct{}{}
+		}
+		for k := range e.state.Entries {
+			keys[k] = struct{}{}
+		}
 	}
 	for rel := range keys {
 		if err := e.checkInterrupted(ctx); err != nil {
 			return err
 		}
-		if err := e.reconcileFile(ctx, rel, remoteFiles, localFiles, remoteFolders, folderID, verifiedIdentical); err != nil {
+		if err := e.reconcileFile(ctx, rel, remoteFiles, localFiles, localDirs, remoteFolders, folderID, verifiedIdentical); err != nil {
 			if errors.Is(err, errSessionExpired) {
 				return err
 			}
 			log.Printf("sync %s: %v", rel, err)
 		}
 	}
+	// The file pass above ran to completion without being interrupted —
+	// every currently-known file has now been reconciled, so the next pass
+	// may safely trust a scoped affected-rels set again (see wasConverged).
+	e.filesConverged = true
 
 	// 4. Push genuinely new local folders (not on the server and never synced).
 	//    This is what carries up empty directories the user just created; folders
@@ -1450,6 +1947,7 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullRemoteWalk b
 			}
 			continue
 		}
+		delete(localDirs, rel)
 		e.deleted.Add(1)
 		log.Printf("🗑  removed folder %s (deleted on server)", rel)
 		e.publishActivity("remove-folder", rel)
@@ -1513,14 +2011,19 @@ func (e *syncEngine) pollRemoteChanges(ctx context.Context) (reconciled bool, er
 }
 
 // forceReconcile runs a full reconcile unconditionally — the periodic backstop
-// that catches hard-deletes the incremental feed can't report (a permanently
-// deleted or purged node leaves no row to surface as changed). Forces a real
-// remote tree walk rather than letting reconcileAllImpl reuse remoteTreeCache
-// via its own check-updates probe, which is exactly the kind of check that
-// can't see a hard delete either — this pass exists specifically to not be
-// satisfied by one. The cursor is seeded from the server clock captured just
-// before the walk, so a change that lands mid-walk still has a timestamp at
-// or after it and is caught next poll.
+// that catches what the incremental paths on either side can't: remotely, a
+// hard delete (a permanently deleted or purged node leaves no row for
+// check-updates to ever report); locally, anything a filesystem watcher gap
+// might have missed (a dropped inotify event, a race between a watch being
+// added and a file landing in a brand-new directory, or running in poll-only
+// mode because no watcher could be created at all — see newWatcherWithRetry).
+// Forces a real remote tree walk and a real local directory walk rather than
+// letting reconcileAllImpl reuse remoteTreeCache/localTreeFiles via their own
+// incremental checks, which are exactly the kind of check that can't see
+// either failure mode — this pass exists specifically to not be satisfied by
+// one. The cursor is seeded from the server clock captured just before the
+// walk, so a change that lands mid-walk still has a timestamp at or after it
+// and is caught next poll.
 func (e *syncEngine) forceReconcile(ctx context.Context) error {
 	serverTime, stErr := e.sc.serverNow(ctx)
 	if stErr != nil {
@@ -1528,7 +2031,7 @@ func (e *syncEngine) forceReconcile(ctx context.Context) error {
 		// poll continues from the existing cursor.
 		serverTime = 0
 	}
-	if err := e.reconcileAllImpl(ctx, true); err != nil {
+	if err := e.reconcileAllImpl(ctx, true, nil); err != nil {
 		return err
 	}
 	if serverTime > 0 {
@@ -1544,20 +2047,25 @@ func (e *syncEngine) forceReconcile(ctx context.Context) error {
 // already gone.
 func (e *syncEngine) pruneRemoteSubtree(rel string, remoteFolders, remoteFiles map[string]storageNode, folderID map[string]string) {
 	prefix := rel + "/"
+	if n, ok := remoteFolders[rel]; ok {
+		delete(e.remoteTreeIDToRel, n.ID)
+	}
 	delete(remoteFolders, rel)
 	delete(folderID, rel)
 	delete(e.state.Folders, rel)
 	delete(e.state.FolderIDs, rel)
-	for k := range remoteFolders {
+	for k, n := range remoteFolders {
 		if strings.HasPrefix(k, prefix) {
+			delete(e.remoteTreeIDToRel, n.ID)
 			delete(remoteFolders, k)
 			delete(folderID, k)
 			delete(e.state.Folders, k)
 			delete(e.state.FolderIDs, k)
 		}
 	}
-	for k := range remoteFiles {
+	for k, n := range remoteFiles {
 		if strings.HasPrefix(k, prefix) {
+			delete(e.remoteTreeIDToRel, n.ID)
 			delete(remoteFiles, k)
 			delete(e.state.Entries, k)
 		}
@@ -1718,7 +2226,7 @@ func dryRunClassify(e *syncEngine, rel string, remoteFiles map[string]storageNod
 // reconcileFile applies the per-path reconciliation rules: creates, updates and
 // deletes push from whichever side changed to the other; on a genuine content
 // conflict (both sides changed the same file), remote wins.
-func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, remoteFolders map[string]storageNode, folderID map[string]string, verifiedIdentical map[string]bool) error {
+func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles map[string]storageNode, localFiles map[string]int64, localDirs map[string]bool, remoteFolders map[string]storageNode, folderID map[string]string, verifiedIdentical map[string]bool) error {
 	if isExcludedPath(rel, e.excludeDirs) {
 		return e.reconcileExcludedFile(rel, remoteFiles, localFiles)
 	}
@@ -1736,7 +2244,7 @@ func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles 
 			return e.deleteRemoteFile(ctx, rel, remoteNode.ID)
 		}
 		// Remote-only, never synced locally -> download.
-		return e.downloadFile(ctx, rel, remoteNode)
+		return e.downloadFile(ctx, rel, remoteNode, localFiles, localDirs)
 
 	case !hasRemote && localExists:
 		localHash, err := hashFile(abs)
@@ -1748,6 +2256,7 @@ func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles 
 			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
 				return err
 			}
+			delete(localFiles, rel)
 			delete(e.state.Entries, rel)
 			e.deleted.Add(1)
 			log.Printf("🗑  removed %s (deleted on server)", rel)
@@ -1795,12 +2304,12 @@ func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles 
 			// Present on both sides with no prior sync history and not
 			// verified identical above: this is the pre-existing-folder
 			// conflict the onboarding wizard asked about.
-			return e.applyFirstSyncConflict(ctx, rel, remoteNode, remoteFolders, folderID)
+			return e.applyFirstSyncConflict(ctx, rel, remoteNode, localFiles, localDirs, remoteFolders, folderID)
 		case localChanged && !remoteChanged:
 			return e.replaceFile(ctx, rel, remoteNode.ID)
 		default:
 			// remote changed (with or without a local change) -> remote wins.
-			return e.downloadFile(ctx, rel, remoteNode)
+			return e.downloadFile(ctx, rel, remoteNode, localFiles, localDirs)
 		}
 
 	default:
@@ -1857,28 +2366,32 @@ func (e *syncEngine) reconcileExcludedFile(rel string, remoteFiles map[string]st
 // "device" downloads the remote copy over the local one, "brick" uploads the
 // local copy over the remote one, and "copy" keeps both by renaming the local
 // file aside before downloading the remote one to the original path.
-func (e *syncEngine) applyFirstSyncConflict(ctx context.Context, rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
+func (e *syncEngine) applyFirstSyncConflict(ctx context.Context, rel string, remoteNode storageNode, localFiles map[string]int64, localDirs map[string]bool, remoteFolders map[string]storageNode, folderID map[string]string) error {
 	switch e.conflictMode {
 	case "brick":
 		return e.replaceFile(ctx, rel, remoteNode.ID)
 	case "copy":
-		return e.keepBothFile(ctx, rel, remoteNode, remoteFolders, folderID)
+		return e.keepBothFile(ctx, rel, remoteNode, localFiles, localDirs, remoteFolders, folderID)
 	default: // "device", or unset (folder was empty, so this case is unreachable in practice)
-		return e.downloadFile(ctx, rel, remoteNode)
+		return e.downloadFile(ctx, rel, remoteNode, localFiles, localDirs)
 	}
 }
 
 // keepBothFile resolves a first-sync conflict by keeping both copies: the
 // local file is renamed aside and re-uploaded as a new file, and the remote
 // copy is downloaded to the original path.
-func (e *syncEngine) keepBothFile(ctx context.Context, rel string, remoteNode storageNode, remoteFolders map[string]storageNode, folderID map[string]string) error {
+func (e *syncEngine) keepBothFile(ctx context.Context, rel string, remoteNode storageNode, localFiles map[string]int64, localDirs map[string]bool, remoteFolders map[string]storageNode, folderID map[string]string) error {
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	copyRel := dupPath(rel)
 	copyAbs := filepath.Join(e.folder, filepath.FromSlash(copyRel))
 	if err := os.Rename(abs, copyAbs); err != nil {
 		return err
 	}
-	if err := e.downloadFile(ctx, rel, remoteNode); err != nil {
+	if size, ok := localFiles[rel]; ok {
+		delete(localFiles, rel)
+		localFiles[copyRel] = size
+	}
+	if err := e.downloadFile(ctx, rel, remoteNode, localFiles, localDirs); err != nil {
 		return err
 	}
 	if err := e.uploadNewFile(ctx, copyRel, remoteFolders, folderID); err != nil {
@@ -1902,7 +2415,17 @@ func dupPath(rel string) string {
 	return dir + "/" + newBase
 }
 
-func (e *syncEngine) downloadFile(ctx context.Context, rel string, node storageNode) error {
+// downloadFile fetches node's content and writes it to rel. localFiles and
+// localDirs are patched in place to reflect the write (mirroring how
+// ensureRemoteFolder patches remoteFolders on the remote side) — necessary
+// now that a reconcile pass may be working from the persistent
+// localTreeFiles/localTreeDirs cache instead of a fresh buildLocalTree walk
+// (see reconcileAllImpl's compareLocal): the filesystem watcher never reports
+// this write back to the cache itself (markRecentlyWritten deliberately
+// suppresses that event, to avoid it being mistaken for an independent local
+// edit and echoed back as an upload), so without this the cache would never
+// learn the file now exists until the next full walk.
+func (e *syncEngine) downloadFile(ctx context.Context, rel string, node storageNode, localFiles map[string]int64, localDirs map[string]bool) error {
 	e.setInFlight(rel, "download")
 	defer e.clearInFlight()
 
@@ -1920,6 +2443,10 @@ func (e *syncEngine) downloadFile(ctx context.Context, rel string, node storageN
 	e.markRecentlyWritten(abs)
 	if err := atomicWrite(abs, data); err != nil {
 		return err
+	}
+	localFiles[rel] = int64(len(data))
+	if parent := parentOf(rel); parent != "" {
+		localDirs[parent] = true
 	}
 	e.state.Entries[rel] = SyncEntry{
 		RelPath:    rel,
@@ -2917,7 +3444,16 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 					// woke this worker, so resume just needs to flip the flag.
 					continue
 				}
-				if err := eng.reconcileAll(ctx); err != nil {
+				// changedPaths is the set of rel paths the watcher actually
+				// reported since the last drain (see markLocalChange below) —
+				// reconcileLocalChanges patches the cached local tree for just
+				// those instead of a full walk of the sync folder. Empty when
+				// this firing came from notify()'s other callers (e.g. the 'P'
+				// resume shortcut) rather than a real filesystem event, in
+				// which case reconcileLocalChanges behaves exactly like
+				// reconcileAll.
+				changedPaths := eng.drainLocalChanges()
+				if err := eng.reconcileLocalChanges(ctx, changedPaths); err != nil {
 					if errors.Is(err, errSessionExpired) {
 						log.Printf("session expired — run 'brick login' to re-authenticate")
 						cancel()
@@ -3011,6 +3547,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 					if eng.isRecentlyWritten(ev.Name) {
 						continue
 					}
+					eng.markLocalChange(filepath.ToSlash(mustRel(folder, ev.Name)))
 					notify()
 				case werr, ok := <-watcher.Errors:
 					if !ok {

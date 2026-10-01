@@ -82,15 +82,19 @@ func TestReconcileAllReusesRemoteTreeCacheWhenNothingChanged(t *testing.T) {
 	}
 }
 
-// The moment /check-updates reports an actual change, the next reconcileAll
-// pass must fall back to a real remote tree walk rather than trusting the
-// now-stale cache.
-func TestReconcileAllRefreshesRemoteTreeCacheWhenSomethingChanged(t *testing.T) {
+// The moment /check-updates reports an actual change that fits within a
+// single checkUpdatesDelta page, the next reconcileAll pass must patch the
+// cached tree directly (applyRemoteDelta) rather than falling back to a real
+// GET .../children walk of every folder — that's the whole point of
+// checkUpdatesDelta existing.
+func TestReconcileAllPatchesRemoteTreeFromDeltaInsteadOfWalking(t *testing.T) {
 	eng, childrenCalls, _ := newRemoteTreeCacheTestEngine(t, func(call int) ([]storageNode, int64) {
 		if call == 1 {
 			return nil, 1000 // seeds the cache during the first pass
 		}
-		return []storageNode{{ID: "n1", NodeType: "file"}}, 2000 // reports a change thereafter
+		// A new file lands remotely, reported with its full path the way a
+		// real /check-updates response would.
+		return []storageNode{{ID: "n1", NodeType: "file", Path: "/newfile.txt", Etag: "e1"}}, 2000
 	})
 
 	if err := eng.reconcileAll(context.Background()); err != nil {
@@ -103,8 +107,71 @@ func TestReconcileAllRefreshesRemoteTreeCacheWhenSomethingChanged(t *testing.T) 
 	if err := eng.reconcileAll(context.Background()); err != nil {
 		t.Fatalf("second reconcileAll error = %v", err)
 	}
+	if got := childrenCalls.Load(); got != 1 {
+		t.Errorf("after second reconcileAll with a small reported change, children calls = %d, want still 1 (patched from the delta, not a fresh walk)", got)
+	}
+	node, ok := eng.remoteTreeFiles["newfile.txt"]
+	if !ok || node.ID != "n1" {
+		t.Errorf("remoteTreeFiles[%q] = %+v, %v, want the delta's node to have been patched in", "newfile.txt", node, ok)
+	}
+}
+
+// A change too big to fit checkUpdatesDelta's page budget must fall back to a
+// real remote tree walk rather than risk patching a partial delta.
+func TestReconcileAllFallsBackToWalkWhenDeltaTooLarge(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".config", "brick"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	syncFolder := t.TempDir()
+
+	var childrenCalls, checkUpdatesCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/accounts/acct-1/nodes/root/children", func(w http.ResponseWriter, r *http.Request) {
+		childrenCalls.Add(1)
+		writeJSON(w, http.StatusOK, storageNodeList{Data: nil, Count: 0})
+	})
+	mux.HandleFunc("/v1/accounts/acct-1/check-updates", func(w http.ResponseWriter, r *http.Request) {
+		n := checkUpdatesCalls.Add(1)
+		if n == 1 {
+			// Seeds the cache during the first pass.
+			writeUpdatesPage(t, w, nil, 1000, "")
+			return
+		}
+		// Every page beyond checkUpdatesDeltaMaxPages carries a cursor, so
+		// checkUpdatesDelta gives up on collecting the whole delta.
+		writeUpdatesPage(t, w, []storageNode{{ID: "n1", NodeType: "file", Path: "/f.txt"}}, 2000, "next")
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	eng := &syncEngine{
+		sc: &storageClient{
+			baseURL:   server.URL,
+			apiURL:    server.URL,
+			accountID: "acct-1",
+			cfg:       &Config{AccessToken: "test-token"},
+		},
+		folder:          syncFolder,
+		accountID:       "acct-1",
+		rootID:          "root",
+		state:           &SyncState{Folder: syncFolder, Entries: map[string]SyncEntry{}, Folders: map[string]bool{}, FolderIDs: map[string]string{}},
+		recentlyWritten: map[string]time.Time{},
+	}
+
+	if err := eng.reconcileAll(context.Background()); err != nil {
+		t.Fatalf("first reconcileAll error = %v", err)
+	}
+	if got := childrenCalls.Load(); got != 1 {
+		t.Fatalf("after first reconcileAll, children calls = %d, want 1", got)
+	}
+
+	if err := eng.reconcileAll(context.Background()); err != nil {
+		t.Fatalf("second reconcileAll error = %v", err)
+	}
 	if got := childrenCalls.Load(); got != 2 {
-		t.Errorf("after second reconcileAll with a reported change, children calls = %d, want 2 (a fresh walk, not the stale cache)", got)
+		t.Errorf("after second reconcileAll with an unbounded delta, children calls = %d, want 2 (a fresh walk, too big a backlog to patch)", got)
 	}
 }
 
