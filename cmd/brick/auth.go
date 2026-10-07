@@ -28,6 +28,23 @@ import (
 // re-authenticate interactively.
 var errSessionExpired = errors.New("session expired")
 
+// errGrantRejected marks a token-endpoint answer that turns the grant down
+// (HTTP 400/401: invalid_grant, invalid_client and the like). Only that means
+// logging in again is the fix; an unreachable or failing endpoint does not,
+// and a later attempt with the same refresh token can still succeed.
+var errGrantRejected = errors.New("the auth server rejected the grant")
+
+// refreshFailed wraps a failed token refresh for a request that was rejected
+// for its access token: as errSessionExpired when the auth server turned the
+// refresh token down, and as a plain error, worth retrying, otherwise (no
+// network yet after a wake, a timeout, a 5xx).
+func refreshFailed(err error) error {
+	if errors.Is(err, errGrantRejected) {
+		return fmt.Errorf("%w; token refresh failed: %v", errSessionExpired, err)
+	}
+	return fmt.Errorf("token refresh failed: %w", err)
+}
+
 // oidcConfig holds the subset of fields from a .well-known/openid-configuration document.
 type oidcConfig struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
@@ -499,6 +516,9 @@ func refreshAccessToken(apiURL, refreshToken, clientID string) (accessToken, new
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized {
+		return "", "", "", fmt.Errorf("%w: token refresh returned status %d: %s", errGrantRejected, resp.StatusCode, string(body))
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", "", "", fmt.Errorf("token refresh returned status %d: %s", resp.StatusCode, string(body))
 	}
@@ -551,6 +571,9 @@ func ensureAuthenticated(apiURL string, checklist *onboardingChecklist) (*Config
 	if cfg.AccessToken == "" && cfg.RefreshToken != "" {
 		clientID := getEnv("OAUTH_CLIENT_ID", DefaultOAuthClientID)
 		newAccess, newRefresh, newID, err := refreshAccessToken(apiURL, cfg.RefreshToken, clientID)
+		if errors.Is(err, errGrantRejected) {
+			return nil, fmt.Errorf("%w; could not refresh credentials: %v", errSessionExpired, err)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("could not refresh credentials: %w", err)
 		}
@@ -593,7 +616,7 @@ func authedGet(apiURL, path, accessToken string, cfg *Config) (*http.Response, e
 		clientID := getEnv("OAUTH_CLIENT_ID", DefaultOAuthClientID)
 		newAccess, newRefresh, newID, refreshErr := refreshAccessToken(apiURL, cfg.RefreshToken, clientID)
 		if refreshErr != nil {
-			return nil, fmt.Errorf("%w; token refresh failed: %v", errSessionExpired, refreshErr)
+			return nil, refreshFailed(refreshErr)
 		}
 		cfg.AccessToken = newAccess
 		if newRefresh != "" {
@@ -635,7 +658,7 @@ func authedPost(apiURL, path, accessToken string, body []byte, cfg *Config) (*ht
 		clientID := getEnv("OAUTH_CLIENT_ID", DefaultOAuthClientID)
 		newAccess, newRefresh, newID, refreshErr := refreshAccessToken(apiURL, cfg.RefreshToken, clientID)
 		if refreshErr != nil {
-			return nil, fmt.Errorf("%w; token refresh failed: %v", errSessionExpired, refreshErr)
+			return nil, refreshFailed(refreshErr)
 		}
 		cfg.AccessToken = newAccess
 		if newRefresh != "" {
@@ -773,9 +796,12 @@ func runWhoami(apiURL string) error {
 	if cfg.AccessToken == "" {
 		clientID := getEnv("OAUTH_CLIENT_ID", DefaultOAuthClientID)
 		newAccess, newRefresh, newID, refreshErr := refreshAccessToken(apiURL, cfg.RefreshToken, clientID)
-		if refreshErr != nil {
+		if errors.Is(refreshErr, errGrantRejected) {
 			fmt.Println("Your session has expired. Run 'brick login' to re-authenticate.")
 			return nil
+		}
+		if refreshErr != nil {
+			return fmt.Errorf("could not refresh credentials: %w", refreshErr)
 		}
 		cfg.AccessToken = newAccess
 		if newRefresh != "" {

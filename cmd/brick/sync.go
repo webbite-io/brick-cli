@@ -478,7 +478,9 @@ func currentAccessToken(cfg *Config) string {
 // rejected; if cfg.AccessToken no longer matches it, another goroutine already
 // refreshed while we waited for the lock, so we adopt that result instead of
 // replaying the now-revoked refresh token. The whole operation is serialized
-// by tokenMu.
+// by tokenMu. A missing or rejected refresh token gives an error wrapping
+// errGrantRejected (see refreshFailed); any other failure leaves the tokens
+// as they were for the next attempt.
 func rotateAccessToken(refreshAPIURL string, cfg *Config, presentedAccessToken string) (string, error) {
 	tokenMu.Lock()
 	defer tokenMu.Unlock()
@@ -488,7 +490,7 @@ func rotateAccessToken(refreshAPIURL string, cfg *Config, presentedAccessToken s
 		return cfg.AccessToken, nil
 	}
 	if cfg.RefreshToken == "" {
-		return "", errors.New("no refresh token available")
+		return "", fmt.Errorf("%w: no refresh token available", errGrantRejected)
 	}
 
 	clientID := getEnv("OAUTH_CLIENT_ID", DefaultOAuthClientID)
@@ -560,7 +562,7 @@ func authedRequest(ctx context.Context, reqBaseURL, refreshAPIURL, method, path 
 		resp.Body.Close()
 		newAccess, refreshErr := rotateAccessToken(refreshAPIURL, cfg, presented)
 		if refreshErr != nil {
-			return nil, fmt.Errorf("%w; token refresh failed: %v", errSessionExpired, refreshErr)
+			return nil, refreshFailed(refreshErr)
 		}
 		if newAccess == "" {
 			return nil, fmt.Errorf("%w; no access token available (run 'brick login')", errSessionExpired)

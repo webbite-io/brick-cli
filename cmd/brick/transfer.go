@@ -302,7 +302,7 @@ func authedStreamRequest(ctx context.Context, reqBaseURL, refreshAPIURL, method,
 		resp.Body.Close()
 		newAccess, refreshErr := rotateAccessToken(refreshAPIURL, cfg, presented)
 		if refreshErr != nil {
-			return nil, fmt.Errorf("%w; token refresh failed: %v", errSessionExpired, refreshErr)
+			return nil, refreshFailed(refreshErr)
 		}
 		if newAccess == "" {
 			return nil, fmt.Errorf("%w; no access token available (run 'brick login')", errSessionExpired)
