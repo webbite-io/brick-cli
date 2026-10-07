@@ -2752,14 +2752,69 @@ func displayPath(abs string) string {
 	return abs
 }
 
+// errUnreachable wraps a failure to reach the auth or Storage API while
+// starting a sync. A start that leads into a long-running sync (the
+// foreground sync and the daemon child) retries after it by itself, with
+// backoff (see retryWhileUnreachable); one that is only a check fails fast.
+var errUnreachable = errors.New("could not reach Brick")
+
+// Backoff between start attempts while Brick is out of reach: 5s, doubling
+// up to 5 minutes. Variables so tests can shorten them.
+var (
+	startRetryMin = 5 * time.Second
+	startRetryMax = 5 * time.Minute
+)
+
+// retryWhileUnreachable runs fn until it returns anything but an
+// errUnreachable error — no network yet after a wake, or brick started
+// before the network was up — logging each failure and backing off between
+// attempts. Interrupting the process is the way out, as for a running sync.
+func retryWhileUnreachable(fn func() error) error {
+	d := startRetryMin
+	for {
+		err := fn()
+		if err == nil || !errors.Is(err, errUnreachable) {
+			return err
+		}
+		log.Printf("%v; retrying in %s", err, d)
+		time.Sleep(d)
+		d = min(d*2, startRetryMax)
+	}
+}
+
+// resolveSyncRoot resolves the account's root folder, the Storage API
+// reachability check a sync starts with. A failure other than an expired
+// session is marked errUnreachable.
+func resolveSyncRoot(sc *storageClient, storageURL string) (*storageNode, error) {
+	root, err := sc.resolveRoot(context.Background())
+	if errors.Is(err, errSessionExpired) {
+		return nil, fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: storage API at %s: %w", errUnreachable, storageURL, err)
+	}
+	return root, nil
+}
+
 // prepareSync runs the interactive setup steps needed before a sync can
 // start: authentication, sync folder resolution (prompting on first run), a
 // Storage API reachability check, and (on a brand new setup) the sync-scope
-// onboarding.
-func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
+// onboarding. With retry, the steps that need the network wait for it (see
+// retryWhileUnreachable) instead of failing.
+func prepareSync(apiURL, storageURL string, retry bool) (*syncSetup, error) {
 	checklist := &onboardingChecklist{}
+	attempt := func(fn func() error) error {
+		if retry {
+			return retryWhileUnreachable(fn)
+		}
+		return fn()
+	}
 
-	cfg, err := ensureAuthenticated(apiURL, checklist)
+	var cfg *Config
+	err := attempt(func() (err error) {
+		cfg, err = ensureAuthenticated(apiURL, checklist)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2775,9 +2830,13 @@ func prepareSync(apiURL, storageURL string) (*syncSetup, error) {
 	}
 
 	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
-	root, err := sc.resolveRoot(context.Background())
+	var root *storageNode
+	err = attempt(func() (err error) {
+		root, err = resolveSyncRoot(sc, storageURL)
+		return err
+	})
 	if err != nil {
-		return nil, fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
+		return nil, err
 	}
 
 	if isFirstSetup {
@@ -2936,7 +2995,7 @@ func runStorageSync(apiURL, storageURL string, remoteControl bool) error {
 		return err
 	}
 
-	setup, err := prepareSync(apiURL, storageURL)
+	setup, err := prepareSync(apiURL, storageURL, true)
 	if err != nil {
 		lock.Release()
 		return err
@@ -3060,7 +3119,7 @@ func runWithSpinnerTUI(prog *tea.Program, label string, fn func() error) error {
 // verification the real sync uses (see verifyUnsyncedFileMatches), then
 // classifies each file with dryRunClassify instead of acting on it.
 func runSyncDryRun(apiURL, storageURL string) error {
-	setup, err := prepareSync(apiURL, storageURL)
+	setup, err := prepareSync(apiURL, storageURL, false)
 	if err != nil {
 		return err
 	}
@@ -3168,7 +3227,7 @@ func runSetupAndExit(apiURL, storageURL string) error {
 	}
 	defer lock.Release()
 
-	if _, err := prepareSync(apiURL, storageURL); err != nil {
+	if _, err := prepareSync(apiURL, storageURL, false); err != nil {
 		return err
 	}
 

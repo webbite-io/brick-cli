@@ -575,7 +575,7 @@ func ensureAuthenticated(apiURL string, checklist *onboardingChecklist) (*Config
 			return nil, fmt.Errorf("%w; could not refresh credentials: %v", errSessionExpired, err)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("could not refresh credentials: %w", err)
+			return nil, fmt.Errorf("%w: could not refresh credentials: %w", errUnreachable, err)
 		}
 		cfg.AccessToken = newAccess
 		if newRefresh != "" {

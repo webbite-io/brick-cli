@@ -3,7 +3,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -110,7 +109,9 @@ func startDaemonProcess(apiURL, storageURL string, remoteControl bool, cliArgs [
 		return 0, "", "", err
 	}
 
-	setup, err := prepareSync(apiURL, storageURL)
+	// No retry: the caller is waiting for an answer (a terminal, or under
+	// --json a companion app); the detached child is the one that waits.
+	setup, err := prepareSync(apiURL, storageURL, false)
 	if err != nil {
 		lock.Release()
 		return 0, "", "", err
@@ -224,7 +225,8 @@ func firstSetupEnvValue(v bool) string {
 // spawns. Login, sync folder selection and onboarding already ran in the
 // foreground parent; this adopts the instance lock inherited via fd 3 (see
 // ExtraFiles above), re-derives a storageClient, re-verifies the Storage API
-// is reachable, and starts the normal sync loop — carrying over the
+// is reachable (waiting for it with backoff if not: see
+// retryWhileUnreachable), and starts the normal sync loop — carrying over the
 // folder/conflictMode/isFirstSetup decisions made in the parent so the very
 // first reconcile pass resolves any pre-existing conflict exactly as the
 // user chose, rather than silently defaulting to "remote wins".
@@ -245,9 +247,13 @@ func runDaemonChild(apiURL, storageURL string, remoteControl bool, folder, confl
 	}
 
 	sc := &storageClient{baseURL: storageURL, apiURL: apiURL, accountID: cfg.ActiveAccountID, cfg: cfg}
-	root, err := sc.resolveRoot(context.Background())
+	var root *storageNode
+	err = retryWhileUnreachable(func() (err error) {
+		root, err = resolveSyncRoot(sc, storageURL)
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("could not reach storage API at %s: %w", storageURL, err)
+		return err
 	}
 
 	setup := &syncSetup{
