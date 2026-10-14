@@ -30,8 +30,15 @@ func newTimestampWriter(w io.Writer) io.Writer {
 	return &timestampWriter{w: w}
 }
 
+// logLinePrefix returns the "<timestamp> CLI: " prefix timestampWriter puts
+// on every line, for output that is stamped by hand rather than written
+// through it (e.g. the sync spinners in sync.go).
+func logLinePrefix() string {
+	return time.Now().Format(logTimestampLayout) + " " + logSourcePrefix
+}
+
 func (t *timestampWriter) Write(p []byte) (int, error) {
-	prefixed := append([]byte(time.Now().Format(logTimestampLayout)+" "+logSourcePrefix), p...)
+	prefixed := append([]byte(logLinePrefix()), p...)
 	if _, err := t.w.Write(prefixed); err != nil {
 		return 0, err
 	}

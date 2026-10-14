@@ -3079,18 +3079,18 @@ func runWithSpinner(label string, fn func() error) error {
 }
 
 // runWithSpinnerPlain is runWithSpinner with every line prefixed by the
-// current timestamp (captured once, not re-stamped per frame), matching the
+// current timestamp and "CLI: " (captured once, not re-stamped per frame), matching the
 // format every other line around it already carries via newTimestampWriter
 // (see logtime.go) — used for the real sync's plain/non-interactive terminal
 // output, as opposed to dry-run's own untimed runWithSpinner.
 func runWithSpinnerPlain(label string, fn func() error) error {
-	ts := time.Now().Format(logTimestampLayout)
+	prefix := logLinePrefix()
 	if !term.IsTerminal(os.Stdout.Fd()) {
-		fmt.Println(ts + " " + label)
+		fmt.Println(prefix + label)
 		return fn()
 	}
 	return runWithSpinnerVia(func(text string, final bool) {
-		fmt.Printf("\r\033[K%s %s", ts, text)
+		fmt.Printf("\r\033[K%s%s", prefix, text)
 		if final {
 			fmt.Println()
 		}
@@ -3102,12 +3102,12 @@ func runWithSpinnerPlain(label string, fn func() error) error {
 // spinnerLineMsg in tui.go) rather than pushed as a new scrollback line every
 // tick. Sent directly to prog rather than through the log package, so unlike
 // every other line in that pane, it is never mirrored into brick.log —
-// timestamped by hand instead (captured once, not re-stamped per frame) to
+// prefixed with the timestamp and "CLI: " by hand instead (captured once, not re-stamped per frame) to
 // match the format log.Printf lines around it get via newTimestampWriter.
 func runWithSpinnerTUI(prog *tea.Program, label string, fn func() error) error {
-	ts := time.Now().Format(logTimestampLayout)
+	prefix := logLinePrefix()
 	return runWithSpinnerVia(func(text string, final bool) {
-		prog.Send(spinnerLineMsg{text: ts + " " + text, done: final})
+		prog.Send(spinnerLineMsg{text: prefix + text, done: final})
 	}, label, fn)
 }
 
