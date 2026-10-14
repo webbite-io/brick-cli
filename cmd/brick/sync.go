@@ -3358,6 +3358,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 			}
 			if interactive {
 				log.SetOutput(baseLogOutput)
+				yamuxLogQuiet.Store(false)
 			}
 		})
 	}
@@ -3380,6 +3381,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 			tuiOutput = io.MultiWriter(tuiOutput, syncLog)
 		}
 		log.SetOutput(newTimestampWriter(tuiOutput))
+		yamuxLogQuiet.Store(true)
 		go func() {
 			if _, runErr := prog.Run(); runErr != nil {
 				// The TUI couldn't start (e.g. no usable terminal despite the

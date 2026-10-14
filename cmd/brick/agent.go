@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -45,7 +46,42 @@ const agentSecretHeader = "X-RBite-Agent-Secret"
 func yamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.ConnectionWriteTimeout = 30 * time.Second
+	// yamux's default LogOutput is os.Stderr, which builds a private logger
+	// that bypasses log.SetOutput — so its "[ERR] yamux: ..." lines would be
+	// painted over the sync TUI instead of landing in its log window (and
+	// would miss brick.log). Route it through the standard logger instead.
+	cfg.LogOutput = nil
+	cfg.Logger = yamuxLogger{}
 	return cfg
+}
+
+// yamuxLogQuiet, while set, drops yamux's own log output. The sync TUI sets
+// it for as long as it's on screen: every yamux error there ends the session
+// and is already reported, more readably, by connectAgentWithReconnect's
+// "Brick CLI disconnected (...); reconnecting..." line.
+var yamuxLogQuiet atomic.Bool
+
+// yamuxLogger forwards yamux's log output to the standard logger unless
+// yamuxLogQuiet is set. It checks the flag on every call, not once per
+// session, so a long-lived session follows the TUI starting or stopping.
+type yamuxLogger struct{}
+
+func (yamuxLogger) Print(v ...any) {
+	if !yamuxLogQuiet.Load() {
+		log.Print(v...)
+	}
+}
+
+func (yamuxLogger) Printf(format string, v ...any) {
+	if !yamuxLogQuiet.Load() {
+		log.Printf(format, v...)
+	}
+}
+
+func (yamuxLogger) Println(v ...any) {
+	if !yamuxLogQuiet.Load() {
+		log.Println(v...)
+	}
 }
 
 // stringList is a repeatable / comma-separated string flag (e.g. --agent-root).
