@@ -33,7 +33,7 @@ import (
 )
 
 // tmpSuffix marks in-progress download files so the local tree walk and the
-// watcher ignore them.
+// watcher ignore them (see isIgnoredName).
 const tmpSuffix = ".brick-tmp"
 
 // --- Storage API types (subset of the OpenAPI schema) ---
@@ -1074,7 +1074,7 @@ func (e *syncEngine) applyLocalChanges(changedPaths []string) []string {
 	}
 
 	for _, rel := range changedPaths {
-		if rel == "" || rel == "." || strings.HasSuffix(rel, tmpSuffix) {
+		if rel == "" || rel == "." || isIgnoredPath(rel) {
 			continue
 		}
 		abs := filepath.Join(e.folder, filepath.FromSlash(rel))
@@ -1125,7 +1125,10 @@ func (e *syncEngine) applyLocalChanges(changedPaths []string) []string {
 				if p == abs {
 					return nil
 				}
-				if strings.HasSuffix(p, tmpSuffix) {
+				if isIgnoredName(d.Name()) {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
 					return nil
 				}
 				childRel := filepath.ToSlash(mustRel(e.folder, p))
@@ -1172,7 +1175,7 @@ func (e *syncEngine) buildRemoteTree(ctx context.Context) (files, folders map[st
 			return nil, nil, nil, listErr
 		}
 		for _, ch := range children {
-			if ch.IsDeleted {
+			if ch.IsDeleted || isIgnoredName(ch.Name) {
 				continue
 			}
 			rel := ch.Name
@@ -1239,6 +1242,29 @@ func (e *syncEngine) applyRemoteDelta(nodes []storageNode) (affectedFiles []stri
 	for _, n := range nodes {
 		rel := strings.Trim(n.Path, "/")
 		oldRel, hadOld := e.remoteTreeIDToRel[n.ID]
+		if !n.IsDeleted && isIgnoredPath(rel) {
+			// Created in, or moved/renamed into, an ignored path: from here on
+			// it doesn't exist as far as sync is concerned. A move reports only
+			// the moved row, so drop a moved folder's cached descendants too.
+			if hadOld {
+				prefix := oldRel + "/"
+				for k, f := range e.remoteTreeFiles {
+					if k == oldRel || strings.HasPrefix(k, prefix) {
+						delete(e.remoteTreeFiles, k)
+						delete(e.remoteTreeIDToRel, f.ID)
+						affectedFiles = append(affectedFiles, k)
+					}
+				}
+				for k, f := range e.remoteTreeFolders {
+					if k == oldRel || strings.HasPrefix(k, prefix) {
+						delete(e.remoteTreeFolders, k)
+						delete(e.remoteTreeFolderID, k)
+						delete(e.remoteTreeIDToRel, f.ID)
+					}
+				}
+			}
+			continue
+		}
 		if n.IsDeleted {
 			removedRel := rel
 			if hadOld {
@@ -1339,7 +1365,10 @@ func (e *syncEngine) buildLocalTree() (files map[string]int64, dirs map[string]b
 		if path == e.folder {
 			return nil
 		}
-		if strings.HasSuffix(path, tmpSuffix) {
+		if isIgnoredName(d.Name()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		rel := filepath.ToSlash(mustRel(e.folder, path))
@@ -1940,6 +1969,9 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullWalk bool, c
 	for _, rel := range goneDirs {
 		delete(e.state.Folders, rel)
 		delete(e.state.FolderIDs, rel)
+		if isIgnoredPath(rel) {
+			continue // synced before its name was ignored; leave the local copy be
+		}
 		abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 		info, err := os.Stat(abs)
 		if err != nil {
@@ -2606,6 +2638,9 @@ func (e *syncEngine) addWatchesRecursive(w *fsnotify.Watcher) {
 			return nil
 		}
 		if d.IsDir() {
+			if path != e.folder && isIgnoredName(d.Name()) {
+				return filepath.SkipDir
+			}
 			_ = w.Add(path)
 		}
 		return nil
@@ -3623,13 +3658,11 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 					if !ok {
 						return
 					}
-					if strings.HasSuffix(ev.Name, tmpSuffix) {
+					rel := filepath.ToSlash(mustRel(folder, ev.Name))
+					if isIgnoredPath(rel) || eng.isRecentlyWritten(ev.Name) {
 						continue
 					}
-					if eng.isRecentlyWritten(ev.Name) {
-						continue
-					}
-					eng.markLocalChange(filepath.ToSlash(mustRel(folder, ev.Name)))
+					eng.markLocalChange(rel)
 					notify()
 				case werr, ok := <-watcher.Errors:
 					if !ok {
