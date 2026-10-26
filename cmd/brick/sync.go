@@ -3439,7 +3439,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 	// failures here are non-fatal to syncing.
 	agentRoots := resolveAgentRoots(cfg)
 	agentSecret := newAgentSecret()
-	if _, agentLn, aerr := startAgentServer(agentRoots, agentSecret, sc, remoteControl); aerr != nil {
+	if _, agentLn, aerr := startAgentServer(ctx, agentRoots, agentSecret, sc, remoteControl, cfg.TransferHistoryLimit); aerr != nil {
 		log.Printf("could not start remote file agent: %v", aerr)
 	} else {
 		agentAddr := agentLn.Addr().String()

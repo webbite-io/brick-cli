@@ -108,6 +108,11 @@ type agentServer struct {
 	secret        string
 	sc            *storageClient
 	remoteControl bool
+	// ctx is the sync session's context. Async transfers run under it rather
+	// than their request's, so they outlive the request but stop when brick
+	// shuts down.
+	ctx       context.Context
+	transfers *transferRegistry
 }
 
 type fsEntry struct {
@@ -118,20 +123,35 @@ type fsEntry struct {
 }
 
 // startAgentServer binds a loopback listener and serves the agent API. The
-// caller closes the returned listener to stop it.
-func startAgentServer(roots []string, secret string, sc *storageClient, remoteControl bool) (*agentServer, net.Listener, error) {
+// caller closes the returned listener to stop it. historyLimit caps the
+// finished-transfer history (<= 0 means defaultTransferHistoryLimit).
+func startAgentServer(ctx context.Context, roots []string, secret string, sc *storageClient, remoteControl bool, historyLimit int) (*agentServer, net.Listener, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, nil, err
 	}
-	a := &agentServer{roots: roots, secret: secret, sc: sc, remoteControl: remoteControl}
+	a := newAgentServer(ctx, roots, secret, sc, remoteControl, historyLimit)
 	srv := &http.Server{Handler: a.handler()}
 	go srv.Serve(ln) //nolint:errcheck
 	return a, ln, nil
 }
 
+func newAgentServer(ctx context.Context, roots []string, secret string, sc *storageClient, remoteControl bool, historyLimit int) *agentServer {
+	return &agentServer{
+		roots:         roots,
+		secret:        secret,
+		sc:            sc,
+		remoteControl: remoteControl,
+		ctx:           ctx,
+		transfers:     newTransferRegistry(historyLimit),
+	}
+}
+
 func (a *agentServer) handler() http.Handler {
 	mux := http.NewServeMux()
+	// /version only needs the secret, not remote control, so Brick HQ can
+	// show which CLI version a device runs even when remote control is off.
+	mux.HandleFunc("/version", a.authSecret(a.handleVersion))
 	mux.HandleFunc("/fs/roots", a.auth(a.handleRoots))
 	mux.HandleFunc("/fs/list", a.auth(a.handleList))
 	mux.HandleFunc("/fs/stat", a.auth(a.handleStat))
@@ -143,21 +163,44 @@ func (a *agentServer) handler() http.Handler {
 	mux.HandleFunc("/fs/copy", a.auth(a.handleCopy))
 	mux.HandleFunc("/transfer/upload", a.auth(a.handleUpload))
 	mux.HandleFunc("/transfer/download", a.auth(a.handleDownload))
+	mux.HandleFunc("/transfers", a.auth(a.handleTransfers))
+	mux.HandleFunc("/transfers/{id}", a.auth(a.handleTransfer))
 	return mux
 }
 
+// auth guards an endpoint that touches the local filesystem or storage: it
+// needs both the agent secret and remote control enabled.
 func (a *agentServer) auth(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+	return a.authSecret(func(w http.ResponseWriter, r *http.Request) {
 		if !a.remoteControl {
 			writeError(w, http.StatusForbidden, "remote_control_disabled", "remote control is not enabled on this client")
 			return
 		}
+		h(w, r)
+	})
+}
+
+// authSecret only checks the agent secret, for endpoints that stay available
+// with remote control disabled.
+func (a *agentServer) authSecret(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if a.secret == "" || r.Header.Get(agentSecretHeader) != a.secret {
 			writeError(w, http.StatusForbidden, "forbidden", "missing or invalid agent secret")
 			return
 		}
 		h(w, r)
 	}
+}
+
+func (a *agentServer) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"version":       Version,
+		"buildTime":     BuildTime,
+		"gitCommit":     GitCommit,
+		"os":            runtime.GOOS,
+		"arch":          runtime.GOARCH,
+		"remoteControl": a.remoteControl,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -537,11 +580,23 @@ func copyFile(src, dst string, mode os.FileMode) error {
 }
 
 // --- Transfer between local disk and the storage API ---
+//
+// Both transfer endpoints stream the file rather than holding it in memory,
+// and record it in a.transfers so its progress can be polled via
+// GET /transfers/{id}. Each accepts two optional fields:
+//
+//   - transferId: a caller-chosen UUID for the transfer, so the caller can
+//     poll its progress while a synchronous request is still in flight.
+//   - async: respond 202 with the transfer record right away and run the
+//     transfer in the background, rather than holding the request open until
+//     it finishes. Inputs are still validated before responding.
 
 type uploadReq struct {
-	LocalPath string `json:"localPath"`
-	ParentID  string `json:"parentId"`
-	Name      string `json:"name"`
+	LocalPath  string `json:"localPath"`
+	ParentID   string `json:"parentId"`
+	Name       string `json:"name"`
+	TransferID string `json:"transferId"`
+	Async      bool   `json:"async"`
 }
 
 func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -555,26 +610,66 @@ func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	data, err := os.ReadFile(abs)
+	f, err := os.Open(abs)
 	if err != nil {
 		writeOSError(w, err)
+		return
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		writeOSError(w, err)
+		return
+	}
+	if info.IsDir() {
+		f.Close()
+		writeError(w, http.StatusBadRequest, "is_a_directory", "path is a directory")
 		return
 	}
 	name := req.Name
 	if name == "" {
 		name = filepath.Base(abs)
 	}
-	node, err := a.sc.upload(r.Context(), req.ParentID, name, data)
+	id, err := a.transfers.begin(req.TransferID, transferRecord{
+		Direction:  "upload",
+		LocalPath:  abs,
+		ParentID:   req.ParentID,
+		Name:       name,
+		BytesTotal: info.Size(),
+	})
+	if err != nil {
+		f.Close()
+		writeErr(w, err)
+		return
+	}
+
+	run := func(ctx context.Context) (*storageNode, error) {
+		defer f.Close()
+		node, err := a.sc.uploadStream(ctx, req.ParentID, name, f, info.Size(), func(written int64) {
+			a.transfers.progress(id, written)
+		})
+		a.transfers.finish(ctx, id, node, err)
+		return node, err
+	}
+	if req.Async {
+		go run(a.ctx) //nolint:errcheck // the outcome is recorded in a.transfers
+		a.writeTransferAccepted(w, id)
+		return
+	}
+	node, err := run(r.Context())
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"node": node})
+	rec, _ := a.transfers.get(id)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"node": node, "transfer": rec})
 }
 
 type downloadReq struct {
-	NodeID    string `json:"nodeId"`
-	LocalPath string `json:"localPath"`
+	NodeID     string `json:"nodeId"`
+	LocalPath  string `json:"localPath"`
+	TransferID string `json:"transferId"`
+	Async      bool   `json:"async"`
 }
 
 func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -588,20 +683,64 @@ func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	data, _, err := a.sc.download(r.Context(), req.NodeID)
+	// Fetched first for the file's size (a chunked download response may not
+	// carry a Content-Length), which progress is reported against.
+	node, err := a.sc.getNode(r.Context(), req.NodeID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	if node.NodeType != "file" {
+		writeError(w, http.StatusBadRequest, "not_a_file", "node is not a file")
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		writeOSError(w, err)
 		return
 	}
-	if err := atomicWrite(abs, data); err != nil {
-		writeOSError(w, err)
+	id, err := a.transfers.begin(req.TransferID, transferRecord{
+		Direction:  "download",
+		LocalPath:  abs,
+		NodeID:     node.ID,
+		Name:       node.Name,
+		BytesTotal: node.SizeBytes,
+	})
+	if err != nil {
+		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"path": abs, "ok": true})
+
+	run := func(ctx context.Context) error {
+		err := a.sc.downloadToFile(ctx, node.ID, abs, node.SizeBytes, func(written, _ int64) {
+			a.transfers.progress(id, written)
+		})
+		a.transfers.finish(ctx, id, nil, err)
+		return err
+	}
+	if req.Async {
+		go run(a.ctx) //nolint:errcheck // the outcome is recorded in a.transfers
+		a.writeTransferAccepted(w, id)
+		return
+	}
+	if err := run(r.Context()); err != nil {
+		var pathErr *os.PathError
+		var linkErr *os.LinkError
+		if errors.As(err, &pathErr) || errors.As(err, &linkErr) {
+			writeOSError(w, err)
+		} else {
+			writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		}
+		return
+	}
+	rec, _ := a.transfers.get(id)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"path": abs, "ok": true, "transfer": rec})
+}
+
+// writeTransferAccepted answers an async transfer request with the
+// transfer's current record.
+func (a *agentServer) writeTransferAccepted(w http.ResponseWriter, id string) {
+	rec, _ := a.transfers.get(id)
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{"transfer": rec})
 }
 
 // --- Persistent connection to the storage API ---

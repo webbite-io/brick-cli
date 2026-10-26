@@ -68,6 +68,11 @@ type Config struct {
 	// run. Set during first-time onboarding if the user opts in; -r still
 	// forces it on for a single invocation if the user declined here.
 	RemoteControl bool `yaml:"remoteControl,omitempty"`
+
+	// TransferHistoryLimit caps how many finished remote-control transfers
+	// GET /transfers reports for the running session. Unset (or <= 0) means
+	// defaultTransferHistoryLimit.
+	TransferHistoryLimit int `yaml:"transferHistoryLimit,omitempty"`
 }
 
 // AccountConfig holds the per-account settings for one entry in Config.Accounts.
