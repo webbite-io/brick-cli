@@ -50,8 +50,17 @@ type transferRegistry struct {
 	mu      sync.Mutex
 	limit   int
 	byID    map[string]*transferRecord // active and history
-	active  map[string]*transferRecord
+	active  map[string]*activeTransfer
 	history []*transferRecord // oldest first
+}
+
+// activeTransfer is a running transfer's record plus what cancel needs to
+// stop it: the cancel func of the context it runs under, and done, closed by
+// finish once it has stopped.
+type activeTransfer struct {
+	rec    *transferRecord
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func newTransferRegistry(limit int) *transferRegistry {
@@ -61,7 +70,7 @@ func newTransferRegistry(limit int) *transferRegistry {
 	return &transferRegistry{
 		limit:  limit,
 		byID:   map[string]*transferRecord{},
-		active: map[string]*transferRecord{},
+		active: map[string]*activeTransfer{},
 	}
 }
 
@@ -69,7 +78,9 @@ func newTransferRegistry(limit int) *transferRegistry {
 // caller-supplied transferId, if any: it must be a UUID not already in use,
 // which lets the caller poll GET /transfers/{id} while a synchronous
 // upload/download request is still in flight. An empty id gets a fresh one.
-func (tr *transferRegistry) begin(id string, rec transferRecord) (string, error) {
+// cancel stops the context the transfer runs under; DELETE /transfers/{id}
+// calls it.
+func (tr *transferRegistry) begin(id string, rec transferRecord, cancel context.CancelFunc) (string, error) {
 	if id == "" {
 		id = uuid.NewString()
 	} else if parsed, err := uuid.Parse(id); err != nil {
@@ -89,7 +100,7 @@ func (tr *transferRegistry) begin(id string, rec transferRecord) (string, error)
 	rec.StartedAt = now
 	rec.UpdatedAt = now
 	tr.byID[id] = &rec
-	tr.active[id] = &rec
+	tr.active[id] = &activeTransfer{rec: &rec, cancel: cancel, done: make(chan struct{})}
 	return id, nil
 }
 
@@ -97,23 +108,29 @@ func (tr *transferRegistry) begin(id string, rec transferRecord) (string, error)
 func (tr *transferRegistry) progress(id string, done int64) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	if rec, ok := tr.active[id]; ok {
-		rec.BytesDone = done
-		rec.UpdatedAt = time.Now().UTC()
+	if at, ok := tr.active[id]; ok {
+		at.rec.BytesDone = done
+		at.rec.UpdatedAt = time.Now().UTC()
 	}
 }
 
 // finish moves transfer id into the history, evicting the oldest entries
 // beyond limit. ctx is the context the transfer ran under: an error after it
-// was cancelled (brick shutting down) is reported as canceled, not failed.
+// was cancelled (DELETE /transfers/{id}, or brick shutting down) is reported
+// as canceled, not failed.
 func (tr *transferRegistry) finish(ctx context.Context, id string, node *storageNode, err error) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	rec, ok := tr.active[id]
+	at, ok := tr.active[id]
 	if !ok {
 		return
 	}
 	delete(tr.active, id)
+	// Deferred so the state below is decided by ctx as the transfer left it:
+	// cancelling first would make every failure look like a cancellation.
+	defer close(at.done)
+	defer at.cancel() // release the context's resources
+	rec := at.rec
 
 	now := time.Now().UTC()
 	rec.UpdatedAt = now
@@ -138,6 +155,12 @@ func (tr *transferRegistry) finish(ctx context.Context, id string, node *storage
 	}
 }
 
+// canceled reports whether transfer id finished as canceled.
+func (tr *transferRegistry) canceled(id string) bool {
+	rec, ok := tr.get(id)
+	return ok && rec.State == transferCanceled
+}
+
 // get returns a copy of transfer id, active or finished.
 func (tr *transferRegistry) get(id string) (transferRecord, bool) {
 	tr.mu.Lock()
@@ -155,8 +178,8 @@ func (tr *transferRegistry) list() (active, history []transferRecord) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	active = make([]transferRecord, 0, len(tr.active))
-	for _, rec := range tr.active {
-		active = append(active, *rec)
+	for _, at := range tr.active {
+		active = append(active, *at.rec)
 	}
 	sort.Slice(active, func(i, j int) bool { return active[i].StartedAt.Before(active[j].StartedAt) })
 	history = make([]transferRecord, 0, len(tr.history))
@@ -164,6 +187,30 @@ func (tr *transferRegistry) list() (active, history []transferRecord) {
 		history = append(history, *tr.history[i])
 	}
 	return active, history
+}
+
+// cancel stops running transfer id and waits up to wait for it to finish.
+// stopped is false if it was still winding down when wait ran out.
+func (tr *transferRegistry) cancel(id string, wait time.Duration) (rec transferRecord, stopped bool, err error) {
+	tr.mu.Lock()
+	at, active := tr.active[id]
+	_, known := tr.byID[id]
+	tr.mu.Unlock()
+	if !active {
+		if known {
+			return transferRecord{}, false, newAPIError(http.StatusConflict, "transfer_finished", "the transfer has already finished")
+		}
+		return transferRecord{}, false, newAPIError(http.StatusNotFound, "transfer_not_found", "no transfer with this id in the current session")
+	}
+
+	at.cancel()
+	select {
+	case <-at.done:
+		stopped = true
+	case <-time.After(wait):
+	}
+	rec, _ = tr.get(id)
+	return rec, stopped, nil
 }
 
 // handleTransfers serves GET /transfers: the session's active transfers and
@@ -186,16 +233,42 @@ func (a *agentServer) handleTransfers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleTransfer serves GET /transfers/{id}: one transfer's current status.
-func (a *agentServer) handleTransfer(w http.ResponseWriter, r *http.Request) {
+// transferIDParam returns the request's {id} path value in the canonical
+// form begin stores.
+func transferIDParam(r *http.Request) string {
 	id := r.PathValue("id")
 	if parsed, err := uuid.Parse(id); err == nil {
-		id = parsed.String() // begin stores the canonical form
+		id = parsed.String()
 	}
-	rec, ok := a.transfers.get(id)
+	return id
+}
+
+// handleTransfer serves GET /transfers/{id}: one transfer's current status.
+func (a *agentServer) handleTransfer(w http.ResponseWriter, r *http.Request) {
+	rec, ok := a.transfers.get(transferIDParam(r))
 	if !ok {
 		writeError(w, http.StatusNotFound, "transfer_not_found", "no transfer with this id in the current session")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"transfer": rec})
+}
+
+// cancelTransferWait bounds how long DELETE /transfers/{id} waits for a
+// cancelled transfer to stop before answering.
+const cancelTransferWait = 5 * time.Second
+
+// handleCancelTransfer serves DELETE /transfers/{id}: it cancels a running
+// transfer and answers 200 with its record once it has stopped, or 202 if it
+// is still winding down after cancelTransferWait (poll it to see it finish).
+func (a *agentServer) handleCancelTransfer(w http.ResponseWriter, r *http.Request) {
+	rec, stopped, err := a.transfers.cancel(transferIDParam(r), cancelTransferWait)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	status := http.StatusOK
+	if !stopped {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, map[string]interface{}{"transfer": rec})
 }

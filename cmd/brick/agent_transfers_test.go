@@ -20,24 +20,30 @@ import (
 const testAgentSecret = "test-secret"
 
 // testAgent is an agentServer served over httptest, backed by a
-// fakeStorageAPI, with one temp dir as its only allowed root.
+// fakeStorageAPI. root is its first allowed root.
 type testAgent struct {
 	t      *testing.T
 	url    string
 	root   string
 	fake   *fakeStorageAPI
 	cancel context.CancelFunc
+	server *agentServer
 }
 
+// newTestAgent serves an agent with one writable temp dir as its only root.
 func newTestAgent(t *testing.T, sc *storageClient, fake *fakeStorageAPI, remoteControl bool) *testAgent {
+	t.Helper()
+	return newTestAgentWithRoots(t, sc, fake, remoteControl, []agentRoot{{path: t.TempDir()}})
+}
+
+func newTestAgentWithRoots(t *testing.T, sc *storageClient, fake *fakeStorageAPI, remoteControl bool, roots []agentRoot) *testAgent {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	root := t.TempDir()
-	a := newAgentServer(ctx, []string{root}, testAgentSecret, sc, remoteControl, 0)
+	a := newAgentServer(ctx, roots, testAgentSecret, sc, remoteControl, 0)
 	server := httptest.NewServer(a.handler())
 	t.Cleanup(server.Close)
-	return &testAgent{t: t, url: server.URL, root: root, fake: fake, cancel: cancel}
+	return &testAgent{t: t, url: server.URL, root: roots[0].path, fake: fake, cancel: cancel, server: a}
 }
 
 // do sends a request carrying the agent secret and decodes the JSON
@@ -339,7 +345,7 @@ func TestTransferRegistryHistoryLimit(t *testing.T) {
 	ctx := context.Background()
 	var ids []string
 	for i := 0; i < 3; i++ {
-		id, err := tr.begin("", transferRecord{Direction: "upload"})
+		id, err := tr.begin("", transferRecord{Direction: "upload"}, func() {})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -355,15 +361,98 @@ func TestTransferRegistryHistoryLimit(t *testing.T) {
 		t.Errorf("evicted transfer %s still retrievable", ids[0])
 	}
 	// An evicted id may be reused.
-	if _, err := tr.begin(ids[0], transferRecord{}); err != nil {
+	if _, err := tr.begin(ids[0], transferRecord{}, func() {}); err != nil {
 		t.Errorf("reusing an evicted transferId: %v", err)
 	}
 
 	var ae *apiError
-	if _, err := tr.begin("not-a-uuid", transferRecord{}); !errors.As(err, &ae) || ae.Code != "invalid_transfer_id" {
+	if _, err := tr.begin("not-a-uuid", transferRecord{}, func() {}); !errors.As(err, &ae) || ae.Code != "invalid_transfer_id" {
 		t.Errorf("non-UUID transferId: err %v, want invalid_transfer_id", err)
 	}
 	if newTransferRegistry(0).limit != defaultTransferHistoryLimit {
 		t.Errorf("limit 0 should fall back to %d", defaultTransferHistoryLimit)
+	}
+}
+
+func TestAgentCancelAsyncTransfer(t *testing.T) {
+	fake := newFakeStorageAPI()
+	ta := newTestAgent(t, gatedDownloadServer(t, fake, make(chan struct{})), fake, true)
+	addFakeFile(fake, "f1", "x.bin", bytes.Repeat([]byte("x"), 4096))
+	local := filepath.Join(ta.root, "x.bin")
+
+	var accepted struct {
+		Transfer transferRecord `json:"transfer"`
+	}
+	ta.do("POST", "/transfer/download", map[string]interface{}{"nodeId": "f1", "localPath": local, "async": true}, &accepted)
+	id := accepted.Transfer.ID
+	ta.waitForTransfer(id, func(rec transferRecord) bool { return rec.BytesDone > 0 })
+
+	var out struct {
+		Transfer transferRecord `json:"transfer"`
+	}
+	if status := ta.do("DELETE", "/transfers/"+id, nil, &out); status != http.StatusOK {
+		t.Fatalf("DELETE /transfers/%s: status %d, want 200", id, status)
+	}
+	if out.Transfer.State != transferCanceled || out.Transfer.FinishedAt == nil {
+		t.Errorf("cancelled transfer = %+v, want state canceled with a finish time", out.Transfer)
+	}
+	if _, err := os.Stat(local + tmpSuffix); !os.IsNotExist(err) {
+		t.Errorf("temp file left behind after cancel (stat err %v)", err)
+	}
+
+	var errResp struct {
+		Error apiError `json:"error"`
+	}
+	if status := ta.do("DELETE", "/transfers/"+id, nil, &errResp); status != http.StatusConflict || errResp.Error.Code != "transfer_finished" {
+		t.Errorf("cancelling a finished transfer: status %d code %q, want 409 transfer_finished", status, errResp.Error.Code)
+	}
+	if status := ta.do("DELETE", "/transfers/"+uuid.NewString(), nil, nil); status != http.StatusNotFound {
+		t.Errorf("cancelling an unknown transfer: status %d, want 404", status)
+	}
+}
+
+func TestAgentCancelSyncTransfer(t *testing.T) {
+	fake := newFakeStorageAPI()
+	ta := newTestAgent(t, gatedDownloadServer(t, fake, make(chan struct{})), fake, true)
+	addFakeFile(fake, "f1", "x.bin", bytes.Repeat([]byte("x"), 4096))
+
+	id := uuid.NewString()
+	type result struct {
+		status int
+		code   string
+	}
+	done := make(chan result, 1)
+	go func() {
+		var errResp struct {
+			Error apiError `json:"error"`
+		}
+		status := ta.do("POST", "/transfer/download", map[string]string{
+			"nodeId": "f1", "localPath": filepath.Join(ta.root, "x.bin"), "transferId": id,
+		}, &errResp)
+		done <- result{status, errResp.Error.Code}
+	}()
+
+	// The caller-chosen transferId is what lets the transfer be found while
+	// the synchronous request is still in flight.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if rec, ok := ta.server.transfers.get(id); ok && rec.BytesDone > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("synchronous transfer never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status := ta.do("DELETE", "/transfers/"+id, nil, nil); status != http.StatusOK {
+		t.Fatalf("DELETE /transfers/%s: status %d, want 200", id, status)
+	}
+	select {
+	case res := <-done:
+		if res.status != http.StatusConflict || res.code != "transfer_canceled" {
+			t.Errorf("cancelled synchronous download answered %d %q, want 409 transfer_canceled", res.status, res.code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("synchronous download request never returned after cancel")
 	}
 }

@@ -103,8 +103,15 @@ var agentRootsFlag stringList
 
 // --- Local agent HTTP API ---
 
+// agentRoot is one directory remote control may access. A read-only root
+// rejects every endpoint that would change anything inside it.
+type agentRoot struct {
+	path     string // absolute, cleaned
+	readOnly bool
+}
+
 type agentServer struct {
-	roots         []string // absolute, cleaned allowed roots
+	roots         []agentRoot
 	secret        string
 	sc            *storageClient
 	remoteControl bool
@@ -113,6 +120,17 @@ type agentServer struct {
 	// shuts down.
 	ctx       context.Context
 	transfers *transferRegistry
+	// settings reads and changes the running sync's exclude list; nil when
+	// there's no sync to apply a change to.
+	settings excludeDirsSettings
+}
+
+// excludeDirsSettings is how the agent reads and changes the active account's
+// excludeDirs: persisted to config.yaml and applied to the running sync
+// engine (see syncExcludeDirsSettings in sync.go).
+type excludeDirsSettings interface {
+	excludeDirs() []string
+	setExcludeDirs(dirs []string) error
 }
 
 type fsEntry struct {
@@ -125,18 +143,19 @@ type fsEntry struct {
 // startAgentServer binds a loopback listener and serves the agent API. The
 // caller closes the returned listener to stop it. historyLimit caps the
 // finished-transfer history (<= 0 means defaultTransferHistoryLimit).
-func startAgentServer(ctx context.Context, roots []string, secret string, sc *storageClient, remoteControl bool, historyLimit int) (*agentServer, net.Listener, error) {
+func startAgentServer(ctx context.Context, roots []agentRoot, secret string, sc *storageClient, remoteControl bool, historyLimit int, settings excludeDirsSettings) (*agentServer, net.Listener, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, nil, err
 	}
 	a := newAgentServer(ctx, roots, secret, sc, remoteControl, historyLimit)
+	a.settings = settings
 	srv := &http.Server{Handler: a.handler()}
 	go srv.Serve(ln) //nolint:errcheck
 	return a, ln, nil
 }
 
-func newAgentServer(ctx context.Context, roots []string, secret string, sc *storageClient, remoteControl bool, historyLimit int) *agentServer {
+func newAgentServer(ctx context.Context, roots []agentRoot, secret string, sc *storageClient, remoteControl bool, historyLimit int) *agentServer {
 	return &agentServer{
 		roots:         roots,
 		secret:        secret,
@@ -164,7 +183,10 @@ func (a *agentServer) handler() http.Handler {
 	mux.HandleFunc("/transfer/upload", a.auth(a.handleUpload))
 	mux.HandleFunc("/transfer/download", a.auth(a.handleDownload))
 	mux.HandleFunc("/transfers", a.auth(a.handleTransfers))
-	mux.HandleFunc("/transfers/{id}", a.auth(a.handleTransfer))
+	mux.HandleFunc("GET /transfers/{id}", a.auth(a.handleTransfer))
+	mux.HandleFunc("DELETE /transfers/{id}", a.auth(a.handleCancelTransfer))
+	mux.HandleFunc("GET /config/exclude-dirs", a.auth(a.handleGetExcludeDirs))
+	mux.HandleFunc("PUT /config/exclude-dirs", a.auth(a.handleSetExcludeDirs))
 	return mux
 }
 
@@ -273,7 +295,7 @@ func (a *agentServer) resolveSafe(p string) (string, error) {
 		if len(a.roots) == 0 {
 			return "", newAPIError(http.StatusForbidden, "no_roots_configured", "no allowed roots configured")
 		}
-		return a.roots[0], nil
+		return a.roots[0].path, nil
 	}
 	if strings.HasPrefix(p, "~") {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -285,9 +307,34 @@ func (a *agentServer) resolveSafe(p string) (string, error) {
 		return "", newAPIError(http.StatusBadRequest, "invalid_path", err.Error())
 	}
 	abs = filepath.Clean(abs)
+	if _, ok := a.rootOf(abs); !ok {
+		return "", newAPIError(http.StatusForbidden, "path_outside_roots", "path is outside the allowed roots")
+	}
+	return abs, nil
+}
+
+// resolveWritable is resolveSafe for a path an endpoint is about to change:
+// it additionally rejects a path inside a read-only root.
+func (a *agentServer) resolveWritable(p string) (string, error) {
+	abs, err := a.resolveSafe(p)
+	if err != nil {
+		return "", err
+	}
+	if root, _ := a.rootOf(abs); root.readOnly {
+		return "", newAPIError(http.StatusForbidden, "read_only_root", "path is inside a read-only root")
+	}
+	return abs, nil
+}
+
+// rootOf returns the root abs lies within. When roots nest, the innermost
+// one wins, so a writable folder inside a read-only root (or the reverse)
+// gets its own setting.
+func (a *agentServer) rootOf(abs string) (agentRoot, bool) {
 	real := evalSafe(abs)
+	var best agentRoot
+	bestLen := -1
 	for _, root := range a.roots {
-		rootReal := evalSafe(root)
+		rootReal := evalSafe(root.path)
 		// prefix carries a trailing separator so "/a/b" doesn't match "/a/bc";
 		// for the filesystem root ("/") rootReal already ends in a separator, so
 		// guard against producing "//" which would reject every child path.
@@ -295,11 +342,11 @@ func (a *agentServer) resolveSafe(p string) (string, error) {
 		if !strings.HasSuffix(prefix, string(os.PathSeparator)) {
 			prefix += string(os.PathSeparator)
 		}
-		if real == rootReal || strings.HasPrefix(real, prefix) {
-			return abs, nil
+		if (real == rootReal || strings.HasPrefix(real, prefix)) && len(rootReal) > bestLen {
+			best, bestLen = root, len(rootReal)
 		}
 	}
-	return "", newAPIError(http.StatusForbidden, "path_outside_roots", "path is outside the allowed roots")
+	return best, bestLen >= 0
 }
 
 // isRoot reports whether abs is exactly one of the configured roots (which must
@@ -307,7 +354,7 @@ func (a *agentServer) resolveSafe(p string) (string, error) {
 func (a *agentServer) isRoot(abs string) bool {
 	real := evalSafe(abs)
 	for _, root := range a.roots {
-		if real == evalSafe(root) {
+		if real == evalSafe(root.path) {
 			return true
 		}
 	}
@@ -323,9 +370,20 @@ func (a *agentServer) resolveParam(w http.ResponseWriter, r *http.Request, key s
 	return abs, true
 }
 
+// resolveWritableParam is resolveParam for a path the endpoint will change.
+func (a *agentServer) resolveWritableParam(w http.ResponseWriter, r *http.Request, key string) (string, bool) {
+	abs, err := a.resolveWritable(r.URL.Query().Get(key))
+	if err != nil {
+		writeErr(w, err)
+		return "", false
+	}
+	return abs, true
+}
+
 type rootEntry struct {
-	Path string `json:"path"`
-	Name string `json:"name"`
+	Path     string `json:"path"`
+	Name     string `json:"name"`
+	ReadOnly bool   `json:"readOnly"`
 }
 
 // handleRoots lists the allowed roots so a client can discover what it may
@@ -334,7 +392,7 @@ type rootEntry struct {
 func (a *agentServer) handleRoots(w http.ResponseWriter, r *http.Request) {
 	roots := make([]rootEntry, 0, len(a.roots))
 	for _, root := range a.roots {
-		roots = append(roots, rootEntry{Path: root, Name: filepath.Base(root)})
+		roots = append(roots, rootEntry{Path: root.path, Name: filepath.Base(root.path), ReadOnly: root.readOnly})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"roots": roots})
 }
@@ -419,7 +477,7 @@ func (a *agentServer) handleRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *agentServer) handleWrite(w http.ResponseWriter, r *http.Request) {
-	abs, ok := a.resolveParam(w, r, "path")
+	abs, ok := a.resolveWritableParam(w, r, "path")
 	if !ok {
 		return
 	}
@@ -449,7 +507,7 @@ func (a *agentServer) handleWrite(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *agentServer) handleMkdir(w http.ResponseWriter, r *http.Request) {
-	abs, ok := a.resolveParam(w, r, "path")
+	abs, ok := a.resolveWritableParam(w, r, "path")
 	if !ok {
 		return
 	}
@@ -461,7 +519,7 @@ func (a *agentServer) handleMkdir(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *agentServer) handleDelete(w http.ResponseWriter, r *http.Request) {
-	abs, ok := a.resolveParam(w, r, "path")
+	abs, ok := a.resolveWritableParam(w, r, "path")
 	if !ok {
 		return
 	}
@@ -481,18 +539,24 @@ type fromToReq struct {
 	To   string `json:"to"`
 }
 
-func (a *agentServer) resolveFromTo(w http.ResponseWriter, r *http.Request) (string, string, bool) {
+// resolveFromTo resolves a move/copy request's paths. to is always written
+// to; from only when fromWritable (a move removes it, a copy just reads it).
+func (a *agentServer) resolveFromTo(w http.ResponseWriter, r *http.Request, fromWritable bool) (string, string, bool) {
 	var req fromToReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 		return "", "", false
 	}
-	from, err := a.resolveSafe(req.From)
+	resolveFrom := a.resolveSafe
+	if fromWritable {
+		resolveFrom = a.resolveWritable
+	}
+	from, err := resolveFrom(req.From)
 	if err != nil {
 		writeErr(w, err)
 		return "", "", false
 	}
-	to, err := a.resolveSafe(req.To)
+	to, err := a.resolveWritable(req.To)
 	if err != nil {
 		writeErr(w, err)
 		return "", "", false
@@ -501,7 +565,7 @@ func (a *agentServer) resolveFromTo(w http.ResponseWriter, r *http.Request) (str
 }
 
 func (a *agentServer) handleMove(w http.ResponseWriter, r *http.Request) {
-	from, to, ok := a.resolveFromTo(w, r)
+	from, to, ok := a.resolveFromTo(w, r, true)
 	if !ok {
 		return
 	}
@@ -521,7 +585,7 @@ func (a *agentServer) handleMove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *agentServer) handleCopy(w http.ResponseWriter, r *http.Request) {
-	from, to, ok := a.resolveFromTo(w, r)
+	from, to, ok := a.resolveFromTo(w, r, false)
 	if !ok {
 		return
 	}
@@ -590,6 +654,9 @@ func copyFile(src, dst string, mode os.FileMode) error {
 //   - async: respond 202 with the transfer record right away and run the
 //     transfer in the background, rather than holding the request open until
 //     it finishes. Inputs are still validated before responding.
+//
+// DELETE /transfers/{id} cancels either kind. A cancelled synchronous
+// request answers 409 transfer_canceled.
 
 type uploadReq struct {
 	LocalPath  string `json:"localPath"`
@@ -630,20 +697,22 @@ func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = filepath.Base(abs)
 	}
+	ctx, cancel := a.transferContext(r, req.Async)
 	id, err := a.transfers.begin(req.TransferID, transferRecord{
 		Direction:  "upload",
 		LocalPath:  abs,
 		ParentID:   req.ParentID,
 		Name:       name,
 		BytesTotal: info.Size(),
-	})
+	}, cancel)
 	if err != nil {
+		cancel()
 		f.Close()
 		writeErr(w, err)
 		return
 	}
 
-	run := func(ctx context.Context) (*storageNode, error) {
+	run := func() (*storageNode, error) {
 		defer f.Close()
 		node, err := a.sc.uploadStream(ctx, req.ParentID, name, f, info.Size(), func(written int64) {
 			a.transfers.progress(id, written)
@@ -652,12 +721,16 @@ func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return node, err
 	}
 	if req.Async {
-		go run(a.ctx) //nolint:errcheck // the outcome is recorded in a.transfers
+		go run() //nolint:errcheck // the outcome is recorded in a.transfers
 		a.writeTransferAccepted(w, id)
 		return
 	}
-	node, err := run(r.Context())
+	node, err := run()
 	if err != nil {
+		if a.transfers.canceled(id) {
+			writeTransferCanceled(w)
+			return
+		}
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
@@ -678,7 +751,7 @@ func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 		return
 	}
-	abs, err := a.resolveSafe(req.LocalPath)
+	abs, err := a.resolveWritable(req.LocalPath)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -698,19 +771,21 @@ func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeOSError(w, err)
 		return
 	}
+	ctx, cancel := a.transferContext(r, req.Async)
 	id, err := a.transfers.begin(req.TransferID, transferRecord{
 		Direction:  "download",
 		LocalPath:  abs,
 		NodeID:     node.ID,
 		Name:       node.Name,
 		BytesTotal: node.SizeBytes,
-	})
+	}, cancel)
 	if err != nil {
+		cancel()
 		writeErr(w, err)
 		return
 	}
 
-	run := func(ctx context.Context) error {
+	run := func() error {
 		err := a.sc.downloadToFile(ctx, node.ID, abs, node.SizeBytes, func(written, _ int64) {
 			a.transfers.progress(id, written)
 		})
@@ -718,11 +793,15 @@ func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return err
 	}
 	if req.Async {
-		go run(a.ctx) //nolint:errcheck // the outcome is recorded in a.transfers
+		go run() //nolint:errcheck // the outcome is recorded in a.transfers
 		a.writeTransferAccepted(w, id)
 		return
 	}
-	if err := run(r.Context()); err != nil {
+	if err := run(); err != nil {
+		if a.transfers.canceled(id) {
+			writeTransferCanceled(w)
+			return
+		}
 		var pathErr *os.PathError
 		var linkErr *os.LinkError
 		if errors.As(err, &pathErr) || errors.As(err, &linkErr) {
@@ -734,6 +813,20 @@ func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	rec, _ := a.transfers.get(id)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"path": abs, "ok": true, "transfer": rec})
+}
+
+// transferContext returns the context a transfer runs under, cancellable via
+// DELETE /transfers/{id}. A synchronous transfer is also tied to its request;
+// an async one outlives the request and stops only when brick shuts down.
+func (a *agentServer) transferContext(r *http.Request, async bool) (context.Context, context.CancelFunc) {
+	if async {
+		return context.WithCancel(a.ctx)
+	}
+	return context.WithCancel(r.Context())
+}
+
+func writeTransferCanceled(w http.ResponseWriter) {
+	writeError(w, http.StatusConflict, "transfer_canceled", "the transfer was canceled")
 }
 
 // writeTransferAccepted answers an async transfer request with the
@@ -1038,14 +1131,19 @@ func deregisterAgent(storageURL, apiURL string, cfg *Config) {
 // resolveAgentRoots returns the absolute, de-duplicated set of roots the agent
 // may access: the --agent-root CLI flags plus cfg.AgentRoots. The sync folder
 // itself is not implicitly included — only directories explicitly configured
-// for remote control are exposed.
-func resolveAgentRoots(cfg *Config) []string {
-	raw := append([]string{}, agentRootsFlag...)
+// for remote control are exposed. Flag roots are always read-only; a config
+// root is read-only unless it sets readOnly: false. A path listed more than
+// once is read-only if any listing says so.
+func resolveAgentRoots(cfg *Config) []agentRoot {
+	raw := make([]AgentRoot, 0, len(agentRootsFlag)+len(cfg.AgentRoots))
+	for _, p := range agentRootsFlag {
+		raw = append(raw, AgentRoot{Path: p})
+	}
 	raw = append(raw, cfg.AgentRoots...)
 
-	seen := map[string]bool{}
-	var out []string
-	add := func(p string) {
+	index := map[string]int{}
+	var out []agentRoot
+	add := func(p string, readOnly bool) {
 		if strings.HasPrefix(p, "~") {
 			if home, err := os.UserHomeDir(); err == nil {
 				p = filepath.Join(home, strings.TrimPrefix(p, "~"))
@@ -1056,15 +1154,30 @@ func resolveAgentRoots(cfg *Config) []string {
 			return
 		}
 		abs = filepath.Clean(abs)
-		if !seen[abs] {
-			seen[abs] = true
-			out = append(out, abs)
+		if i, ok := index[abs]; ok {
+			out[i].readOnly = out[i].readOnly || readOnly
+			return
 		}
+		index[abs] = len(out)
+		out = append(out, agentRoot{path: abs, readOnly: readOnly})
 	}
 	for _, r := range raw {
-		add(r)
+		add(r.Path, r.isReadOnly())
 	}
 	return out
+}
+
+// formatAgentRoots renders roots for the "Remote control enabled" log line.
+func formatAgentRoots(roots []agentRoot) string {
+	parts := make([]string, len(roots))
+	for i, r := range roots {
+		mode := "read-write"
+		if r.readOnly {
+			mode = "read-only"
+		}
+		parts[i] = fmt.Sprintf("%s (%s)", r.path, mode)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // newAgentSecret returns a fresh random secret for the agent session.

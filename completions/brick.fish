@@ -54,7 +54,7 @@ complete -c brick -n '__fish_seen_subcommand_from sync' -s r -l remote-control \
     -d 'Allow the Storage API to remotely list/browse/transfer files on this device'
 
 complete -c brick -n '__fish_seen_subcommand_from sync' -l agent-root \
-    -d 'Additional directory to expose to remote clients when remote control is enabled' -r
+    -d 'Additional read-only directory to expose to remote clients when remote control is enabled' -r
 
 complete -c brick -n '__fish_seen_subcommand_from sync' -s s -l selective-sync \
     -d 'Choose which folders to exclude from sync'

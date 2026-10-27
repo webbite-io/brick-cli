@@ -61,7 +61,7 @@ type Config struct {
 	// exposes to remote clients attached via the storage API. Global rather
 	// than per-account: which extra directories a device shares isn't tied to
 	// any one Brick account.
-	AgentRoots []string `yaml:"agentRoots,omitempty"`
+	AgentRoots []AgentRoot `yaml:"agentRoots,omitempty"`
 
 	// RemoteControl, when true, enables remote file access (equivalent to
 	// always passing -r/--remote-control) without needing the flag on every
@@ -73,6 +73,42 @@ type Config struct {
 	// GET /transfers reports for the running session. Unset (or <= 0) means
 	// defaultTransferHistoryLimit.
 	TransferHistoryLimit int `yaml:"transferHistoryLimit,omitempty"`
+}
+
+// AgentRoot is one agentRoots entry. It's written either as a plain path,
+// which is read-only, or as a mapping that sets readOnly explicitly:
+//
+//	agentRoots:
+//	  - /home/me/Documents
+//	  - path: /home/me/Shared
+//	    readOnly: false
+type AgentRoot struct {
+	Path string `yaml:"path"`
+	// ReadOnly, when unset or true, makes remote control reject every
+	// endpoint that would change anything under Path.
+	ReadOnly *bool `yaml:"readOnly,omitempty"`
+}
+
+func (r AgentRoot) isReadOnly() bool { return r.ReadOnly == nil || *r.ReadOnly }
+
+// UnmarshalYAML accepts both the plain-path and the mapping form.
+func (r *AgentRoot) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		*r = AgentRoot{Path: node.Value}
+		return nil
+	}
+	type plain AgentRoot // no methods, so Decode doesn't recurse back here
+	return node.Decode((*plain)(r))
+}
+
+// MarshalYAML keeps an entry with readOnly unset in the plain-path form, so
+// saving the config doesn't rewrite existing entries.
+func (r AgentRoot) MarshalYAML() (interface{}, error) {
+	if r.ReadOnly == nil {
+		return r.Path, nil
+	}
+	type plain AgentRoot
+	return plain(r), nil
 }
 
 // AccountConfig holds the per-account settings for one entry in Config.Accounts.
@@ -287,7 +323,7 @@ func printHelp() {
 	fmt.Printf("    -d, --daemon                Detach into the background once logged in and the Storage API is reachable\n")
 	fmt.Printf("        --json                  With -d: print one JSON status line instead of running interactively\n")
 	fmt.Printf("    -r, --remote-control        Allow remote control via Brick webapp (also possible to enable via config file)\n")
-	fmt.Printf("        --agent-root PATH       Directory to expose to remote clients when remote control is enabled (repeatable)\n")
+	fmt.Printf("        --agent-root PATH       Read-only directory to expose to remote clients when remote control is enabled (repeatable)\n")
 	fmt.Printf("    -s, --selective-sync        Choose which folders to exclude from sync (deletes their local copies)\n")
 	fmt.Printf("        --list-selective-sync   List the folders currently excluded from sync\n")
 	fmt.Printf("        --dry-run               Report what would be synced without transferring, deleting or writing anything\n")

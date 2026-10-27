@@ -41,7 +41,7 @@ _brick() {
                         '(-d --daemon)'{-d,--daemon}'[Detach into the background once logged in and reachable]'
                         '(--json)'--json'[With -d: print one JSON status line instead of running interactively]'
                         '(-r --remote-control)'{-r,--remote-control}'[Allow the Storage API to remotely list/browse/transfer files on this device]'
-                        '(--agent-root)'--agent-root'[Additional directory to expose to remote clients when remote control is enabled]:directory:_files -/'
+                        '(--agent-root)'--agent-root'[Additional read-only directory to expose to remote clients when remote control is enabled]:directory:_files -/'
                         '(-s --selective-sync)'{-s,--selective-sync}'[Choose which folders to exclude from sync]'
                         '(--list-selective-sync)'--list-selective-sync'[List the folders currently excluded from sync]'
                         '(--dry-run)'--dry-run'[Report what would be synced without transferring, deleting or writing anything]'

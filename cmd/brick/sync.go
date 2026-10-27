@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -609,6 +610,10 @@ type SyncState struct {
 	// startup seeds it. Persisted so a restart resumes incremental polling
 	// rather than re-scanning the whole tree on every tick.
 	ServerTime int64 `json:"serverTime"`
+	// ExcludeDirs is the excludeDirs list the index was last reconciled
+	// with, so a pass can tell which folders have been un-excluded since —
+	// see reconcileExcludeDirsChange.
+	ExcludeDirs []string `json:"excludeDirs,omitempty"`
 }
 
 // syncStatePath returns the state file for one account, keyed by its account
@@ -660,7 +665,13 @@ type syncEngine struct {
 
 	// excludeDirs are the configured excludeDirs entries (slash-separated,
 	// relative to folder); files under them are never uploaded or downloaded.
+	// Guarded by e.mu; changed mid-session only via pendingExcludeDirs.
 	excludeDirs []string
+	// pendingExcludeDirs holds an excludeDirs change made while the engine
+	// runs (PUT /config/exclude-dirs), adopted at the start of the next pass.
+	// Handed over this way rather than by taking e.mu, which a pass holds for
+	// as long as it runs.
+	pendingExcludeDirs atomic.Pointer[[]string]
 
 	// firstSync is true only for the very first reconcileAll call of this
 	// process. conflictMode ("device", "brick" or "copy") says how to resolve a
@@ -1618,6 +1629,11 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullWalk bool, c
 		return err
 	}
 
+	if dirs := e.pendingExcludeDirs.Swap(nil); dirs != nil {
+		e.excludeDirs = *dirs
+	}
+	e.reconcileExcludeDirsChange()
+
 	// wasConverged records whether the *previous* pass ran its file pass (3,
 	// below) to completion. e.filesConverged itself is set false the instant
 	// this pass starts and only flips back to true once this pass's own file
@@ -2121,6 +2137,59 @@ func isUnderAny(rel string, handled map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// queueExcludeDirs hands the engine a new excludeDirs list, which the next
+// reconcile pass adopts. The caller should then trigger a pass.
+func (e *syncEngine) queueExcludeDirs(dirs []string) {
+	dirs = slices.Clone(dirs)
+	e.pendingExcludeDirs.Store(&dirs)
+}
+
+// reconcileExcludeDirsChange brings the sync index in line with an
+// excludeDirs change since it was last reconciled: one made mid-session via
+// PUT /config/exclude-dirs, or between runs by 'brick sync -s' or a config
+// edit. Must be called with e.mu held, before anything reads the index.
+//
+// While a folder is excluded the index keeps recording it: pass 2 records
+// the remote folder even though it's never created locally, and
+// reconcileExcludedFile records each file with whichever sides it exists on.
+// Once the folder is un-excluded, an entry for a folder or file missing
+// locally would read as "synced before, deleted locally since" and get
+// trashed on the server, and a file entry with no remote node as "deleted
+// remotely" and get removed locally. So those entries are dropped, leaving
+// the paths looking new, to be downloaded or uploaded instead. Entries for
+// files on both sides stay: they're current, and spare a re-transfer.
+//
+// Any change also forces the next file pass over every path, since an
+// un-exclude changes nothing an incremental pass would otherwise notice.
+func (e *syncEngine) reconcileExcludeDirsChange() {
+	prev := e.state.ExcludeDirs
+	if slices.Equal(prev, e.excludeDirs) {
+		return
+	}
+	e.state.ExcludeDirs = slices.Clone(e.excludeDirs)
+	e.filesConverged = false
+	e.localTreeValid = false
+
+	unexcluded := func(rel string) bool {
+		return isExcludedPath(rel, prev) && !isExcludedPath(rel, e.excludeDirs)
+	}
+	missingLocally := func(rel string) bool {
+		_, err := os.Lstat(filepath.Join(e.folder, filepath.FromSlash(rel)))
+		return errors.Is(err, fs.ErrNotExist)
+	}
+	for rel := range e.state.Folders {
+		if unexcluded(rel) && missingLocally(rel) {
+			delete(e.state.Folders, rel)
+			delete(e.state.FolderIDs, rel)
+		}
+	}
+	for rel, entry := range e.state.Entries {
+		if unexcluded(rel) && (entry.NodeID == "" || missingLocally(rel)) {
+			delete(e.state.Entries, rel)
+		}
+	}
 }
 
 // isExcludedPath reports whether rel (a slash-separated path relative to the
@@ -3439,7 +3508,8 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 	// failures here are non-fatal to syncing.
 	agentRoots := resolveAgentRoots(cfg)
 	agentSecret := newAgentSecret()
-	if _, agentLn, aerr := startAgentServer(ctx, agentRoots, agentSecret, sc, remoteControl, cfg.TransferHistoryLimit); aerr != nil {
+	settings := &syncExcludeDirsSettings{cfg: cfg, eng: eng, notify: notify}
+	if _, agentLn, aerr := startAgentServer(ctx, agentRoots, agentSecret, sc, remoteControl, cfg.TransferHistoryLimit, settings); aerr != nil {
 		log.Printf("could not start remote file agent: %v", aerr)
 	} else {
 		agentAddr := agentLn.Addr().String()
@@ -3451,7 +3521,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 			// Logged rather than printed: in interactive mode the sync TUI
 			// owns the whole screen, and writing to stdout behind its back
 			// would be clobbered by its next repaint.
-			log.Printf("Remote control enabled (roots: %s)", strings.Join(agentRoots, ", "))
+			log.Printf("Remote control enabled (roots: %s)", formatAgentRoots(agentRoots))
 		}
 		// Give the agent connection a short head start so its own "Brick CLI
 		// connected..." line reliably lands ahead of the initial reconcile
@@ -4053,6 +4123,50 @@ func promptCreateFolder(home string) (string, error) {
 	return folder, nil
 }
 
+// syncExcludeDirsSettings is the agent's view of the active account's
+// excludeDirs during a sync session: a change is saved to config.yaml, then
+// handed to the engine and a reconcile pass triggered.
+type syncExcludeDirsSettings struct {
+	cfg    *Config
+	eng    *syncEngine
+	notify func()
+}
+
+// excludeDirs and setExcludeDirs hold tokenMu while touching cfg: it's what
+// serializes rotateAccessToken's own saveConfig of the same *Config.
+func (s *syncExcludeDirsSettings) excludeDirs() []string {
+	tokenMu.Lock()
+	defer tokenMu.Unlock()
+	if ac := s.cfg.activeAccount(); ac != nil {
+		return slices.Clone(ac.ExcludeDirs)
+	}
+	return nil
+}
+
+func (s *syncExcludeDirsSettings) setExcludeDirs(dirs []string) error {
+	tokenMu.Lock()
+	ac := s.cfg.ensureActiveAccount()
+	prev := ac.ExcludeDirs
+	ac.ExcludeDirs = dirs
+	err := saveConfig(s.cfg)
+	if err != nil {
+		ac.ExcludeDirs = prev
+	}
+	tokenMu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	s.eng.queueExcludeDirs(dirs)
+	s.notify()
+	if len(dirs) == 0 {
+		log.Printf("Excluded folders updated remotely: none")
+	} else {
+		log.Printf("Excluded folders updated remotely: %s", strings.Join(dirs, ", "))
+	}
+	return nil
+}
+
 // promptForRemoteControl asks, during first-time onboarding, whether to
 // enable remote file access (-r/--remote-control) by default and, if so,
 // which folder to expose as its root. The choice is persisted to
@@ -4120,13 +4234,13 @@ func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
 	cfg.RemoteControl = true
 	present := false
 	for _, r := range cfg.AgentRoots {
-		if r == abs {
+		if r.Path == abs {
 			present = true
 			break
 		}
 	}
 	if !present {
-		cfg.AgentRoots = append(cfg.AgentRoots, abs)
+		cfg.AgentRoots = append(cfg.AgentRoots, AgentRoot{Path: abs}) // read-only by default
 	}
 	if err := saveConfig(cfg); err != nil {
 		return err
