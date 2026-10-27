@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -397,23 +398,83 @@ func (a *agentServer) handleRoots(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"roots": roots})
 }
 
+// handleList serves /fs/list. Its optional query params match the Brick
+// API's GET /nodes/{id}/children: sort (name, sizeBytes or updatedAt — a
+// file's modification time here) and sortOrder (asc or desc), defaulting to
+// name ascending. As there, folders aren't grouped first, and names compare
+// byte-wise. showHidden=false leaves out dot-files and dot-folders.
 func (a *agentServer) handleList(w http.ResponseWriter, r *http.Request) {
 	abs, ok := a.resolveParam(w, r, "path")
 	if !ok {
 		return
 	}
+	q := r.URL.Query()
+	sortField, sortOrder := q.Get("sort"), q.Get("sortOrder")
+	if sortField == "" {
+		sortField = "name"
+	}
+	if sortOrder == "" {
+		sortOrder = "asc"
+	}
+	if sortField != "name" && sortField != "sizeBytes" && sortField != "updatedAt" {
+		writeError(w, http.StatusBadRequest, "invalid_sort", "sort must be name, sizeBytes or updatedAt")
+		return
+	}
+	if sortOrder != "asc" && sortOrder != "desc" {
+		writeError(w, http.StatusBadRequest, "invalid_sort", "sortOrder must be asc or desc")
+		return
+	}
+	showHidden := true
+	if v := q.Get("showHidden"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "showHidden must be true or false")
+			return
+		}
+		showHidden = b
+	}
+
 	dirents, err := os.ReadDir(abs)
 	if err != nil {
 		writeOSError(w, err)
 		return
 	}
-	entries := make([]fsEntry, 0, len(dirents))
+	infos := make([]os.FileInfo, 0, len(dirents))
 	for _, d := range dirents {
+		if !showHidden && strings.HasPrefix(d.Name(), ".") {
+			continue
+		}
 		info, err := d.Info()
 		if err != nil {
 			continue
 		}
-		entries = append(entries, toEntry(info))
+		infos = append(infos, info)
+	}
+
+	// Ties fall back to name, the way the Brick API falls back to node ID.
+	less := func(x, y os.FileInfo) bool {
+		switch sortField {
+		case "sizeBytes":
+			if x.Size() != y.Size() {
+				return x.Size() < y.Size()
+			}
+		case "updatedAt":
+			if !x.ModTime().Equal(y.ModTime()) {
+				return x.ModTime().Before(y.ModTime())
+			}
+		}
+		return x.Name() < y.Name()
+	}
+	sort.SliceStable(infos, func(i, j int) bool {
+		if sortOrder == "desc" {
+			return less(infos[j], infos[i])
+		}
+		return less(infos[i], infos[j])
+	})
+
+	entries := make([]fsEntry, len(infos))
+	for i, info := range infos {
+		entries[i] = toEntry(info)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"path": abs, "entries": entries})
 }
