@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestAgentListSortAndShowHidden(t *testing.T) {
+func TestAgentListSortFilterAndPaginate(t *testing.T) {
 	sc, fake := newTestTransferClient(t)
 	ta := newTestAgent(t, sc, fake, true)
 
@@ -63,6 +63,11 @@ func TestAgentListSortAndShowHidden(t *testing.T) {
 		{"&sort=updatedAt&sortOrder=desc&showHidden=false", []string{"b.txt", "c.txt", "a.txt"}},
 		{"&showHidden=true", []string{".hidden", "a.txt", "b.txt", "c.txt"}},
 		{"&showHidden=false", []string{"a.txt", "b.txt", "c.txt"}},
+		{"&limit=2", []string{".hidden", "a.txt"}},
+		{"&limit=2&offset=2", []string{"b.txt", "c.txt"}},
+		{"&limit=0&offset=1", []string{"a.txt", "b.txt", "c.txt"}},
+		{"&offset=9", []string{}},
+		{"&sort=sizeBytes&sortOrder=desc&showHidden=false&limit=1&offset=1", []string{"c.txt"}},
 	}
 	for _, tc := range cases {
 		if got := list(tc.query); !slices.Equal(got, tc.want) {
@@ -70,7 +75,16 @@ func TestAgentListSortAndShowHidden(t *testing.T) {
 		}
 	}
 
-	for _, bad := range []string{"&sort=createdAt", "&sortOrder=up", "&showHidden=maybe"} {
+	// count is the total after filtering, before paging.
+	var out struct {
+		Entries []fsEntry `json:"entries"`
+		Count   int       `json:"count"`
+	}
+	if status := ta.do("GET", "/fs/list?path="+ta.root+"&showHidden=false&limit=1", nil, &out); status != http.StatusOK || out.Count != 3 || len(out.Entries) != 1 {
+		t.Errorf("GET /fs/list&showHidden=false&limit=1: status %d, count %d, %d entries; want 200, 3, 1", status, out.Count, len(out.Entries))
+	}
+
+	for _, bad := range []string{"&sort=createdAt", "&sortOrder=up", "&showHidden=maybe", "&limit=-1", "&offset=x"} {
 		if status := ta.do("GET", "/fs/list?path="+ta.root+bad, nil, nil); status != http.StatusBadRequest {
 			t.Errorf("GET /fs/list%s: status %d, want 400", bad, status)
 		}

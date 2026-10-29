@@ -402,7 +402,10 @@ func (a *agentServer) handleRoots(w http.ResponseWriter, r *http.Request) {
 // API's GET /nodes/{id}/children: sort (name, sizeBytes or updatedAt — a
 // file's modification time here) and sortOrder (asc or desc), defaulting to
 // name ascending. As there, folders aren't grouped first, and names compare
-// byte-wise. showHidden=false leaves out dot-files and dot-folders.
+// byte-wise. showHidden=false leaves out dot-files and dot-folders. limit and
+// offset page through the sorted entries, and count is the total before
+// paging. Unlike the Brick API, an omitted (or 0) limit returns every entry,
+// as /fs/list always has.
 func (a *agentServer) handleList(w http.ResponseWriter, r *http.Request) {
 	abs, ok := a.resolveParam(w, r, "path")
 	if !ok {
@@ -432,6 +435,20 @@ func (a *agentServer) handleList(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		showHidden = b
+	}
+	limit, offset := 0, 0
+	for _, p := range []struct {
+		name string
+		dst  *int
+	}{{"limit", &limit}, {"offset", &offset}} {
+		if v := q.Get(p.name); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				writeError(w, http.StatusBadRequest, "invalid_request", p.name+" must be a non-negative integer")
+				return
+			}
+			*p.dst = n
+		}
 	}
 
 	dirents, err := os.ReadDir(abs)
@@ -472,11 +489,17 @@ func (a *agentServer) handleList(w http.ResponseWriter, r *http.Request) {
 		return less(infos[i], infos[j])
 	})
 
+	count := len(infos)
+	infos = infos[min(offset, count):]
+	if limit > 0 && limit < len(infos) {
+		infos = infos[:limit]
+	}
+
 	entries := make([]fsEntry, len(infos))
 	for i, info := range infos {
 		entries[i] = toEntry(info)
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"path": abs, "entries": entries})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"path": abs, "entries": entries, "count": count})
 }
 
 func (a *agentServer) handleStat(w http.ResponseWriter, r *http.Request) {
