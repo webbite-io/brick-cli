@@ -555,9 +555,51 @@ func (a *agentServer) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", info.Name()))
+	w.Header().Set("Content-Disposition", contentDisposition(info.Name()))
 	w.WriteHeader(http.StatusOK)
 	io.Copy(w, f)
+}
+
+// contentDisposition is an attachment header that names the file correctly in
+// a browser saving it natively. Go's %q is not the header's quoting: it
+// escapes non-ASCII as \uXXXX, which a browser shows literally. A name that
+// isn't plain ASCII gets an ASCII stand-in in filename plus the real name,
+// UTF-8 and percent-encoded, in filename* (RFC 6266/5987), which browsers
+// prefer when present.
+func contentDisposition(name string) string {
+	var fallback strings.Builder
+	plain := true
+	for _, r := range name {
+		if r < 0x20 || r > 0x7e || r == '"' || r == '\\' {
+			fallback.WriteByte('_')
+			plain = false
+		} else {
+			fallback.WriteRune(r)
+		}
+	}
+	header := `attachment; filename="` + fallback.String() + `"`
+	if plain {
+		return header
+	}
+	var encoded strings.Builder
+	for _, b := range []byte(name) {
+		if isRFC5987AttrChar(b) {
+			encoded.WriteByte(b)
+		} else {
+			fmt.Fprintf(&encoded, "%%%02X", b)
+		}
+	}
+	return header + "; filename*=UTF-8''" + encoded.String()
+}
+
+// isRFC5987AttrChar reports whether b may appear unencoded in an RFC 5987
+// ext-value.
+func isRFC5987AttrChar(b byte) bool {
+	switch {
+	case 'a' <= b && b <= 'z', 'A' <= b && b <= 'Z', '0' <= b && b <= '9':
+		return true
+	}
+	return strings.IndexByte("!#$&+-.^_`|~", b) >= 0
 }
 
 func (a *agentServer) handleWrite(w http.ResponseWriter, r *http.Request) {
