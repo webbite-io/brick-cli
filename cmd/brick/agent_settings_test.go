@@ -33,9 +33,9 @@ func TestAgentReadOnlyRootRejectsWrites(t *testing.T) {
 		name, method, path string
 		body               interface{}
 	}{
-		{"write", "POST", "/fs/write?path=" + filepath.Join(ro, "new.txt"), nil},
+		{"write", "PUT", "/fs/write?path=" + filepath.Join(ro, "new.txt"), nil},
 		{"mkdir", "POST", "/fs/mkdir?path=" + filepath.Join(ro, "dir"), nil},
-		{"delete", "POST", "/fs/delete?path=" + file, nil},
+		{"delete", "DELETE", "/fs/delete?path=" + file, nil},
 		{"move out of read-only", "POST", "/fs/move", fromToReq{From: file, To: filepath.Join(rw, "notes.txt")}},
 		{"move into read-only", "POST", "/fs/move", fromToReq{From: filepath.Join(rw, "x"), To: filepath.Join(ro, "x")}},
 		{"copy into read-only", "POST", "/fs/copy", fromToReq{From: file, To: filepath.Join(ro, "copy.txt")}},
