@@ -191,6 +191,7 @@ func (a *agentServer) handler() http.Handler {
 	mux.HandleFunc("POST /transfer/download", a.auth(a.handleDownload))
 	mux.HandleFunc("POST /transfer/upload-batch", a.auth(a.handleUploadBatch))
 	mux.HandleFunc("POST /transfer/download-batch", a.auth(a.handleDownloadBatch))
+	mux.HandleFunc("POST /transfer/client-batch", a.auth(a.handleClientBatch))
 	mux.HandleFunc("GET /transfers", a.auth(a.handleTransfers))
 	mux.HandleFunc("GET /transfers/{id}", a.auth(a.handleTransfer))
 	mux.HandleFunc("DELETE /transfers/{id}", a.auth(a.handleCancelTransfer))
@@ -695,7 +696,33 @@ func (a *agentServer) resolveFromTo(w http.ResponseWriter, r *http.Request, from
 		writeErr(w, err)
 		return "", "", false
 	}
+	if err := checkFromTo(from, to); err != nil {
+		writeErr(w, err)
+		return "", "", false
+	}
 	return from, to, true
+}
+
+// checkFromTo refuses a move or copy that would write over something already
+// at to, or put a folder inside itself (which a copy would recurse into
+// forever). Moving a path onto itself under another case, as a rename on a
+// case-insensitive disk does, isn't writing over anything.
+func checkFromTo(from, to string) error {
+	realFrom, realTo := evalSafe(from), evalSafe(to)
+	if realTo != realFrom && strings.HasPrefix(realTo, realFrom+string(filepath.Separator)) {
+		return newAPIError(http.StatusBadRequest, "invalid_destination", "a folder can't go inside itself")
+	}
+	toInfo, err := os.Lstat(to)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if fromInfo, err := os.Lstat(from); err == nil && os.SameFile(fromInfo, toInfo) && from != to {
+		return nil
+	}
+	return newAPIError(http.StatusConflict, "exists", "a file or folder with this name already exists")
 }
 
 func (a *agentServer) handleMove(w http.ResponseWriter, r *http.Request) {

@@ -213,7 +213,12 @@ func (sc *storageClient) downloadToFile(ctx context.Context, nodeID, destPath st
 	if resp.StatusCode != http.StatusOK {
 		return sc.errFrom(resp)
 	}
+	return writeBodyToFile(resp.Body, destPath, total, onProgress)
+}
 
+// writeBodyToFile streams body to destPath via a temporary file renamed into
+// place once it's all there, reporting bytes written as it goes.
+func writeBodyToFile(body io.Reader, destPath string, total int64, onProgress func(written, total int64)) error {
 	tmpPath := destPath + tmpSuffix
 	out, err := os.Create(tmpPath)
 	if err != nil {
@@ -223,7 +228,7 @@ func (sc *storageClient) downloadToFile(ctx context.Context, nodeID, destPath st
 	var written int64
 	buf := make([]byte, 256*1024)
 	for {
-		n, readErr := resp.Body.Read(buf)
+		n, readErr := body.Read(buf)
 		if n > 0 {
 			if _, writeErr := out.Write(buf[:n]); writeErr != nil {
 				out.Close()

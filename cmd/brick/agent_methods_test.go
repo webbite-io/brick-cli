@@ -30,6 +30,7 @@ func TestAgentRejectsWrongMethod(t *testing.T) {
 		{"GET", "/transfer/download"},
 		{"GET", "/transfer/upload-batch"},
 		{"GET", "/transfer/download-batch"},
+		{"GET", "/transfer/client-batch"},
 		{"POST", "/transfers"},
 		{"POST", "/transfers/x"},
 		{"POST", "/config/exclude-dirs"},

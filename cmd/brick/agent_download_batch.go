@@ -41,13 +41,15 @@ type downloadBatchReq struct {
 	BatchID   string   `json:"batchId"`
 }
 
-// downloadBatchFile is one file a batch download resolved to.
+// downloadBatchFile is one file a batch download resolved to: a Drive node,
+// or for a copy from another client (see agent_client_batch.go) a path there.
 type downloadBatchFile struct {
-	NodeID    string `json:"nodeId"`
-	Dir       string `json:"dir,omitempty"`       // folder path under localDir, "/"-separated
-	LocalPath string `json:"localPath,omitempty"` // where it goes, when localDir was given
-	Name      string `json:"name"`
-	Size      int64  `json:"size"`
+	NodeID     string `json:"nodeId,omitempty"`
+	SourcePath string `json:"sourcePath,omitempty"`
+	Dir        string `json:"dir,omitempty"`       // folder path under localDir, "/"-separated
+	LocalPath  string `json:"localPath,omitempty"` // where it goes, when localDir was given
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
 }
 
 // downloadResolver turns a batch download's node ids into its files.
@@ -56,7 +58,7 @@ type downloadResolver struct {
 	sc        *storageClient
 	localDir  string // absolute, or "" for a dry run without one
 	recursive bool
-	seen      map[string]bool // node ids taken so far
+	seen      map[string]bool // node ids (or source paths) taken so far
 	dests     map[string]bool // local paths taken so far
 	files     []downloadBatchFile
 	skipped   []batchSkip
@@ -101,7 +103,7 @@ func (dr *downloadResolver) addNode(id string) error {
 	}
 	switch node.NodeType {
 	case "file":
-		return dr.addFile(*node, "")
+		return dr.addNodeFile(*node, "")
 	case "folder":
 		if !dr.recursive {
 			dr.skip(node.Name, "is_a_directory", "node is a folder; set recursive to download its contents")
@@ -149,7 +151,7 @@ func (dr *downloadResolver) addTree(folder storageNode) error {
 				}
 				queue = append(queue, queued{id: ch.ID, dir: path.Join(cur.dir, ch.Name)})
 			case "file":
-				if err := dr.addFile(ch, cur.dir); err != nil {
+				if err := dr.addNodeFile(ch, cur.dir); err != nil {
 					return err
 				}
 			}
@@ -158,21 +160,26 @@ func (dr *downloadResolver) addTree(folder storageNode) error {
 	return nil
 }
 
-// addFile adds file node (to go in dir under localDir), unless it was already
-// added, its name can't be used locally, or something is already in its place.
-func (dr *downloadResolver) addFile(node storageNode, dir string) error {
-	display := path.Join(dir, node.Name)
-	if !validLocalName(node.Name) {
+func (dr *downloadResolver) addNodeFile(node storageNode, dir string) error {
+	return dr.addFile(node.ID, downloadBatchFile{NodeID: node.ID, Name: node.Name, Size: node.SizeBytes}, dir)
+}
+
+// addFile adds file f (its source, Name and Size set) to go in dir under
+// localDir, unless key, its node id or source path, was already added, its
+// name can't be used locally, or something is already in its place.
+func (dr *downloadResolver) addFile(key string, f downloadBatchFile, dir string) error {
+	display := path.Join(dir, f.Name)
+	if !validLocalName(f.Name) {
 		dr.skip(display, "invalid_name", "the file's name can't be used on this device")
 		return nil
 	}
-	if dr.seen[node.ID] {
+	if dr.seen[key] {
 		dr.skip(display, "duplicate", "the file is already in this batch")
 		return nil
 	}
 	var dest string
 	if dr.localDir != "" {
-		dest = filepath.Join(dr.localDir, filepath.FromSlash(dir), node.Name)
+		dest = filepath.Join(dr.localDir, filepath.FromSlash(dir), f.Name)
 		if dr.dests[dest] {
 			dr.skip(dest, "duplicate", "another file in this batch goes to the same place")
 			return nil
@@ -185,13 +192,12 @@ func (dr *downloadResolver) addFile(node storageNode, dir string) error {
 	if len(dr.files) == maxBatchFiles {
 		return errTooManyBatchFiles
 	}
-	dr.seen[node.ID] = true
+	dr.seen[key] = true
 	if dest != "" {
 		dr.dests[dest] = true
 	}
-	dr.files = append(dr.files, downloadBatchFile{
-		NodeID: node.ID, Dir: dir, LocalPath: dest, Name: node.Name, Size: node.SizeBytes,
-	})
+	f.Dir, f.LocalPath = dir, dest
+	dr.files = append(dr.files, f)
 	return nil
 }
 
@@ -218,38 +224,59 @@ func (a *agentServer) handleDownloadBatch(w http.ResponseWriter, r *http.Request
 		writeErr(w, errTooManyBatchFiles)
 		return
 	}
-	if strings.TrimSpace(req.LocalDir) == "" && !req.DryRun {
-		writeError(w, http.StatusBadRequest, "invalid_request", "localDir is required")
+	localDir, ok := a.resolveLocalDir(w, req.LocalDir, req.DryRun)
+	if !ok {
 		return
 	}
-	// A dry run may leave localDir out, but one that names it is checked as
-	// the real thing would be, so a read-only root shows up before anything
-	// is queued.
-	var localDir string
-	if strings.TrimSpace(req.LocalDir) != "" {
-		abs, err := a.resolveWritable(req.LocalDir)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		info, err := os.Stat(abs)
-		if err != nil {
-			writeOSError(w, err)
-			return
-		}
-		if !info.IsDir() {
-			writeError(w, http.StatusBadRequest, "not_a_directory", "localDir is not a directory")
-			return
-		}
-		localDir = abs
-	}
-
 	files, skipped, err := a.resolveDownloadBatch(r.Context(), req.NodeIDs, localDir, req.Recursive)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	if req.DryRun {
+	a.answerDownloadBatch(w, req.DryRun, req.BatchID, transferBatch{Direction: "download", LocalDir: localDir}, files, skipped,
+		func(ctx context.Context, f downloadBatchFile, dest string, onProgress func(written, total int64)) error {
+			return a.sc.downloadToFile(ctx, f.NodeID, dest, f.Size, onProgress)
+		})
+}
+
+// resolveLocalDir resolves a batch download's destination folder, which must
+// be a writable folder within the roots. A dry run may leave it out ("" is
+// returned), but one that names it is checked as the real thing would be, so
+// a read-only root shows up before anything is queued.
+func (a *agentServer) resolveLocalDir(w http.ResponseWriter, localDir string, dryRun bool) (string, bool) {
+	if strings.TrimSpace(localDir) == "" {
+		if dryRun {
+			return "", true
+		}
+		writeError(w, http.StatusBadRequest, "invalid_request", "localDir is required")
+		return "", false
+	}
+	abs, err := a.resolveWritable(localDir)
+	if err != nil {
+		writeErr(w, err)
+		return "", false
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		writeOSError(w, err)
+		return "", false
+	}
+	if !info.IsDir() {
+		writeError(w, http.StatusBadRequest, "not_a_directory", "localDir is not a directory")
+		return "", false
+	}
+	return abs, true
+}
+
+// fetchFunc writes batch download file f's bytes to dest, reporting bytes
+// written as it goes.
+type fetchFunc func(ctx context.Context, f downloadBatchFile, dest string, onProgress func(written, total int64)) error
+
+// answerDownloadBatch answers a batch download resolved to files: with the
+// dry run's list, or by queueing them under a batch like dest, each fetched
+// into its folder under dest.LocalDir by fetch.
+func (a *agentServer) answerDownloadBatch(w http.ResponseWriter, dryRun bool, batchID string, dest transferBatch, files []downloadBatchFile, skipped []batchSkip, fetch fetchFunc) {
+	if dryRun {
 		var total int64
 		for _, f := range files {
 			total += f.Size
@@ -261,7 +288,7 @@ func (a *agentServer) handleDownloadBatch(w http.ResponseWriter, r *http.Request
 	}
 	if len(files) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error":   map[string]string{"code": "no_files", "message": "none of the nodes resolved to a file that can be downloaded"},
+			"error":   map[string]string{"code": "no_files", "message": "nothing resolved to a file that can be downloaded"},
 			"skipped": skipped,
 		})
 		return
@@ -274,13 +301,14 @@ func (a *agentServer) handleDownloadBatch(w http.ResponseWriter, r *http.Request
 		ctxs[i] = ctx
 		items[i] = queuedTransfer{
 			rec: transferRecord{
-				Direction: "download", LocalPath: f.LocalPath, NodeID: f.NodeID,
+				Direction: dest.Direction, LocalPath: f.LocalPath, NodeID: f.NodeID,
+				SourceClientID: dest.SourceClientID, SourcePath: f.SourcePath,
 				Name: f.Name, BytesTotal: f.Size,
 			},
 			cancel: cancel,
 		}
 	}
-	batch, err := a.transfers.beginBatch(req.BatchID, transferBatch{Direction: "download", LocalDir: localDir}, items)
+	batch, err := a.transfers.beginBatch(batchID, dest, items)
 	if err != nil {
 		for _, it := range items {
 			it.cancel()
@@ -294,7 +322,7 @@ func (a *agentServer) handleDownloadBatch(w http.ResponseWriter, r *http.Request
 	for i, id := range batch.TransferIDs {
 		id, f, ctx := id, files[i], ctxs[i]
 		jobs[i] = queuedJob{id: id, ctx: ctx, run: func() (*storageNode, error) {
-			return nil, a.downloadBatchFile(ctx, id, localDir, f)
+			return nil, a.downloadBatchFile(ctx, id, dest.LocalDir, f, fetch)
 		}}
 		transfers[i], _ = a.transfers.get(id)
 	}
@@ -304,8 +332,8 @@ func (a *agentServer) handleDownloadBatch(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// downloadBatchFile downloads queued file f into its folder under localDir.
-func (a *agentServer) downloadBatchFile(ctx context.Context, id, localDir string, f downloadBatchFile) error {
+// downloadBatchFile fetches queued file f into its folder under localDir.
+func (a *agentServer) downloadBatchFile(ctx context.Context, id, localDir string, f downloadBatchFile, fetch fetchFunc) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -323,7 +351,7 @@ func (a *agentServer) downloadBatchFile(ctx context.Context, id, localDir string
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return a.sc.downloadToFile(ctx, f.NodeID, dest, f.Size, func(written, _ int64) {
+	return fetch(ctx, f, dest, func(written, _ int64) {
 		a.transfers.progress(id, written)
 	})
 }

@@ -32,22 +32,25 @@ const (
 // StartedAt until it starts running, and its ParentID is the batch's
 // destination until the (sub)folder it goes into has been created.
 type transferRecord struct {
-	ID         string       `json:"id"`
-	Direction  string       `json:"direction"` // "upload" or "download"
-	State      string       `json:"state"`
-	LocalPath  string       `json:"localPath"`
-	NodeID     string       `json:"nodeId,omitempty"`   // download source
-	ParentID   string       `json:"parentId,omitempty"` // upload destination folder
-	Name       string       `json:"name"`
-	BatchID    string       `json:"batchId,omitempty"`   // the batch upload it belongs to
-	RemoteDir  string       `json:"remoteDir,omitempty"` // batch upload: folder path under the batch's parentId
-	BytesTotal int64        `json:"bytesTotal"`
-	BytesDone  int64        `json:"bytesDone"`
-	StartedAt  time.Time    `json:"startedAt"`
-	UpdatedAt  time.Time    `json:"updatedAt"`
-	FinishedAt *time.Time   `json:"finishedAt,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	Node       *storageNode `json:"node,omitempty"` // uploaded node, once completed
+	ID        string `json:"id"`
+	Direction string `json:"direction"` // "upload", "download" or "copy" (from another client)
+	State     string `json:"state"`
+	LocalPath string `json:"localPath"`
+	NodeID    string `json:"nodeId,omitempty"` // download source
+	// A copy's source: the client it comes from, and its path there.
+	SourceClientID string       `json:"sourceClientId,omitempty"`
+	SourcePath     string       `json:"sourcePath,omitempty"`
+	ParentID       string       `json:"parentId,omitempty"` // upload destination folder
+	Name           string       `json:"name"`
+	BatchID        string       `json:"batchId,omitempty"`   // the batch upload it belongs to
+	RemoteDir      string       `json:"remoteDir,omitempty"` // batch upload: folder path under the batch's parentId
+	BytesTotal     int64        `json:"bytesTotal"`
+	BytesDone      int64        `json:"bytesDone"`
+	StartedAt      time.Time    `json:"startedAt"`
+	UpdatedAt      time.Time    `json:"updatedAt"`
+	FinishedAt     *time.Time   `json:"finishedAt,omitempty"`
+	Error          string       `json:"error,omitempty"`
+	Node           *storageNode `json:"node,omitempty"` // uploaded node, once completed
 
 	seq uint64 // registration order, which the active list is sorted by
 }
@@ -59,21 +62,23 @@ const maxBatchHistory = 100
 // GET /transfers/{id} for the batch's id: one transfer per file, run one at a
 // time.
 type transferBatch struct {
-	ID          string     `json:"id"`
-	Direction   string     `json:"direction"`          // "upload" or "download"
-	State       string     `json:"state"`              // queued, running, then completed, failed (any file failed) or canceled
-	ParentID    string     `json:"parentId,omitempty"` // upload destination folder
-	LocalDir    string     `json:"localDir,omitempty"` // download destination folder
-	FileCount   int        `json:"fileCount"`
-	TotalBytes  int64      `json:"totalBytes"`
-	BytesDone   int64      `json:"bytesDone"` // completed files plus the running one's progress
-	Completed   int        `json:"completed"`
-	Failed      int        `json:"failed"`
-	Canceled    int        `json:"canceled"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
-	FinishedAt  *time.Time `json:"finishedAt,omitempty"`
-	TransferIDs []string   `json:"transferIds"`
+	ID        string `json:"id"`
+	Direction string `json:"direction"`          // "upload", "download" or "copy"
+	State     string `json:"state"`              // queued, running, then completed, failed (any file failed) or canceled
+	ParentID  string `json:"parentId,omitempty"` // upload destination folder
+	LocalDir  string `json:"localDir,omitempty"` // download or copy destination folder
+	// A copy's source client.
+	SourceClientID string     `json:"sourceClientId,omitempty"`
+	FileCount      int        `json:"fileCount"`
+	TotalBytes     int64      `json:"totalBytes"`
+	BytesDone      int64      `json:"bytesDone"` // completed files plus the running one's progress
+	Completed      int        `json:"completed"`
+	Failed         int        `json:"failed"`
+	Canceled       int        `json:"canceled"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	UpdatedAt      time.Time  `json:"updatedAt"`
+	FinishedAt     *time.Time `json:"finishedAt,omitempty"`
+	TransferIDs    []string   `json:"transferIds"`
 
 	completedBytes int64
 }
@@ -177,8 +182,9 @@ type queuedTransfer struct {
 }
 
 // beginBatch registers batch batchID, going where dest's Direction and
-// ParentID or LocalDir say, and one queued transfer per file, returning the
-// batch's ids. As with begin, an empty batchID gets a fresh one.
+// ParentID or LocalDir (and a copy's SourceClientID) say, and one queued
+// transfer per file, returning the batch's ids. As with begin, an empty
+// batchID gets a fresh one.
 func (tr *transferRegistry) beginBatch(batchID string, dest transferBatch, items []queuedTransfer) (transferBatch, error) {
 	batchID, err := canonicalTransferID(batchID, "invalid_batch_id", "batchId")
 	if err != nil {
@@ -193,7 +199,7 @@ func (tr *transferRegistry) beginBatch(batchID string, dest transferBatch, items
 	now := time.Now().UTC()
 	b := &transferBatch{
 		ID: batchID, Direction: dest.Direction, State: transferQueued,
-		ParentID: dest.ParentID, LocalDir: dest.LocalDir, FileCount: len(items),
+		ParentID: dest.ParentID, LocalDir: dest.LocalDir, SourceClientID: dest.SourceClientID, FileCount: len(items),
 		CreatedAt: now, UpdatedAt: now, TransferIDs: make([]string, 0, len(items)),
 	}
 	for _, it := range items {
