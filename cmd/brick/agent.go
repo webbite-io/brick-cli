@@ -121,8 +121,9 @@ type agentServer struct {
 	// shuts down.
 	ctx       context.Context
 	transfers *transferRegistry
-	// uploads holds batch upload files waiting their turn; see agent_batch.go.
-	uploads *uploadQueue
+	// queue holds batch upload and download files waiting their turn; see
+	// agent_batch.go.
+	queue *transferQueue
 	// settings reads and changes the running sync's exclude list; nil when
 	// there's no sync to apply a change to.
 	settings excludeDirsSettings
@@ -166,9 +167,9 @@ func newAgentServer(ctx context.Context, roots []agentRoot, secret string, sc *s
 		remoteControl: remoteControl,
 		ctx:           ctx,
 		transfers:     newTransferRegistry(historyLimit),
-		uploads:       newUploadQueue(),
+		queue:         newTransferQueue(),
 	}
-	go a.runUploadQueue(ctx)
+	go a.runTransferQueue(ctx)
 	return a
 }
 
@@ -189,6 +190,7 @@ func (a *agentServer) handler() http.Handler {
 	mux.HandleFunc("/transfer/upload", a.auth(a.handleUpload))
 	mux.HandleFunc("/transfer/download", a.auth(a.handleDownload))
 	mux.HandleFunc("POST /transfer/upload-batch", a.auth(a.handleUploadBatch))
+	mux.HandleFunc("POST /transfer/download-batch", a.auth(a.handleDownloadBatch))
 	mux.HandleFunc("/transfers", a.auth(a.handleTransfers))
 	mux.HandleFunc("GET /transfers/{id}", a.auth(a.handleTransfer))
 	mux.HandleFunc("DELETE /transfers/{id}", a.auth(a.handleCancelTransfer))

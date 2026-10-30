@@ -52,15 +52,18 @@ type transferRecord struct {
 	seq uint64 // registration order, which the active list is sorted by
 }
 
-// maxBatchHistory caps how many finished batch uploads the agent remembers.
+// maxBatchHistory caps how many finished batches the agent remembers.
 const maxBatchHistory = 100
 
-// transferBatch is a batch upload as reported by GET /transfers/{id} for the
-// batch's id: one transfer per file, run one at a time.
+// transferBatch is a batch upload or download as reported by
+// GET /transfers/{id} for the batch's id: one transfer per file, run one at a
+// time.
 type transferBatch struct {
 	ID          string     `json:"id"`
-	State       string     `json:"state"` // queued, running, then completed, failed (any file failed) or canceled
-	ParentID    string     `json:"parentId"`
+	Direction   string     `json:"direction"`          // "upload" or "download"
+	State       string     `json:"state"`              // queued, running, then completed, failed (any file failed) or canceled
+	ParentID    string     `json:"parentId,omitempty"` // upload destination folder
+	LocalDir    string     `json:"localDir,omitempty"` // download destination folder
 	FileCount   int        `json:"fileCount"`
 	TotalBytes  int64      `json:"totalBytes"`
 	BytesDone   int64      `json:"bytesDone"` // completed files plus the running one's progress
@@ -173,9 +176,10 @@ type queuedTransfer struct {
 	cancel context.CancelFunc
 }
 
-// beginBatch registers batch upload batchID and one queued transfer per file,
-// returning the batch's ids. As with begin, an empty batchID gets a fresh one.
-func (tr *transferRegistry) beginBatch(batchID, parentID string, items []queuedTransfer) (transferBatch, error) {
+// beginBatch registers batch batchID, going where dest's Direction and
+// ParentID or LocalDir say, and one queued transfer per file, returning the
+// batch's ids. As with begin, an empty batchID gets a fresh one.
+func (tr *transferRegistry) beginBatch(batchID string, dest transferBatch, items []queuedTransfer) (transferBatch, error) {
 	batchID, err := canonicalTransferID(batchID, "invalid_batch_id", "batchId")
 	if err != nil {
 		return transferBatch{}, err
@@ -188,7 +192,8 @@ func (tr *transferRegistry) beginBatch(batchID, parentID string, items []queuedT
 	}
 	now := time.Now().UTC()
 	b := &transferBatch{
-		ID: batchID, State: transferQueued, ParentID: parentID, FileCount: len(items),
+		ID: batchID, Direction: dest.Direction, State: transferQueued,
+		ParentID: dest.ParentID, LocalDir: dest.LocalDir, FileCount: len(items),
 		CreatedAt: now, UpdatedAt: now, TransferIDs: make([]string, 0, len(items)),
 	}
 	for _, it := range items {

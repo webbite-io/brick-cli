@@ -64,7 +64,7 @@ type batchSkip struct {
 }
 
 var errTooManyBatchFiles = newAPIError(http.StatusBadRequest, "too_many_files",
-	fmt.Sprintf("a batch upload can hold at most %d files", maxBatchFiles))
+	fmt.Sprintf("a batch transfer can hold at most %d files", maxBatchFiles))
 
 // batchResolver turns a batch upload's paths into its files.
 type batchResolver struct {
@@ -253,7 +253,7 @@ func (a *agentServer) handleUploadBatch(w http.ResponseWriter, r *http.Request) 
 			cancel: cancel,
 		}
 	}
-	batch, err := a.transfers.beginBatch(req.BatchID, req.ParentID, items)
+	batch, err := a.transfers.beginBatch(req.BatchID, transferBatch{Direction: "upload", ParentID: req.ParentID}, items)
 	if err != nil {
 		for _, it := range items {
 			it.cancel()
@@ -263,21 +263,22 @@ func (a *agentServer) handleUploadBatch(w http.ResponseWriter, r *http.Request) 
 	}
 
 	folders := &batchFolders{parentID: req.ParentID, ids: map[string]string{}}
-	queued := make([]queuedUpload, len(files))
+	jobs := make([]queuedJob, len(files))
 	transfers := make([]transferRecord, len(files))
 	for i, id := range batch.TransferIDs {
-		queued[i] = queuedUpload{id: id, file: files[i], ctx: ctxs[i], folders: folders}
+		it := queuedUpload{id: id, file: files[i], ctx: ctxs[i], folders: folders}
+		jobs[i] = queuedJob{id: id, ctx: it.ctx, run: func() (*storageNode, error) { return a.uploadBatchFile(it) }}
 		transfers[i], _ = a.transfers.get(id)
 	}
-	a.uploads.push(queued...)
+	a.queue.push(jobs...)
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
 		"batch": batch, "transfers": transfers, "skipped": skipped,
 	})
 }
 
-// --- The upload queue ---
+// --- The transfer queue ---
 
-// queuedUpload is one batch file waiting in the upload queue.
+// queuedUpload is one batch upload file, as its queuedJob runs it.
 type queuedUpload struct {
 	id      string
 	file    batchFile
@@ -316,19 +317,29 @@ func (bf *batchFolders) folder(ctx context.Context, sc *storageClient, dir strin
 	return id, nil
 }
 
-// uploadQueue holds batch files waiting to be uploaded, oldest first. A
-// single worker (runUploadQueue) takes them one at a time.
-type uploadQueue struct {
+// queuedJob is one batch file, upload or download, waiting its turn: run
+// transfers it, under ctx (cancelled by DELETE /transfers/{id} or brick
+// shutting down).
+type queuedJob struct {
+	id  string
+	ctx context.Context
+	run func() (*storageNode, error)
+}
+
+// transferQueue holds batch files waiting to be transferred, oldest first. A
+// single worker (runTransferQueue) takes them one at a time, whichever way
+// they go.
+type transferQueue struct {
 	mu    sync.Mutex
-	items []queuedUpload
+	items []queuedJob
 	wake  chan struct{}
 }
 
-func newUploadQueue() *uploadQueue {
-	return &uploadQueue{wake: make(chan struct{}, 1)}
+func newTransferQueue() *transferQueue {
+	return &transferQueue{wake: make(chan struct{}, 1)}
 }
 
-func (q *uploadQueue) push(items ...queuedUpload) {
+func (q *transferQueue) push(items ...queuedJob) {
 	q.mu.Lock()
 	q.items = append(q.items, items...)
 	q.mu.Unlock()
@@ -338,43 +349,43 @@ func (q *uploadQueue) push(items ...queuedUpload) {
 	}
 }
 
-func (q *uploadQueue) pop() (queuedUpload, bool) {
+func (q *transferQueue) pop() (queuedJob, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if len(q.items) == 0 {
-		return queuedUpload{}, false
+		return queuedJob{}, false
 	}
 	it := q.items[0]
-	q.items[0] = queuedUpload{}
+	q.items[0] = queuedJob{}
 	q.items = q.items[1:]
 	return it, true
 }
 
-// runUploadQueue uploads queued batch files until ctx (the session) ends,
+// runTransferQueue transfers queued batch files until ctx (the session) ends,
 // then marks whatever is still queued as canceled.
-func (a *agentServer) runUploadQueue(ctx context.Context) {
+func (a *agentServer) runTransferQueue(ctx context.Context) {
 	for {
-		it, ok := a.uploads.pop()
+		it, ok := a.queue.pop()
 		if !ok {
 			select {
-			case <-a.uploads.wake:
+			case <-a.queue.wake:
 				continue
 			case <-ctx.Done():
 			}
-			for it, ok := a.uploads.pop(); ok; it, ok = a.uploads.pop() {
+			for it, ok := a.queue.pop(); ok; it, ok = a.queue.pop() {
 				a.transfers.finish(it.ctx, it.id, nil, it.ctx.Err())
 			}
 			return
 		}
-		a.runQueuedUpload(it)
+		a.runQueuedJob(it)
 	}
 }
 
-func (a *agentServer) runQueuedUpload(it queuedUpload) {
+func (a *agentServer) runQueuedJob(it queuedJob) {
 	if !a.transfers.start(it.id) {
 		return // cancelled while it waited
 	}
-	node, err := a.uploadBatchFile(it)
+	node, err := it.run()
 	a.transfers.finish(it.ctx, it.id, node, err)
 }
 
