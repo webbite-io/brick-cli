@@ -234,7 +234,7 @@ func (a *agentServer) handleUploadBatch(w http.ResponseWriter, r *http.Request) 
 	}
 	if len(files) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error":   map[string]string{"code": "no_files", "message": "none of the paths resolved to a file that can be uploaded"},
+			"error":   map[string]string{"code": "no_files", "message": "None of the paths resolved to a file that can be uploaded."},
 			"skipped": skipped,
 		})
 		return

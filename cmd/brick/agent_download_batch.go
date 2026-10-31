@@ -146,7 +146,7 @@ func (dr *downloadResolver) addTree(folder storageNode) error {
 			switch ch.NodeType {
 			case "folder":
 				if !validLocalName(ch.Name) {
-					dr.skip(path.Join(cur.dir, ch.Name), "invalid_name", "the folder's name can't be used on this device")
+					dr.skip(path.Join(cur.dir, ch.Name), "invalid_name", "The folder's name can't be used on this device.")
 					continue
 				}
 				queue = append(queue, queued{id: ch.ID, dir: path.Join(cur.dir, ch.Name)})
@@ -288,7 +288,7 @@ func (a *agentServer) answerDownloadBatch(w http.ResponseWriter, dryRun bool, ba
 	}
 	if len(files) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error":   map[string]string{"code": "no_files", "message": "nothing resolved to a file that can be downloaded"},
+			"error":   map[string]string{"code": "no_files", "message": "Nothing resolved to a file that can be downloaded."},
 			"skipped": skipped,
 		})
 		return

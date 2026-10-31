@@ -88,7 +88,7 @@ func (a *agentServer) resolveClientBatch(ctx context.Context, sourceID string, p
 	}
 	for _, f := range srcFiles {
 		if !validLocalDir(f.RemoteDir) {
-			dr.skip(path.Join(f.RemoteDir, f.Name), "invalid_name", "a folder's name can't be used on this device")
+			dr.skip(path.Join(f.RemoteDir, f.Name), "invalid_name", "A folder's name can't be used on this device.")
 			continue
 		}
 		if err := dr.addFile(f.LocalPath, downloadBatchFile{SourcePath: f.LocalPath, Name: f.Name, Size: f.Size}, f.RemoteDir); err != nil {
