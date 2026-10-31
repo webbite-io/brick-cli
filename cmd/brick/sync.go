@@ -110,7 +110,7 @@ func (sc *storageClient) request(ctx context.Context, method, path string, body 
 
 func (sc *storageClient) errFrom(resp *http.Response) error {
 	body, _ := io.ReadAll(resp.Body)
-	return fmt.Errorf("storage API %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	return &storageStatusError{code: resp.StatusCode, status: resp.Status, body: strings.TrimSpace(string(body))}
 }
 
 func (sc *storageClient) resolveRoot(ctx context.Context) (*storageNode, error) {

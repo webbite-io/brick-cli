@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sort"
 	"sync"
@@ -51,6 +52,11 @@ type transferRecord struct {
 	FinishedAt     *time.Time   `json:"finishedAt,omitempty"`
 	Error          string       `json:"error,omitempty"`
 	Node           *storageNode `json:"node,omitempty"` // uploaded node, once completed
+	// Retries counts the times the transfer has been tried again after a
+	// network or server failure. RetryError is what the latest one was for,
+	// while it waits to go again or until it moves bytes again.
+	Retries    int    `json:"retries,omitempty"`
+	RetryError string `json:"retryError,omitempty"`
 
 	seq uint64 // registration order, which the active list is sorted by
 }
@@ -256,9 +262,32 @@ func (tr *transferRegistry) progress(id string, done int64) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	if at, ok := tr.active[id]; ok {
+		if done > at.rec.BytesDone {
+			at.rec.RetryError = ""
+		}
 		at.rec.BytesDone = done
 		at.rec.UpdatedAt = time.Now().UTC()
 	}
+}
+
+// retrying records that transfer id failed with err and will be tried again.
+func (tr *transferRegistry) retrying(id string, err error) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if at, ok := tr.active[id]; ok {
+		at.rec.Retries++
+		at.rec.RetryError = sentence(err.Error())
+		at.rec.UpdatedAt = time.Now().UTC()
+	}
+}
+
+// retryContext returns ctx with a retry observer for transfer id, which
+// records each retry on its record and in the log.
+func (tr *transferRegistry) retryContext(ctx context.Context, id string) context.Context {
+	return withTransferRetryObserver(ctx, func(err error, wait time.Duration) {
+		log.Printf("Transfer %s: %v; retrying in %s", id, err, wait)
+		tr.retrying(id, err)
+	})
 }
 
 // finish moves transfer id into the history, evicting the oldest entries

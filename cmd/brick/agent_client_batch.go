@@ -143,17 +143,25 @@ func (sc *storageClient) clientUploadDryRun(ctx context.Context, id string, path
 }
 
 // clientReadToFile streams file p on attached client id, through the Storage
-// API, to destPath.
+// API, to destPath. A read that fails part way resumes where it stopped (see
+// resumableDownload), or starts over if the source is a client from before
+// /fs/read served ranges.
 func (sc *storageClient) clientReadToFile(ctx context.Context, id, p, destPath string, total int64, onProgress func(written, total int64)) error {
-	resp, err := sc.request(ctx, "GET", clientPath(id, "/fs/read?"+url.Values{"path": {p}}.Encode()), nil, nil)
-	if err != nil {
-		return err
+	return resumableDownload(ctx, destPath, total, onProgress, func(ctx context.Context, headers map[string]string) (*http.Response, error) {
+		return sc.streamGet(ctx, clientPath(id, "/fs/read?"+url.Values{"path": {p}}.Encode()), headers)
+	}, sourceReadError)
+}
+
+// sourceReadError is sourceError for a failed read from a source client,
+// marked worth retrying when the source is only briefly out of reach: the
+// Storage API answers 409 while the source reconnects, and 502/503/504 when
+// it doesn't answer.
+func sourceReadError(resp *http.Response) error {
+	err := sourceError(resp)
+	if resp.StatusCode == http.StatusConflict || retryableStatus(resp.StatusCode) {
+		return &transientError{err}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return sourceError(resp)
-	}
-	return writeBodyToFile(resp.Body, destPath, total, onProgress)
+	return err
 }
 
 // sourceError turns the source client's (or the Storage API's) failed answer

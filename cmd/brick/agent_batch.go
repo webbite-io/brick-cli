@@ -393,7 +393,15 @@ func (a *agentServer) uploadBatchFile(it queuedUpload) (*storageNode, error) {
 	if err := it.ctx.Err(); err != nil {
 		return nil, err
 	}
-	parentID, err := it.folders.folder(it.ctx, a.sc, it.file.RemoteDir)
+	ctx := a.transfers.retryContext(it.ctx, it.id)
+	// Creating the file's folders is retried like the upload itself, so a
+	// Storage API that is restarting just then doesn't fail the file.
+	var parentID string
+	err := retryTransfer(ctx, func(ctx context.Context, _ func()) (bool, error) {
+		var err error
+		parentID, err = it.folders.folder(ctx, a.sc, it.file.RemoteDir)
+		return false, err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +422,7 @@ func (a *agentServer) uploadBatchFile(it queuedUpload) (*storageNode, error) {
 		rec.ParentID = parentID
 		rec.BytesTotal = info.Size()
 	})
-	return a.sc.uploadStream(it.ctx, parentID, it.file.Name, f, info.Size(), func(written int64) {
+	return a.sc.uploadStream(ctx, parentID, it.file.Name, f, info.Size(), func(written int64) {
 		a.transfers.progress(it.id, written)
 	})
 }

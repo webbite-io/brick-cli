@@ -351,7 +351,7 @@ func (a *agentServer) downloadBatchFile(ctx context.Context, id, localDir string
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return fetch(ctx, f, dest, func(written, _ int64) {
+	return fetch(a.transfers.retryContext(ctx, id), f, dest, func(written, _ int64) {
 		a.transfers.progress(id, written)
 	})
 }

@@ -202,62 +202,22 @@ func (sc *storageClient) resolvePath(ctx context.Context, path string) (*storage
 // buffering the whole file in memory the way storageClient.download does —
 // appropriate for a dedicated large-file transfer command. total is the
 // file's known size (from the node metadata, fetched before this call — a
-// chunked response may not carry a Content-Length), used only to report
-// progress.
+// chunked response may not carry a Content-Length), used to report progress
+// and to tell a finished download from one cut off at its last byte. A
+// download that fails part way resumes where it stopped (see
+// resumableDownload).
 func (sc *storageClient) downloadToFile(ctx context.Context, nodeID, destPath string, total int64, onProgress func(written, total int64)) error {
-	resp, err := sc.request(ctx, "GET", "/files/"+nodeID, nil, nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return sc.errFrom(resp)
-	}
-	return writeBodyToFile(resp.Body, destPath, total, onProgress)
+	return resumableDownload(ctx, destPath, total, onProgress, func(ctx context.Context, headers map[string]string) (*http.Response, error) {
+		return sc.streamGet(ctx, "/files/"+nodeID, headers)
+	}, sc.errFrom)
 }
 
-// writeBodyToFile streams body to destPath via a temporary file renamed into
-// place once it's all there, reporting bytes written as it goes.
-func writeBodyToFile(body io.Reader, destPath string, total int64, onProgress func(written, total int64)) error {
-	tmpPath := destPath + tmpSuffix
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-
-	var written int64
-	buf := make([]byte, 256*1024)
-	for {
-		n, readErr := body.Read(buf)
-		if n > 0 {
-			if _, writeErr := out.Write(buf[:n]); writeErr != nil {
-				out.Close()
-				os.Remove(tmpPath)
-				return writeErr
-			}
-			written += int64(n)
-			if onProgress != nil {
-				onProgress(written, total)
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			out.Close()
-			os.Remove(tmpPath)
-			return readErr
-		}
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := os.Rename(tmpPath, destPath); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	return nil
+// streamGet is request for a GET whose response body is a file: it has no
+// overall timeout, which a large file would outlast, so it relies on ctx
+// (and retryTransfer's stall timeout) to end it.
+func (sc *storageClient) streamGet(ctx context.Context, path string, headers map[string]string) (*http.Response, error) {
+	full := "/v1/accounts/" + sc.accountID + path
+	return authedStreamRequest(ctx, sc.baseURL, sc.apiURL, "GET", full, nil, 0, headers, sc.cfg, nil)
 }
 
 // authedStreamRequest mirrors authedRequest (see sync.go) but for a streaming
@@ -270,21 +230,30 @@ func writeBodyToFile(body io.Reader, destPath string, total int64, onProgress fu
 // types that don't include an arbitrary io.Reader. onProgress, if set, is
 // called with cumulative bytes sent as the transport reads the body; it
 // starts over from zero on a retry, since a retry resends the whole body.
+// body may be nil, for a request (a download) whose response is the stream.
+//
+// The client has no overall timeout, which a large file would outlast: the
+// caller ends a request that stops moving through ctx (see retryTransfer).
 func authedStreamRequest(ctx context.Context, reqBaseURL, refreshAPIURL, method, path string, body io.ReadSeeker, size int64, headers map[string]string, cfg *Config, onProgress func(written int64)) (*http.Response, error) {
-	client := &http.Client{Timeout: 30 * time.Minute}
+	client := &http.Client{}
 	doRequest := func(token string) (*http.Response, error) {
-		if _, err := body.Seek(0, io.SeekStart); err != nil {
-			return nil, err
-		}
-		var r io.Reader = body
-		if onProgress != nil {
-			r = &progressReader{r: body, onRead: onProgress}
+		var r io.Reader
+		if body != nil {
+			if _, err := body.Seek(0, io.SeekStart); err != nil {
+				return nil, err
+			}
+			r = body
+			if onProgress != nil {
+				r = &progressReader{r: body, onRead: onProgress}
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(reqBaseURL, "/")+path, r)
 		if err != nil {
 			return nil, err
 		}
-		req.ContentLength = size
+		if body != nil {
+			req.ContentLength = size
+		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		for k, v := range headers {
 			req.Header.Set(k, v)
@@ -335,22 +304,41 @@ func (p *progressReader) Read(b []byte) (int, error) {
 }
 
 // streamRequest is the shared body of uploadStream/replaceStream: issue an
-// authenticated streaming request and decode the resulting node.
+// authenticated streaming request and decode the resulting node. An attempt
+// that fails on the way is retried from the start (see retryTransfer), so
+// onProgress can go back to zero. Retrying after a response that was lost
+// once the server had stored the file stores it again, which for a name
+// already taken is one more version of the same content.
 func (sc *storageClient) streamRequest(ctx context.Context, method, path string, body io.ReadSeeker, size int64, headers map[string]string, onProgress func(written int64), wantStatus int) (*storageNode, error) {
 	full := "/v1/accounts/" + sc.accountID + path
-	resp, err := authedStreamRequest(ctx, sc.baseURL, sc.apiURL, method, full, body, size, headers, sc.cfg, onProgress)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != wantStatus {
-		return nil, sc.errFrom(resp)
-	}
-	var result storageUploadResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return &result.Node, nil
+	var node *storageNode
+	var furthest int64 // the most bytes any attempt has sent
+	err := retryTransfer(ctx, func(ctx context.Context, touch func()) (bool, error) {
+		var sent int64
+		resp, err := authedStreamRequest(ctx, sc.baseURL, sc.apiURL, method, full, body, size, headers, sc.cfg, func(written int64) {
+			touch()
+			sent = written
+			if onProgress != nil {
+				onProgress(written)
+			}
+		})
+		progressed := sent > furthest
+		furthest = max(furthest, sent)
+		if err != nil {
+			return progressed, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != wantStatus {
+			return progressed, sc.errFrom(resp)
+		}
+		var result storageUploadResult
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return progressed, &transientError{err}
+		}
+		node = &result.Node
+		return progressed, nil
+	})
+	return node, err
 }
 
 // uploadStream is upload's streaming counterpart: POST /files without

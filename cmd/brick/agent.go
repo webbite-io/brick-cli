@@ -581,10 +581,18 @@ func (a *agentServer) handleRead(w http.ResponseWriter, r *http.Request) {
 		ct = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.Header().Set("Content-Disposition", contentDisposition(info.Name()))
-	w.WriteHeader(http.StatusOK)
-	io.Copy(w, f)
+	w.Header().Set("ETag", fileETag(info))
+	// ServeContent answers a Range request with just that part (206), so an
+	// interrupted read can resume; If-Range against the ETag makes it send
+	// the whole file again if it changed in between.
+	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
+}
+
+// fileETag is a strong ETag for the file's current content, as far as its
+// size and modification time tell.
+func fileETag(info os.FileInfo) string {
+	return fmt.Sprintf(`"%x-%x"`, info.Size(), info.ModTime().UnixNano())
 }
 
 // contentDisposition is an attachment header that names the file correctly in
@@ -948,7 +956,7 @@ func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	run := func() (*storageNode, error) {
 		defer f.Close()
-		node, err := a.sc.uploadStream(ctx, req.ParentID, name, f, info.Size(), func(written int64) {
+		node, err := a.sc.uploadStream(a.transfers.retryContext(ctx, id), req.ParentID, name, f, info.Size(), func(written int64) {
 			a.transfers.progress(id, written)
 		})
 		a.transfers.finish(ctx, id, node, err)
@@ -1020,7 +1028,7 @@ func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	run := func() error {
-		err := a.sc.downloadToFile(ctx, node.ID, abs, node.SizeBytes, func(written, _ int64) {
+		err := a.sc.downloadToFile(a.transfers.retryContext(ctx, id), node.ID, abs, node.SizeBytes, func(written, _ int64) {
 			a.transfers.progress(id, written)
 		})
 		a.transfers.finish(ctx, id, nil, err)
