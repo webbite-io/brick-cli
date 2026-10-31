@@ -78,7 +78,7 @@ func (a *agentServer) resolveDownloadBatch(ctx context.Context, ids []string, lo
 }
 
 func (dr *downloadResolver) skip(p, code, message string) {
-	dr.skipped = append(dr.skipped, batchSkip{Path: p, Code: code, Message: message})
+	dr.skipped = append(dr.skipped, batchSkip{Path: p, Code: code, Message: sentence(message)})
 }
 
 // addNode adds the file with id, or (recursive) every file under the folder
@@ -86,7 +86,7 @@ func (dr *downloadResolver) skip(p, code, message string) {
 // returned; every other problem is recorded as a skip.
 func (dr *downloadResolver) addNode(id string) error {
 	if strings.TrimSpace(id) == "" {
-		dr.skip(id, "invalid_node_id", "node id is empty")
+		dr.skip(id, "invalid_node_id", "Node id is empty.")
 		return nil
 	}
 	node, err := dr.sc.getNode(dr.ctx, id)
@@ -98,7 +98,7 @@ func (dr *downloadResolver) addNode(id string) error {
 		return nil
 	}
 	if node.IsDeleted {
-		dr.skip(node.Name, "not_found", "the node is in the trash")
+		dr.skip(node.Name, "not_found", "The node is in the trash.")
 		return nil
 	}
 	switch node.NodeType {
@@ -106,16 +106,16 @@ func (dr *downloadResolver) addNode(id string) error {
 		return dr.addNodeFile(*node, "")
 	case "folder":
 		if !dr.recursive {
-			dr.skip(node.Name, "is_a_directory", "node is a folder; set recursive to download its contents")
+			dr.skip(node.Name, "is_a_directory", "Node is a folder; set recursive to download its contents.")
 			return nil
 		}
 		if !validLocalName(node.Name) {
-			dr.skip(node.Name, "invalid_name", "the folder's name can't be used on this device")
+			dr.skip(node.Name, "invalid_name", "The folder's name can't be used on this device.")
 			return nil
 		}
 		return dr.addTree(*node)
 	default:
-		dr.skip(node.Name, "not_a_file", "only files and folders can be downloaded")
+		dr.skip(node.Name, "not_a_file", "Only files and folders can be downloaded.")
 		return nil
 	}
 }
@@ -170,22 +170,22 @@ func (dr *downloadResolver) addNodeFile(node storageNode, dir string) error {
 func (dr *downloadResolver) addFile(key string, f downloadBatchFile, dir string) error {
 	display := path.Join(dir, f.Name)
 	if !validLocalName(f.Name) {
-		dr.skip(display, "invalid_name", "the file's name can't be used on this device")
+		dr.skip(display, "invalid_name", "The file's name can't be used on this device.")
 		return nil
 	}
 	if dr.seen[key] {
-		dr.skip(display, "duplicate", "the file is already in this batch")
+		dr.skip(display, "duplicate", "The file is already in this batch.")
 		return nil
 	}
 	var dest string
 	if dr.localDir != "" {
 		dest = filepath.Join(dr.localDir, filepath.FromSlash(dir), f.Name)
 		if dr.dests[dest] {
-			dr.skip(dest, "duplicate", "another file in this batch goes to the same place")
+			dr.skip(dest, "duplicate", "Another file in this batch goes to the same place.")
 			return nil
 		}
 		if _, err := os.Lstat(dest); err == nil {
-			dr.skip(dest, "exists", "a file or folder with this name already exists")
+			dr.skip(dest, "exists", "A file or folder with this name already exists.")
 			return nil
 		}
 	}
@@ -213,11 +213,11 @@ func validLocalName(name string) bool {
 func (a *agentServer) handleDownloadBatch(w http.ResponseWriter, r *http.Request) {
 	var req downloadBatchReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body.")
 		return
 	}
 	if len(req.NodeIDs) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "nodeIds is required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "The nodeIds field is required.")
 		return
 	}
 	if len(req.NodeIDs) > maxBatchFiles {
@@ -248,7 +248,7 @@ func (a *agentServer) resolveLocalDir(w http.ResponseWriter, localDir string, dr
 		if dryRun {
 			return "", true
 		}
-		writeError(w, http.StatusBadRequest, "invalid_request", "localDir is required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "The localDir field is required.")
 		return "", false
 	}
 	abs, err := a.resolveWritable(localDir)
@@ -262,7 +262,7 @@ func (a *agentServer) resolveLocalDir(w http.ResponseWriter, localDir string, dr
 		return "", false
 	}
 	if !info.IsDir() {
-		writeError(w, http.StatusBadRequest, "not_a_directory", "localDir is not a directory")
+		writeError(w, http.StatusBadRequest, "not_a_directory", "The localDir field is not a directory.")
 		return "", false
 	}
 	return abs, true

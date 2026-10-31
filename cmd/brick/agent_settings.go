@@ -12,7 +12,7 @@ import (
 // from sync for the active account, relative to its sync folder.
 func (a *agentServer) handleGetExcludeDirs(w http.ResponseWriter, r *http.Request) {
 	if a.settings == nil {
-		writeError(w, http.StatusServiceUnavailable, "sync_not_running", "no sync is running to read settings from")
+		writeError(w, http.StatusServiceUnavailable, "sync_not_running", "No sync is running to read settings from.")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"excludeDirs": nonNil(a.settings.excludeDirs())})
@@ -25,14 +25,14 @@ func (a *agentServer) handleGetExcludeDirs(w http.ResponseWriter, r *http.Reques
 // longer excluded are downloaded on the next sync pass.
 func (a *agentServer) handleSetExcludeDirs(w http.ResponseWriter, r *http.Request) {
 	if a.settings == nil {
-		writeError(w, http.StatusServiceUnavailable, "sync_not_running", "no sync is running to apply settings to")
+		writeError(w, http.StatusServiceUnavailable, "sync_not_running", "No sync is running to apply settings to.")
 		return
 	}
 	var req struct {
 		ExcludeDirs *[]string `json:"excludeDirs"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ExcludeDirs == nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", `body must be {"excludeDirs": [...]}`)
+		writeError(w, http.StatusBadRequest, "invalid_request", `The body must be {"excludeDirs": [...]}.`)
 		return
 	}
 	dirs, err := normalizeExcludeDirs(*req.ExcludeDirs)
@@ -58,13 +58,13 @@ func normalizeExcludeDirs(dirs []string) ([]string, error) {
 		clean := path.Clean("/" + strings.Trim(filepath.ToSlash(strings.TrimSpace(d)), "/"))
 		clean = strings.TrimPrefix(clean, "/")
 		if clean == "" || clean == "." {
-			return nil, newAPIError(http.StatusBadRequest, "invalid_exclude_dir", "excludeDirs entries must name a folder")
+			return nil, newAPIError(http.StatusBadRequest, "invalid_exclude_dir", "Each excludeDirs entry must name a folder.")
 		}
 		// path.Clean on a rooted path resolves ".." away silently; reject it
 		// instead, since it can only mean a typo or an attempt to escape.
 		for _, seg := range strings.Split(filepath.ToSlash(d), "/") {
 			if seg == ".." {
-				return nil, newAPIError(http.StatusBadRequest, "invalid_exclude_dir", "excludeDirs entries must not contain \"..\"")
+				return nil, newAPIError(http.StatusBadRequest, "invalid_exclude_dir", "No excludeDirs entry may contain \"..\".")
 			}
 		}
 		if !seen[clean] {

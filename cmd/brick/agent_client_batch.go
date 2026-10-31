@@ -44,15 +44,15 @@ type clientBatchReq struct {
 func (a *agentServer) handleClientBatch(w http.ResponseWriter, r *http.Request) {
 	var req clientBatchReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body.")
 		return
 	}
 	if strings.TrimSpace(req.SourceClientID) == "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "sourceClientId is required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "The sourceClientId field is required.")
 		return
 	}
 	if len(req.Paths) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "paths is required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "The paths field is required.")
 		return
 	}
 	if len(req.Paths) > maxBatchFiles {
@@ -166,15 +166,15 @@ func sourceError(resp *http.Response) error {
 	}
 	if json.Unmarshal(raw, &env) != nil || env.Error.Code == "" {
 		if resp.StatusCode == http.StatusNotFound {
-			return newAPIError(http.StatusBadGateway, "source_outdated", "the source device runs a version of Brick without this feature")
+			return newAPIError(http.StatusBadGateway, "source_outdated", "The source device runs a version of Brick without this feature.")
 		}
 		msg := strings.TrimSpace(string(bytes.ToValidUTF8(raw, nil)))
 		if msg == "" {
 			msg = resp.Status
 		}
-		return newAPIError(http.StatusBadGateway, "source_error", "source device: "+msg)
+		return newAPIError(http.StatusBadGateway, "source_error", "Source device: "+msg)
 	}
 	// Always a 502: the caller's own request was fine, and passing on a 401 or
 	// 403 would read as its own credentials failing.
-	return newAPIError(http.StatusBadGateway, env.Error.Code, "source device: "+env.Error.Message)
+	return newAPIError(http.StatusBadGateway, env.Error.Code, "Source device: "+env.Error.Message)
 }

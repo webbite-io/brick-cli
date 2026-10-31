@@ -21,6 +21,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -206,7 +208,7 @@ func (a *agentServer) handler() http.Handler {
 func (a *agentServer) auth(h http.HandlerFunc) http.HandlerFunc {
 	return a.authSecret(func(w http.ResponseWriter, r *http.Request) {
 		if !a.remoteControl {
-			writeError(w, http.StatusForbidden, "remote_control_disabled", "remote control is not enabled on this client")
+			writeError(w, http.StatusForbidden, "remote_control_disabled", "Remote control is not enabled on this client.")
 			return
 		}
 		h(w, r)
@@ -218,7 +220,7 @@ func (a *agentServer) auth(h http.HandlerFunc) http.HandlerFunc {
 func (a *agentServer) authSecret(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if a.secret == "" || r.Header.Get(agentSecretHeader) != a.secret {
-			writeError(w, http.StatusForbidden, "forbidden", "missing or invalid agent secret")
+			writeError(w, http.StatusForbidden, "forbidden", "Missing or invalid agent secret.")
 			return
 		}
 		h(w, r)
@@ -260,8 +262,23 @@ func newAPIError(status int, code, message string) *apiError {
 // writeError emits the predefined JSON error envelope: {"error":{"code","message"}}.
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]interface{}{
-		"error": map[string]string{"code": code, "message": message},
+		"error": map[string]string{"code": code, "message": sentence(message)},
 	})
+}
+
+// sentence makes msg start with a capital letter and end with a period, so
+// error messages read alike whether written here or taken from a Go error.
+func sentence(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return msg
+	}
+	r, n := utf8.DecodeRuneInString(msg)
+	msg = string(unicode.ToUpper(r)) + msg[n:]
+	if !strings.HasSuffix(msg, ".") && !strings.HasSuffix(msg, "?") && !strings.HasSuffix(msg, "!") {
+		msg += "."
+	}
+	return msg
 }
 
 // writeErr emits err as a JSON error, preferring an *apiError's status/code and
@@ -304,7 +321,7 @@ func evalSafe(p string) string {
 func (a *agentServer) resolveSafe(p string) (string, error) {
 	if strings.TrimSpace(p) == "" {
 		if len(a.roots) == 0 {
-			return "", newAPIError(http.StatusForbidden, "no_roots_configured", "no allowed roots configured")
+			return "", newAPIError(http.StatusForbidden, "no_roots_configured", "No allowed roots configured.")
 		}
 		return a.roots[0].path, nil
 	}
@@ -319,7 +336,7 @@ func (a *agentServer) resolveSafe(p string) (string, error) {
 	}
 	abs = filepath.Clean(abs)
 	if _, ok := a.rootOf(abs); !ok {
-		return "", newAPIError(http.StatusForbidden, "path_outside_roots", "path is outside the allowed roots")
+		return "", newAPIError(http.StatusForbidden, "path_outside_roots", "Path is outside the allowed roots.")
 	}
 	return abs, nil
 }
@@ -332,7 +349,7 @@ func (a *agentServer) resolveWritable(p string) (string, error) {
 		return "", err
 	}
 	if root, _ := a.rootOf(abs); root.readOnly {
-		return "", newAPIError(http.StatusForbidden, "read_only_root", "path is inside a read-only root")
+		return "", newAPIError(http.StatusForbidden, "read_only_root", "Path is inside a read-only root.")
 	}
 	return abs, nil
 }
@@ -430,18 +447,18 @@ func (a *agentServer) handleList(w http.ResponseWriter, r *http.Request) {
 		sortOrder = "asc"
 	}
 	if sortField != "name" && sortField != "sizeBytes" && sortField != "updatedAt" {
-		writeError(w, http.StatusBadRequest, "invalid_sort", "sort must be name, sizeBytes or updatedAt")
+		writeError(w, http.StatusBadRequest, "invalid_sort", "The sort parameter must be name, sizeBytes or updatedAt.")
 		return
 	}
 	if sortOrder != "asc" && sortOrder != "desc" {
-		writeError(w, http.StatusBadRequest, "invalid_sort", "sortOrder must be asc or desc")
+		writeError(w, http.StatusBadRequest, "invalid_sort", "The sortOrder parameter must be asc or desc.")
 		return
 	}
 	showHidden := true
 	if v := q.Get("showHidden"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", "showHidden must be true or false")
+			writeError(w, http.StatusBadRequest, "invalid_request", "The showHidden parameter must be true or false.")
 			return
 		}
 		showHidden = b
@@ -454,7 +471,7 @@ func (a *agentServer) handleList(w http.ResponseWriter, r *http.Request) {
 		if v := q.Get(p.name); v != "" {
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 0 {
-				writeError(w, http.StatusBadRequest, "invalid_request", p.name+" must be a non-negative integer")
+				writeError(w, http.StatusBadRequest, "invalid_request", "The "+p.name+" parameter must be a non-negative integer.")
 				return
 			}
 			*p.dst = n
@@ -549,7 +566,7 @@ func (a *agentServer) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if info.IsDir() {
-		writeError(w, http.StatusBadRequest, "is_a_directory", "path is a directory")
+		writeError(w, http.StatusBadRequest, "is_a_directory", "Path is a directory.")
 		return
 	}
 	f, err := os.Open(abs)
@@ -660,7 +677,7 @@ func (a *agentServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.isRoot(abs) {
-		writeError(w, http.StatusForbidden, "root_protected", "refusing to delete an allowed root")
+		writeError(w, http.StatusForbidden, "root_protected", "Refusing to delete an allowed root.")
 		return
 	}
 	if err := os.RemoveAll(abs); err != nil {
@@ -681,16 +698,16 @@ func (a *agentServer) handleDeleteBatch(w http.ResponseWriter, r *http.Request) 
 		Paths []string `json:"paths"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body.")
 		return
 	}
 	if len(req.Paths) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "paths is required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "The paths field is required.")
 		return
 	}
 	if len(req.Paths) > maxBatchFiles {
 		writeError(w, http.StatusBadRequest, "too_many_files",
-			fmt.Sprintf("a batch delete can hold at most %d paths", maxBatchFiles))
+			fmt.Sprintf("A batch delete can hold at most %d paths.", maxBatchFiles))
 		return
 	}
 	deleted := []string{}
@@ -698,7 +715,7 @@ func (a *agentServer) handleDeleteBatch(w http.ResponseWriter, r *http.Request) 
 	for _, p := range req.Paths {
 		abs, err := a.resolveWritable(p)
 		if err == nil && a.isRoot(abs) {
-			err = newAPIError(http.StatusForbidden, "root_protected", "refusing to delete an allowed root")
+			err = newAPIError(http.StatusForbidden, "root_protected", "Refusing to delete an allowed root.")
 		}
 		if err == nil {
 			err = os.RemoveAll(abs)
@@ -717,11 +734,11 @@ func deleteSkip(p string, err error) batchSkip {
 	var ae *apiError
 	switch {
 	case errors.As(err, &ae):
-		return batchSkip{Path: p, Code: ae.Code, Message: ae.Message}
+		return batchSkip{Path: p, Code: ae.Code, Message: sentence(ae.Message)}
 	case os.IsPermission(err):
-		return batchSkip{Path: p, Code: "permission_denied", Message: err.Error()}
+		return batchSkip{Path: p, Code: "permission_denied", Message: sentence(err.Error())}
 	default:
-		return batchSkip{Path: p, Code: "io_error", Message: err.Error()}
+		return batchSkip{Path: p, Code: "io_error", Message: sentence(err.Error())}
 	}
 }
 
@@ -735,7 +752,7 @@ type fromToReq struct {
 func (a *agentServer) resolveFromTo(w http.ResponseWriter, r *http.Request, fromWritable bool) (string, string, bool) {
 	var req fromToReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body.")
 		return "", "", false
 	}
 	resolveFrom := a.resolveSafe
@@ -766,7 +783,7 @@ func (a *agentServer) resolveFromTo(w http.ResponseWriter, r *http.Request, from
 func checkFromTo(from, to string) error {
 	realFrom, realTo := evalSafe(from), evalSafe(to)
 	if realTo != realFrom && strings.HasPrefix(realTo, realFrom+string(filepath.Separator)) {
-		return newAPIError(http.StatusBadRequest, "invalid_destination", "a folder can't go inside itself")
+		return newAPIError(http.StatusBadRequest, "invalid_destination", "A folder can't go inside itself.")
 	}
 	toInfo, err := os.Lstat(to)
 	if errors.Is(err, os.ErrNotExist) {
@@ -778,7 +795,7 @@ func checkFromTo(from, to string) error {
 	if fromInfo, err := os.Lstat(from); err == nil && os.SameFile(fromInfo, toInfo) && from != to {
 		return nil
 	}
-	return newAPIError(http.StatusConflict, "exists", "a file or folder with this name already exists")
+	return newAPIError(http.StatusConflict, "exists", "A file or folder with this name already exists.")
 }
 
 func (a *agentServer) handleMove(w http.ResponseWriter, r *http.Request) {
@@ -787,7 +804,7 @@ func (a *agentServer) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.isRoot(from) {
-		writeError(w, http.StatusForbidden, "root_protected", "refusing to move an allowed root")
+		writeError(w, http.StatusForbidden, "root_protected", "Refusing to move an allowed root.")
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
@@ -886,7 +903,7 @@ type uploadReq struct {
 func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	var req uploadReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body.")
 		return
 	}
 	abs, err := a.resolveSafe(req.LocalPath)
@@ -907,7 +924,7 @@ func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if info.IsDir() {
 		f.Close()
-		writeError(w, http.StatusBadRequest, "is_a_directory", "path is a directory")
+		writeError(w, http.StatusBadRequest, "is_a_directory", "Path is a directory.")
 		return
 	}
 	name := req.Name
@@ -965,7 +982,7 @@ type downloadReq struct {
 func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	var req downloadReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body.")
 		return
 	}
 	abs, err := a.resolveWritable(req.LocalPath)
@@ -981,7 +998,7 @@ func (a *agentServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if node.NodeType != "file" {
-		writeError(w, http.StatusBadRequest, "not_a_file", "node is not a file")
+		writeError(w, http.StatusBadRequest, "not_a_file", "Node is not a file.")
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
@@ -1043,7 +1060,7 @@ func (a *agentServer) transferContext(r *http.Request, async bool) (context.Cont
 }
 
 func writeTransferCanceled(w http.ResponseWriter) {
-	writeError(w, http.StatusConflict, "transfer_canceled", "the transfer was canceled")
+	writeError(w, http.StatusConflict, "transfer_canceled", "The transfer was canceled.")
 }
 
 // writeTransferAccepted answers an async transfer request with the

@@ -128,7 +128,7 @@ func canonicalTransferID(id, code, field string) (string, error) {
 	}
 	parsed, err := uuid.Parse(id)
 	if err != nil {
-		return "", newAPIError(http.StatusBadRequest, code, field+" must be a UUID")
+		return "", newAPIError(http.StatusBadRequest, code, "The "+field+" field must be a UUID.")
 	}
 	return parsed.String(), nil
 }
@@ -148,7 +148,7 @@ func (tr *transferRegistry) begin(id string, rec transferRecord, cancel context.
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	if tr.idTakenLocked(id) {
-		return "", newAPIError(http.StatusConflict, "transfer_exists", "a transfer with this transferId already exists")
+		return "", newAPIError(http.StatusConflict, "transfer_exists", "A transfer with this transferId already exists.")
 	}
 	tr.addLocked(id, rec, transferRunning, cancel)
 	return id, nil
@@ -194,7 +194,7 @@ func (tr *transferRegistry) beginBatch(batchID string, dest transferBatch, items
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	if tr.idTakenLocked(batchID) {
-		return transferBatch{}, newAPIError(http.StatusConflict, "batch_exists", "a transfer or batch with this batchId already exists")
+		return transferBatch{}, newAPIError(http.StatusConflict, "batch_exists", "A transfer or batch with this batchId already exists.")
 	}
 	now := time.Now().UTC()
 	b := &transferBatch{
@@ -295,10 +295,10 @@ func (tr *transferRegistry) finishLocked(id string, node *storageNode, err error
 		rec.Node = node
 	case canceled:
 		rec.State = transferCanceled
-		rec.Error = err.Error()
+		rec.Error = sentence(err.Error())
 	default:
 		rec.State = transferFailed
-		rec.Error = err.Error()
+		rec.Error = sentence(err.Error())
 	}
 	if b := tr.batches[rec.BatchID]; b != nil {
 		tr.recordBatchResultLocked(b, rec, now)
@@ -376,11 +376,11 @@ func (tr *transferRegistry) cancelBatch(id string, wait time.Duration) (batch tr
 	b, ok := tr.batches[id]
 	if !ok {
 		tr.mu.Unlock()
-		return transferBatch{}, false, newAPIError(http.StatusNotFound, "transfer_not_found", "no transfer or batch with this id in the current session")
+		return transferBatch{}, false, newAPIError(http.StatusNotFound, "transfer_not_found", "No transfer or batch with this id in the current session.")
 	}
 	if b.FinishedAt != nil {
 		tr.mu.Unlock()
-		return transferBatch{}, false, newAPIError(http.StatusConflict, "transfer_finished", "the batch has already finished")
+		return transferBatch{}, false, newAPIError(http.StatusConflict, "transfer_finished", "The batch has already finished.")
 	}
 	var running []*activeTransfer
 	for _, tid := range b.TransferIDs {
@@ -460,9 +460,9 @@ func (tr *transferRegistry) cancel(id string, wait time.Duration) (rec transferR
 	tr.mu.Unlock()
 	if !active {
 		if known {
-			return transferRecord{}, false, newAPIError(http.StatusConflict, "transfer_finished", "the transfer has already finished")
+			return transferRecord{}, false, newAPIError(http.StatusConflict, "transfer_finished", "The transfer has already finished.")
 		}
-		return transferRecord{}, false, newAPIError(http.StatusNotFound, "transfer_not_found", "no transfer with this id in the current session")
+		return transferRecord{}, false, newAPIError(http.StatusNotFound, "transfer_not_found", "No transfer with this id in the current session.")
 	}
 
 	at.cancel()
@@ -483,7 +483,7 @@ func (tr *transferRegistry) cancel(id string, wait time.Duration) (rec transferR
 func (a *agentServer) handleTransfers(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	if state != "" && state != "active" && state != "history" {
-		writeError(w, http.StatusBadRequest, "invalid_state", `state must be "active" or "history"`)
+		writeError(w, http.StatusBadRequest, "invalid_state", `The state parameter must be "active" or "history".`)
 		return
 	}
 	active, history := a.transfers.list()
@@ -494,7 +494,7 @@ func (a *agentServer) handleTransfers(w http.ResponseWriter, r *http.Request) {
 		}
 		batch, ok := a.transfers.getBatch(batchID)
 		if !ok {
-			writeError(w, http.StatusNotFound, "batch_not_found", "no batch with this id in the current session")
+			writeError(w, http.StatusNotFound, "batch_not_found", "No batch with this id in the current session.")
 			return
 		}
 		resp["batch"] = batch
@@ -541,7 +541,7 @@ func (a *agentServer) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"batch": batch})
 		return
 	}
-	writeError(w, http.StatusNotFound, "transfer_not_found", "no transfer with this id in the current session")
+	writeError(w, http.StatusNotFound, "transfer_not_found", "No transfer with this id in the current session.")
 }
 
 // cancelTransferWait bounds how long DELETE /transfers/{id} waits for a

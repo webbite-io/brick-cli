@@ -64,7 +64,7 @@ type batchSkip struct {
 }
 
 var errTooManyBatchFiles = newAPIError(http.StatusBadRequest, "too_many_files",
-	fmt.Sprintf("a batch transfer can hold at most %d files", maxBatchFiles))
+	fmt.Sprintf("A batch transfer can hold at most %d files.", maxBatchFiles))
 
 // batchResolver turns a batch upload's paths into its files.
 type batchResolver struct {
@@ -86,7 +86,7 @@ func (a *agentServer) resolveBatch(paths []string, recursive bool) ([]batchFile,
 }
 
 func (br *batchResolver) skip(p, code, message string) {
-	br.skipped = append(br.skipped, batchSkip{Path: p, Code: code, Message: message})
+	br.skipped = append(br.skipped, batchSkip{Path: p, Code: code, Message: sentence(message)})
 }
 
 // skipErr records p as skipped for err, classified as writeOSError would.
@@ -110,7 +110,7 @@ func (br *batchResolver) skipErr(p string, err error) {
 func (br *batchResolver) addPath(p string) error {
 	if strings.TrimSpace(p) == "" {
 		// resolveSafe would take this to mean the first root.
-		br.skip(p, "invalid_path", "path is empty")
+		br.skip(p, "invalid_path", "Path is empty.")
 		return nil
 	}
 	abs, err := br.a.resolveSafe(p)
@@ -127,7 +127,7 @@ func (br *batchResolver) addPath(p string) error {
 		return br.addFile(abs, "", info)
 	}
 	if !br.recursive {
-		br.skip(abs, "is_a_directory", "path is a directory; set recursive to upload its contents")
+		br.skip(abs, "is_a_directory", "Path is a directory; set recursive to upload its contents.")
 		return nil
 	}
 	return br.addTree(abs)
@@ -157,11 +157,11 @@ func (br *batchResolver) addTree(abs string) error {
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
 			if info.IsDir() {
-				br.skip(p, "symlinked_directory", "symlinked folders are not followed")
+				br.skip(p, "symlinked_directory", "Symlinked folders are not followed.")
 				return nil
 			}
 			if _, ok := br.a.rootOf(p); !ok {
-				br.skip(p, "path_outside_roots", "symlink points outside the allowed roots")
+				br.skip(p, "path_outside_roots", "Symlink points outside the allowed roots.")
 				return nil
 			}
 		}
@@ -174,12 +174,12 @@ func (br *batchResolver) addTree(abs string) error {
 // added under another path or can't be read.
 func (br *batchResolver) addFile(abs, remoteDir string, info os.FileInfo) error {
 	if !info.Mode().IsRegular() {
-		br.skip(abs, "not_a_regular_file", "only regular files can be uploaded")
+		br.skip(abs, "not_a_regular_file", "Only regular files can be uploaded.")
 		return nil
 	}
 	real := evalSafe(abs)
 	if br.seen[real] {
-		br.skip(abs, "duplicate", "the file is already in this batch")
+		br.skip(abs, "duplicate", "The file is already in this batch.")
 		return nil
 	}
 	f, err := os.Open(abs)
@@ -201,11 +201,11 @@ func (br *batchResolver) addFile(abs, remoteDir string, info os.FileInfo) error 
 func (a *agentServer) handleUploadBatch(w http.ResponseWriter, r *http.Request) {
 	var req uploadBatchReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body.")
 		return
 	}
 	if len(req.Paths) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "paths is required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "The paths field is required.")
 		return
 	}
 	if len(req.Paths) > maxBatchFiles {
@@ -213,7 +213,7 @@ func (a *agentServer) handleUploadBatch(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if req.ParentID == "" && !req.DryRun {
-		writeError(w, http.StatusBadRequest, "invalid_request", "parentId is required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "The parentId field is required.")
 		return
 	}
 
