@@ -1340,12 +1340,22 @@ func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, c
 
 	attempt := 0
 	for {
-		err := connectAgentOnce(ctx, storageURL, apiURL, cfg, secret, agentAddr, remoteControl, signalConnected)
+		established := false
+		err := connectAgentOnce(ctx, storageURL, apiURL, cfg, secret, agentAddr, remoteControl, func() {
+			established = true
+			signalConnected()
+		})
 		if ctx.Err() != nil {
 			return
 		}
 		if err == nil {
 			return
+		}
+		// A connection that was up and then dropped (e.g. a Storage API
+		// restart) starts the backoff over, so the device is back as soon as
+		// the server is, however many drops came before.
+		if established {
+			attempt = 0
 		}
 		delay := reconnectBackoff[min(attempt, len(reconnectBackoff)-1)]
 		log.Printf("Brick CLI disconnected (%v); reconnecting in %v...", err, delay)

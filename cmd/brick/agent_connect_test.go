@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,5 +99,45 @@ func TestConnectAgentWithReconnectToleratesNilConnectedChannel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("connectAgentWithReconnect did not return promptly after ctx cancellation")
+	}
+}
+
+// A connection that came up and then dropped must start the backoff over:
+// otherwise every Storage API restart over a sync's lifetime adds a step,
+// and before long each reconnect waits the longest delay.
+func TestConnectAgentWithReconnectResetsBackoffAfterConnecting(t *testing.T) {
+	saved := reconnectBackoff
+	reconnectBackoff = []time.Duration{10 * time.Millisecond, 5 * time.Second}
+	t.Cleanup(func() { reconnectBackoff = saved })
+
+	upgrader := websocket.Upgrader{}
+	var connects atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connects.Add(1)
+		conn.Close() // drop every connection right away, like a server restarting
+	}))
+	defer server.Close()
+
+	cfg := &Config{AccessToken: "test-token", ActiveAccountID: "acct-1", ClientID: "client-1"}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connectAgentWithReconnect(ctx, server.URL, server.URL, cfg, "secret", "127.0.0.1:0", false, nil)
+	}()
+
+	// Without the reset, the second drop would wait 5s.
+	deadline := time.Now().Add(2 * time.Second)
+	for connects.Load() < 4 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if n := connects.Load(); n < 4 {
+		t.Fatalf("connected %d times in 2s, want at least 4: the backoff didn't start over after a connection", n)
 	}
 }
