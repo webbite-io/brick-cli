@@ -185,6 +185,7 @@ func (a *agentServer) handler() http.Handler {
 	mux.HandleFunc("PUT /fs/write", a.auth(a.handleWrite))
 	mux.HandleFunc("POST /fs/mkdir", a.auth(a.handleMkdir))
 	mux.HandleFunc("DELETE /fs/delete", a.auth(a.handleDelete))
+	mux.HandleFunc("POST /fs/delete-batch", a.auth(a.handleDeleteBatch))
 	mux.HandleFunc("POST /fs/move", a.auth(a.handleMove))
 	mux.HandleFunc("POST /fs/copy", a.auth(a.handleCopy))
 	mux.HandleFunc("POST /transfer/upload", a.auth(a.handleUpload))
@@ -667,6 +668,61 @@ func (a *agentServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"path": abs, "ok": true})
+}
+
+// handleDeleteBatch deletes up to maxBatchFiles paths (files, or folders with
+// everything in them) in one request. A path that can't be deleted (outside
+// the roots, read-only, a root itself, ...) is reported in "skipped" with
+// the code a single delete would have failed with, and the rest still go.
+// A path already gone, e.g. one inside a folder deleted earlier in the same
+// batch, counts as deleted.
+func (a *agentServer) handleDeleteBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Paths []string `json:"paths"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		return
+	}
+	if len(req.Paths) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "paths is required")
+		return
+	}
+	if len(req.Paths) > maxBatchFiles {
+		writeError(w, http.StatusBadRequest, "too_many_files",
+			fmt.Sprintf("a batch delete can hold at most %d paths", maxBatchFiles))
+		return
+	}
+	deleted := []string{}
+	skipped := []batchSkip{}
+	for _, p := range req.Paths {
+		abs, err := a.resolveWritable(p)
+		if err == nil && a.isRoot(abs) {
+			err = newAPIError(http.StatusForbidden, "root_protected", "refusing to delete an allowed root")
+		}
+		if err == nil {
+			err = os.RemoveAll(abs)
+		}
+		if err != nil {
+			skipped = append(skipped, deleteSkip(p, err))
+			continue
+		}
+		deleted = append(deleted, abs)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": deleted, "skipped": skipped})
+}
+
+// deleteSkip is the skipped entry for path p, which failed to delete with err.
+func deleteSkip(p string, err error) batchSkip {
+	var ae *apiError
+	switch {
+	case errors.As(err, &ae):
+		return batchSkip{Path: p, Code: ae.Code, Message: ae.Message}
+	case os.IsPermission(err):
+		return batchSkip{Path: p, Code: "permission_denied", Message: err.Error()}
+	default:
+		return batchSkip{Path: p, Code: "io_error", Message: err.Error()}
+	}
 }
 
 type fromToReq struct {

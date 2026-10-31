@@ -24,6 +24,8 @@ func TestAgentRejectsWrongMethod(t *testing.T) {
 		{"GET", "/fs/mkdir?path=" + filepath.Join(ta.root, "dir")},
 		{"GET", "/fs/delete?path=" + file},
 		{"POST", "/fs/delete?path=" + file},
+		{"GET", "/fs/delete-batch"},
+		{"DELETE", "/fs/delete-batch"},
 		{"GET", "/fs/move"},
 		{"GET", "/fs/copy"},
 		{"GET", "/transfer/upload"},
