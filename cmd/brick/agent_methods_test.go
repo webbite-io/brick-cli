@@ -35,7 +35,8 @@ func TestAgentRejectsWrongMethod(t *testing.T) {
 		{"GET", "/transfer/client-batch"},
 		{"POST", "/transfers"},
 		{"POST", "/transfers/x"},
-		{"POST", "/config/exclude-dirs"},
+		{"POST", "/settings"},
+		{"PUT", "/settings"},
 	} {
 		if status := ta.do(tc.method, tc.path, nil, nil); status != http.StatusMethodNotAllowed {
 			t.Errorf("%s %s: status %d, want 405", tc.method, tc.path, status)

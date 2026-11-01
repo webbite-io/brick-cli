@@ -668,7 +668,7 @@ type syncEngine struct {
 	// Guarded by e.mu; changed mid-session only via pendingExcludeDirs.
 	excludeDirs []string
 	// pendingExcludeDirs holds an excludeDirs change made while the engine
-	// runs (PUT /config/exclude-dirs), adopted at the start of the next pass.
+	// runs (PATCH /settings), adopted at the start of the next pass.
 	// Handed over this way rather than by taking e.mu, which a pass holds for
 	// as long as it runs.
 	pendingExcludeDirs atomic.Pointer[[]string]
@@ -2148,7 +2148,7 @@ func (e *syncEngine) queueExcludeDirs(dirs []string) {
 
 // reconcileExcludeDirsChange brings the sync index in line with an
 // excludeDirs change since it was last reconciled: one made mid-session via
-// PUT /config/exclude-dirs, or between runs by 'brick sync -s' or a config
+// PATCH /settings, or between runs by 'brick sync -s' or a config
 // edit. Must be called with e.mu held, before anything reads the index.
 //
 // While a folder is excluded the index keeps recording it: pass 2 records

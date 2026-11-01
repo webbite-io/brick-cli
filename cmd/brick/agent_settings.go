@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"path"
@@ -8,34 +9,74 @@ import (
 	"strings"
 )
 
-// handleGetExcludeDirs serves GET /config/exclude-dirs: the folders excluded
-// from sync for the active account, relative to its sync folder.
-func (a *agentServer) handleGetExcludeDirs(w http.ResponseWriter, r *http.Request) {
+// settingsResponse is the body of GET and PATCH /settings. selectiveSync can
+// be changed with PATCH; roots, with whether each is read-only, is listed only,
+// as it can only be changed on the device itself.
+type settingsResponse struct {
+	SelectiveSync selectiveSyncSettings `json:"selectiveSync"`
+	Roots         []rootEntry           `json:"roots"`
+}
+
+// selectiveSyncSettings holds the folders excluded from sync for the active
+// account, relative to its sync folder.
+type selectiveSyncSettings struct {
+	ExcludeDirs []string `json:"excludeDirs"`
+}
+
+func (a *agentServer) settingsResponse() settingsResponse {
+	return settingsResponse{
+		SelectiveSync: selectiveSyncSettings{ExcludeDirs: nonNil(a.settings.excludeDirs())},
+		Roots:         a.rootEntries(),
+	}
+}
+
+// handleGetSettings serves GET /settings.
+func (a *agentServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	if a.settings == nil {
 		writeError(w, http.StatusServiceUnavailable, "sync_not_running", "No sync is running to read settings from.")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"excludeDirs": nonNil(a.settings.excludeDirs())})
+	writeJSON(w, http.StatusOK, a.settingsResponse())
 }
 
-// handleSetExcludeDirs serves PUT /config/exclude-dirs with a body of
-// {"excludeDirs": [...]}, replacing the whole list. The change is saved to
+// handleUpdateSettings serves PATCH /settings with a body of
+// {"selectiveSync": {"excludeDirs": [...]}}, replacing the whole exclude list,
+// and answers with the settings as GET /settings does. The change is saved to
 // config.yaml and applied to the running sync straight away. Local copies of
 // newly excluded folders are left on disk, just no longer synced; folders no
-// longer excluded are downloaded on the next sync pass.
-func (a *agentServer) handleSetExcludeDirs(w http.ResponseWriter, r *http.Request) {
+// longer excluded are downloaded on the next sync pass. A body that names
+// roots is refused: which folders remote control may reach, and whether it
+// may change them, is up to the device, not to remote control.
+func (a *agentServer) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if a.settings == nil {
 		writeError(w, http.StatusServiceUnavailable, "sync_not_running", "No sync is running to apply settings to.")
 		return
 	}
-	var req struct {
-		ExcludeDirs *[]string `json:"excludeDirs"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ExcludeDirs == nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", `The body must be {"excludeDirs": [...]}.`)
+	const usage = `The body must be {"selectiveSync": {"excludeDirs": [...]}}.`
+	var req map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", usage)
 		return
 	}
-	dirs, err := normalizeExcludeDirs(*req.ExcludeDirs)
+	if _, ok := req["roots"]; ok {
+		writeError(w, http.StatusForbidden, "setting_read_only", "Roots and whether they're read-only can only be changed on the device.")
+		return
+	}
+	raw, ok := req["selectiveSync"]
+	if !ok || len(req) != 1 {
+		writeError(w, http.StatusBadRequest, "invalid_request", usage)
+		return
+	}
+	var sel struct {
+		ExcludeDirs *[]string `json:"excludeDirs"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&sel); err != nil || sel.ExcludeDirs == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", usage)
+		return
+	}
+	dirs, err := normalizeExcludeDirs(*sel.ExcludeDirs)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -44,7 +85,7 @@ func (a *agentServer) handleSetExcludeDirs(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, "config_write_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"excludeDirs": nonNil(dirs)})
+	writeJSON(w, http.StatusOK, a.settingsResponse())
 }
 
 // normalizeExcludeDirs validates excludeDirs entries and puts them in the

@@ -130,48 +130,68 @@ func (s *stubExcludeDirs) setExcludeDirs(dirs []string) error {
 	return nil
 }
 
-func TestAgentExcludeDirsEndpoints(t *testing.T) {
+func TestAgentSettingsEndpoints(t *testing.T) {
 	sc, fake := newTestTransferClient(t)
 	ta := newTestAgent(t, sc, fake, true)
 
 	var errResp struct {
 		Error apiError `json:"error"`
 	}
-	if status := ta.do("GET", "/config/exclude-dirs", nil, &errResp); status != http.StatusServiceUnavailable {
+	if status := ta.do("GET", "/settings", nil, &errResp); status != http.StatusServiceUnavailable {
 		t.Errorf("GET with no sync running: status %d, want 503", status)
 	}
 
 	stub := &stubExcludeDirs{}
 	ta.server.settings = stub
 
-	var got struct {
-		ExcludeDirs []string `json:"excludeDirs"`
+	var got settingsResponse
+	if status := ta.do("GET", "/settings", nil, &got); status != http.StatusOK || got.SelectiveSync.ExcludeDirs == nil || len(got.SelectiveSync.ExcludeDirs) != 0 {
+		t.Errorf("GET with nothing excluded: status %d, excludeDirs %#v, want 200 and []", status, got.SelectiveSync.ExcludeDirs)
 	}
-	if status := ta.do("GET", "/config/exclude-dirs", nil, &got); status != http.StatusOK || got.ExcludeDirs == nil || len(got.ExcludeDirs) != 0 {
-		t.Errorf("GET with nothing excluded: status %d, excludeDirs %#v, want 200 and []", status, got.ExcludeDirs)
+	if len(got.Roots) != 1 || got.Roots[0].Path != ta.root {
+		t.Errorf("GET roots = %+v, want just %s", got.Roots, ta.root)
 	}
 
-	body := map[string][]string{"excludeDirs": {"/Photos/", "Work//Archive/", "Photos", " Music "}}
-	if status := ta.do("PUT", "/config/exclude-dirs", body, &got); status != http.StatusOK {
-		t.Fatalf("PUT: status %d, want 200", status)
+	body := map[string]any{"selectiveSync": map[string][]string{"excludeDirs": {"/Photos/", "Work//Archive/", "Photos", " Music "}}}
+	if status := ta.do("PATCH", "/settings", body, &got); status != http.StatusOK {
+		t.Fatalf("PATCH: status %d, want 200", status)
 	}
 	want := []string{"Photos", "Work/Archive", "Music"}
-	if !slices.Equal(got.ExcludeDirs, want) || !slices.Equal(stub.dirs, want) {
-		t.Errorf("PUT stored %v and answered %v, want both %v", stub.dirs, got.ExcludeDirs, want)
+	if !slices.Equal(got.SelectiveSync.ExcludeDirs, want) || !slices.Equal(stub.dirs, want) {
+		t.Errorf("PATCH stored %v and answered %v, want both %v", stub.dirs, got.SelectiveSync.ExcludeDirs, want)
+	}
+	if len(got.Roots) != 1 {
+		t.Errorf("PATCH answered roots %+v, want the one root", got.Roots)
 	}
 
-	for _, bad := range []interface{}{
-		map[string][]string{"excludeDirs": {"../etc"}},
-		map[string][]string{"excludeDirs": {"Photos/../.."}},
-		map[string][]string{"excludeDirs": {"/"}},
+	for _, bad := range []any{
+		map[string]any{"selectiveSync": map[string][]string{"excludeDirs": {"../etc"}}},
+		map[string]any{"selectiveSync": map[string][]string{"excludeDirs": {"Photos/../.."}}},
+		map[string]any{"selectiveSync": map[string][]string{"excludeDirs": {"/"}}},
+		map[string]any{"selectiveSync": map[string]any{}},
+		map[string]any{"selectiveSync": map[string]any{"excludeDirs": []string{}, "other": 1}},
+		map[string][]string{"excludeDirs": {"Photos"}},
 		map[string]string{"something": "else"},
 	} {
-		if status := ta.do("PUT", "/config/exclude-dirs", bad, nil); status != http.StatusBadRequest {
-			t.Errorf("PUT %v: status %d, want 400", bad, status)
+		if status := ta.do("PATCH", "/settings", bad, nil); status != http.StatusBadRequest {
+			t.Errorf("PATCH %v: status %d, want 400", bad, status)
 		}
 	}
+
+	// Roots, and whether they're read-only, can't be changed remotely, even
+	// alongside a valid selectiveSync change.
+	readOnly := map[string]any{
+		"selectiveSync": map[string][]string{"excludeDirs": {}},
+		"roots":         []map[string]any{{"path": ta.root, "readOnly": true}},
+	}
+	if status := ta.do("PATCH", "/settings", readOnly, &errResp); status != http.StatusForbidden || errResp.Error.Code != "setting_read_only" {
+		t.Errorf("PATCH roots: status %d code %q, want 403 setting_read_only", status, errResp.Error.Code)
+	}
 	if !slices.Equal(stub.dirs, want) {
-		t.Errorf("a rejected PUT changed the list to %v", stub.dirs)
+		t.Errorf("a rejected PATCH changed the list to %v", stub.dirs)
+	}
+	if ta.server.roots[0].readOnly {
+		t.Error("a rejected PATCH made the root read-only")
 	}
 }
 

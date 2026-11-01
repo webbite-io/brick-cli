@@ -199,8 +199,8 @@ func (a *agentServer) handler() http.Handler {
 	mux.HandleFunc("GET /transfers", a.auth(a.handleTransfers))
 	mux.HandleFunc("GET /transfers/{id}", a.auth(a.handleTransfer))
 	mux.HandleFunc("DELETE /transfers/{id}", a.auth(a.handleCancelTransfer))
-	mux.HandleFunc("GET /config/exclude-dirs", a.auth(a.handleGetExcludeDirs))
-	mux.HandleFunc("PUT /config/exclude-dirs", a.auth(a.handleSetExcludeDirs))
+	mux.HandleFunc("GET /settings", a.auth(a.handleGetSettings))
+	mux.HandleFunc("PATCH /settings", a.auth(a.handleUpdateSettings))
 	return mux
 }
 
@@ -419,11 +419,15 @@ type rootEntry struct {
 // navigate. Each root's path is a valid value for the "path" param of the other
 // endpoints.
 func (a *agentServer) handleRoots(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{"roots": a.rootEntries()})
+}
+
+func (a *agentServer) rootEntries() []rootEntry {
 	roots := make([]rootEntry, 0, len(a.roots))
 	for _, root := range a.roots {
 		roots = append(roots, rootEntry{Path: root.path, Name: filepath.Base(root.path), ReadOnly: root.readOnly})
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"roots": roots})
+	return roots
 }
 
 // handleList serves /fs/list. Its optional query params match the Brick
@@ -1246,8 +1250,8 @@ var remoteControlActions = map[string]remoteControlAction{
 	"GET /transfers":                {"Listing transfers", ""},
 	"GET /transfers/{id}":           {"Checking a transfer", ""},
 	"DELETE /transfers/{id}":        {"Cancelling a transfer", ""},
-	"GET /config/exclude-dirs":      {"Reading the excluded folders", ""},
-	"PUT /config/exclude-dirs":      {"Updating the excluded folders", ""},
+	"GET /settings":                 {"Reading the settings", ""},
+	"PATCH /settings":               {"Updating the settings", ""},
 }
 
 // remoteControlBodyPaths names the JSON body field holding the local path an
