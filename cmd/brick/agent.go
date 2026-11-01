@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1186,6 +1187,8 @@ func proxyAgentStream(stream net.Conn, agentAddr string) {
 		return
 	}
 
+	target := remoteControlTarget(req)
+
 	localConn, err := net.Dial("tcp", agentAddr)
 	if err != nil {
 		log.Printf("Local dial failed (%s): %v", agentAddr, err)
@@ -1211,7 +1214,123 @@ func proxyAgentStream(stream net.Conn, agentAddr string) {
 		return
 	}
 
-	log.Printf("Brick CLI: %s %s %d %s", req.Method, req.URL.RequestURI(), resp.StatusCode, time.Since(start).Round(time.Millisecond))
+	log.Print(remoteControlLogLine(req.Method, req.URL.Path, target, resp.StatusCode, time.Since(start)))
+}
+
+// remoteControlAction is how the status window names an agent API endpoint:
+// generic, and with the name of the file or folder it acts on when there is
+// one (named, a format with one %s).
+type remoteControlAction struct {
+	generic, named string
+}
+
+// remoteControlActions names each agent API endpoint, keyed by method and
+// path as registered in agentServer.handler, for the status window.
+var remoteControlActions = map[string]remoteControlAction{
+	"GET /version":                  {"Checking the version", ""},
+	"GET /fs/roots":                 {"Listing roots", ""},
+	"GET /fs/list":                  {"Listing a folder", "Listing %s"},
+	"GET /fs/stat":                  {"Looking up a file", "Looking up %s"},
+	"GET /fs/read":                  {"Reading a file", "Reading %s"},
+	"PUT /fs/write":                 {"Writing a file", "Writing %s"},
+	"POST /fs/mkdir":                {"Creating a folder", "Creating the folder %s"},
+	"DELETE /fs/delete":             {"Deleting a file", "Deleting %s"},
+	"POST /fs/delete-batch":         {"Deleting files", ""},
+	"POST /fs/move":                 {"Moving a file", "Moving %s"},
+	"POST /fs/copy":                 {"Copying a file", "Copying %s"},
+	"POST /transfer/upload":         {"Starting an upload", "Uploading %s"},
+	"POST /transfer/download":       {"Starting a download", "Downloading %s"},
+	"POST /transfer/upload-batch":   {"Starting a batch upload", ""},
+	"POST /transfer/download-batch": {"Starting a batch download", ""},
+	"POST /transfer/client-batch":   {"Starting a copy from another client", ""},
+	"GET /transfers":                {"Listing transfers", ""},
+	"GET /transfers/{id}":           {"Checking a transfer", ""},
+	"DELETE /transfers/{id}":        {"Cancelling a transfer", ""},
+	"GET /config/exclude-dirs":      {"Reading the excluded folders", ""},
+	"PUT /config/exclude-dirs":      {"Updating the excluded folders", ""},
+}
+
+// remoteControlBodyPaths names the JSON body field holding the local path an
+// endpoint acts on, for the endpoints that take it in the body rather than in
+// the path query parameter.
+var remoteControlBodyPaths = map[string]string{
+	"POST /fs/move":           "from",
+	"POST /fs/copy":           "from",
+	"POST /transfer/upload":   "localPath",
+	"POST /transfer/download": "localPath",
+}
+
+// maxLoggedBody caps how much of a request body remoteControlTarget reads to
+// find the path; the bodies it looks at are small JSON objects.
+const maxLoggedBody = 64 << 10
+
+// remoteControlKey is the remoteControlActions key for a request.
+func remoteControlKey(method, path string) string {
+	if id, ok := strings.CutPrefix(path, "/transfers/"); ok && id != "" && !strings.Contains(id, "/") {
+		return method + " /transfers/{id}"
+	}
+	return method + " " + path
+}
+
+// remoteControlTarget returns the name of the file or folder req acts on, or
+// "" when it acts on none. It may read req's body to find it, and leaves the
+// body as it was for forwarding.
+func remoteControlTarget(req *http.Request) string {
+	key := remoteControlKey(req.Method, req.URL.Path)
+	if action := remoteControlActions[key]; action.named == "" {
+		return ""
+	}
+	field, ok := remoteControlBodyPaths[key]
+	if !ok {
+		return displayName(req.URL.Query().Get("path"))
+	}
+	if req.Body == nil {
+		return ""
+	}
+	buf, err := io.ReadAll(io.LimitReader(req.Body, maxLoggedBody+1))
+	req.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(buf), req.Body), req.Body}
+	if err != nil || len(buf) > maxLoggedBody {
+		return ""
+	}
+	var body map[string]any
+	if json.Unmarshal(buf, &body) != nil {
+		return ""
+	}
+	p, _ := body[field].(string)
+	return displayName(p)
+}
+
+// displayName is the last element of p, a path from the caller in either slash
+// style, so a status line names a file without its folders.
+func displayName(p string) string {
+	p = strings.TrimRight(p, `/\`)
+	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
+		p = p[i+1:]
+	}
+	return p
+}
+
+// remoteControlLogLine describes a proxied request as a sentence, e.g.
+// "Remote Control: Listing roots." or `Remote Control: Reading "a.txt".`,
+// naming target when it isn't empty. A failed request gets its status code,
+// and an endpoint missing from remoteControlActions falls back to method and
+// path.
+func remoteControlLogLine(method, path, target string, status int, elapsed time.Duration) string {
+	action, ok := remoteControlActions[remoteControlKey(method, path)]
+	if !ok {
+		return fmt.Sprintf("Remote Control: %s %s %d %s", method, path, status, elapsed.Round(time.Millisecond))
+	}
+	text := action.generic
+	if target != "" && action.named != "" {
+		text = fmt.Sprintf(action.named, `"`+target+`"`)
+	}
+	if status >= 400 {
+		return fmt.Sprintf("Remote Control: %s failed (%d).", text, status)
+	}
+	return "Remote Control: " + text + "."
 }
 
 // connectAgentOnce dials the storage API, takes the yamux server role, and
