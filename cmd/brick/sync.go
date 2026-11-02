@@ -3800,10 +3800,15 @@ func ensureStorageSyncFolder(cfg *Config, checklist *onboardingChecklist) (folde
 	return abs, conflictMode, nil
 }
 
+// cameraUploadsFolder is the top-level folder the sync-scope onboarding
+// leaves out by default, since it tends to hold a lot of large files.
+const cameraUploadsFolder = "Camera Uploads"
+
 // runSyncScopeOnboarding runs the final onboarding step: if the Brick account
-// has any top-level folders, it asks whether to sync everything or only a
-// subset, writing the folders the user picks to exclude into the active
-// account's ExcludeDirs. A no-op if the account has no folders yet.
+// has any top-level folders, it asks whether to sync everything, everything
+// but Camera Uploads (the default), or only the folders the user picks to
+// include, writing whatever is left out into the active account's
+// ExcludeDirs. A no-op if the account has no folders yet.
 func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config, checklist *onboardingChecklist) error {
 	topFolders, totalSize, err := sc.folderSummary(context.Background(), rootID)
 	if err != nil {
@@ -3817,45 +3822,69 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config, check
 	checklist.println("")
 
 	const (
-		optAll  = "all"
-		optPick = "pick"
+		optAll          = "all"
+		optAllButCamera = "allButCamera"
+		optPick         = "pick"
 	)
-	var choice string
+	// Pre-set so huh highlights this option when the form opens.
+	choice := optAllButCamera
 	if err := huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().
 			Title("Sync scope").
 			Options(
 				huh.NewOption(fmt.Sprintf("Sync all folders from Brick (%s)", humanSize(totalSize)), optAll),
+				huh.NewOption(fmt.Sprintf("Sync all folders except %q from Brick", cameraUploadsFolder), optAllButCamera),
 				huh.NewOption("Pick which folders to sync", optPick),
 			).
 			Value(&choice),
 	)).Run(); err != nil {
 		return err
 	}
-	if choice == optAll {
+
+	var excludeDirs []string
+	switch choice {
+	case optAll:
 		checklist.done("Folders selected (all)")
 		return nil
-	}
-
-	options := make([]huh.Option[string], len(topFolders))
-	for i, f := range topFolders {
-		options[i] = huh.NewOption(f.Name, f.Name)
-	}
-	var excludeDirs []string
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewMultiSelect[string]().
-			Title("Select the folders to EXCLUDE from sync (type \"x\" to toggle)").
-			Options(options...).
-			Value(&excludeDirs),
-	)).Run(); err != nil {
-		return err
+	case optAllButCamera:
+		// Excluded even if the folder doesn't exist yet, so it's still left
+		// out once the first camera upload creates it.
+		excludeDirs = []string{cameraUploadsFolder}
+	case optPick:
+		options := make([]huh.Option[string], len(topFolders))
+		// Pre-populated before Options()/Value() are chained below, so huh
+		// ticks every folder except Camera Uploads.
+		var includeDirs []string
+		for i, f := range topFolders {
+			options[i] = huh.NewOption(f.Name, f.Name)
+			if f.Name != cameraUploadsFolder {
+				includeDirs = append(includeDirs, f.Name)
+			}
+		}
+		if err := huh.NewForm(huh.NewGroup(
+			huh.NewMultiSelect[string]().
+				Title("Select the folders to INCLUDE in sync (type \"x\" to toggle)").
+				Options(options...).
+				Value(&includeDirs),
+		)).Run(); err != nil {
+			return err
+		}
+		for _, f := range topFolders {
+			if !slices.Contains(includeDirs, f.Name) {
+				excludeDirs = append(excludeDirs, f.Name)
+			}
+		}
 	}
 
 	cfg.ensureActiveAccount().ExcludeDirs = excludeDirs
 	if err := saveConfig(cfg); err != nil {
 		return err
 	}
-	checklist.done("Folders selected (%d of %d)", len(topFolders)-len(excludeDirs), len(topFolders))
+	if choice == optAllButCamera {
+		checklist.done("Folders selected (all except %s)", cameraUploadsFolder)
+	} else {
+		checklist.done("Folders selected (%d of %d)", len(topFolders)-len(excludeDirs), len(topFolders))
+	}
 	return nil
 }
 
