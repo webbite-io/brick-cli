@@ -347,3 +347,22 @@ func TestSyncTUIModelTopRowEllipsizesFolder(t *testing.T) {
 		t.Errorf("topRow() = %q, want the folder ellipsized to fit", row)
 	}
 }
+
+func TestRCTUIModelIgnoresDetachAndPause(t *testing.T) {
+	var cancelled atomic.Bool
+	m := newRCTUIModel("1.2.3", func() { cancelled.Store(true) })
+	m.width, m.height = 80, 24
+
+	for _, k := range []string{"d", "p"} {
+		if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}); cmd != nil {
+			t.Errorf("%q returned a command, want none", k)
+		}
+	}
+	if cancelled.Load() || m.detachRequested.Load() || m.paused {
+		t.Fatalf("d/p had an effect: cancelled=%v detach=%v paused=%v", cancelled.Load(), m.detachRequested.Load(), m.paused)
+	}
+	line := m.commandsLine()
+	if strings.Contains(line, "Detach") || strings.Contains(line, "sync") {
+		t.Errorf("commandsLine offers sync shortcuts: %q", line)
+	}
+}

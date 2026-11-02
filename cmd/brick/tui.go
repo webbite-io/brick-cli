@@ -180,6 +180,10 @@ type syncTUIModel struct {
 	quota  *storageQuota
 	paused bool
 
+	// rcOnly is set for `brick rc`, which runs no sync: the Detach and
+	// Pause shortcuts are neither offered nor handled.
+	rcOnly bool
+
 	searching  bool // the search input row is visible/focused
 	search     textinput.Model
 	matchCount int
@@ -207,6 +211,15 @@ func newSyncTUIModel(version, folder string, cancel context.CancelFunc, detachRe
 		detachRequested: detachRequested,
 		togglePause:     togglePause,
 	}
+}
+
+// newRCTUIModel is the TUI for `brick rc`: the same log view, with
+// rcFolderLabel where the sync folder would go and only Ctrl+C and search as
+// commands.
+func newRCTUIModel(version string, cancel context.CancelFunc) *syncTUIModel {
+	m := newSyncTUIModel(version, rcFolderLabel, cancel, &atomic.Bool{}, func() {})
+	m.rcOnly = true
+	return m
 }
 
 func (m *syncTUIModel) Init() tea.Cmd { return nil }
@@ -283,12 +296,15 @@ func (m *syncTUIModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cancel()
 		return m, tea.Quit
 	case "d", "D":
-		if daemonSupported {
+		if daemonSupported && !m.rcOnly {
 			m.detachRequested.Store(true)
 			m.cancel()
 			return m, tea.Quit
 		}
 	case "p", "P":
+		if m.rcOnly {
+			return m, nil
+		}
 		m.togglePause()
 		m.paused = !m.paused
 		return m, nil
@@ -494,6 +510,10 @@ func (m *syncTUIModel) searchRow() string {
 
 func (m *syncTUIModel) commandsLine() string {
 	colored := ansiLightGreen + "Ctrl+C" + ansiReset + ": Stop"
+	if m.rcOnly {
+		colored += " • " + ansiLightGreen + "/" + ansiReset + ": Search"
+		return fmt.Sprintf("%sCommands:%s %s", ansiPurple, ansiReset, colored)
+	}
 	if daemonSupported {
 		colored += " • " + ansiLightGreen + "D" + ansiReset + ": Detach as daemon"
 	}

@@ -156,6 +156,21 @@ Print the folders currently excluded from sync for the active account.
 Report what a real sync would do right now \(em every file that would be
 uploaded, downloaded, or otherwise changed \(em without transferring,
 deleting, or writing anything.
+.SS "rc \fR[\fIoptions\fR]"
+Start the same log view as
+.B "brick sync"
+with remote control enabled, but without syncing anything: no sync folder is
+read, watched, or written. Brick can browse and transfer files in the exposed
+directories, and each remote control request is logged. Press
+.B Ctrl+C
+to stop. Like
+.BR sync ,
+it refuses to start while another brick instance is running.
+.TP
+.B \-\-agent\-root \fIPATH\fR
+Expose a read-only directory to remote clients, in addition to any
+.I agentRoots
+in the configuration file. Repeatable.
 .SS "upload \fR[\fIoptions\fR] \fIfile\fR|\fIdir\fR [\fItarget\-path\fR|\fIuuid\fR]"
 Upload a local file or folder to Brick, outside of the two-way sync loop.
 .I target

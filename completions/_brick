@@ -20,6 +20,7 @@ _brick() {
         'restart:Clear existing settings and configure Brick from scratch'
         'uninstall:Uninstall brick (interactive)'
         'sync:Sync storageSyncFolder with the Storage API and watch for changes'
+        'rc:Handle remote control requests and log them, without syncing'
         'upload:Upload a local file or folder'
         'download:Download a remote file or folder'
     )
@@ -47,6 +48,10 @@ _brick() {
                         '(--dry-run)'--dry-run'[Report what would be synced without transferring, deleting or writing anything]'
                     )
                     _arguments -s $sync_flags
+                    ;;
+                rc)
+                    _arguments -s \
+                        '(--agent-root)'--agent-root'[Read-only directory to expose to remote clients]:directory:_files -/'
                     ;;
                 upload)
                     local -a upload_flags

@@ -37,6 +37,9 @@ complete -c brick -n '__fish_use_subcommand' -a uninstall \
 complete -c brick -n '__fish_use_subcommand' -a sync \
     -d 'Sync storageSyncFolder with the Storage API and watch for changes'
 
+complete -c brick -n '__fish_use_subcommand' -a rc \
+    -d 'Handle remote control requests and log them, without syncing'
+
 complete -c brick -n '__fish_use_subcommand' -a upload \
     -d 'Upload a local file or folder'
 
@@ -64,6 +67,10 @@ complete -c brick -n '__fish_seen_subcommand_from sync' -l list-selective-sync \
 
 complete -c brick -n '__fish_seen_subcommand_from sync' -l dry-run \
     -d 'Report what would be synced without transferring, deleting or writing anything'
+
+# ── rc ───────────────────────────────────────────────────────────────────────
+complete -c brick -n '__fish_seen_subcommand_from rc' -l agent-root \
+    -d 'Read-only directory to expose to remote clients' -r
 
 # ── upload ───────────────────────────────────────────────────────────────────
 complete -c brick -n '__fish_seen_subcommand_from upload' -s r -l recursive \

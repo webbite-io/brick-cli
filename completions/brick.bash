@@ -13,7 +13,7 @@ _brick() {
         --no-upgrade-check
         --setup-and-exit
     )
-    local commands=(login switch-accounts whoami restart uninstall sync upload download)
+    local commands=(login switch-accounts whoami restart uninstall sync rc upload download)
 
     # Find the subcommand word, if any: the first word (after the program
     # name) that isn't itself a flag. Global flags must precede it, so any
@@ -45,6 +45,17 @@ _brick() {
             esac
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=( $(compgen -W "-d --daemon --json -r --remote-control --agent-root -s --selective-sync --list-selective-sync --dry-run" -- "$cur") )
+            fi
+            ;;
+        rc)
+            case "$prev" in
+                --agent-root)
+                    _filedir -d
+                    return 0
+                    ;;
+            esac
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--agent-root" -- "$cur") )
             fi
             ;;
         upload)

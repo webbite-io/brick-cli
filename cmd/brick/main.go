@@ -136,6 +136,10 @@ func main() {
 		runSyncCmd(flag.Args()[1:], noUpgradeCheck)
 		os.Exit(0)
 
+	case "rc":
+		runRCCmd(flag.Args()[1:], noUpgradeCheck)
+		os.Exit(0)
+
 	case "upload":
 		runUploadCmd(flag.Args()[1:])
 		os.Exit(0)
