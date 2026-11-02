@@ -603,18 +603,9 @@ func (a *agentServer) handleRead(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	info, err := os.Stat(abs)
+	f, info, err := openRegular(abs)
 	if err != nil {
-		writeOSError(w, err)
-		return
-	}
-	if info.IsDir() {
-		writeError(w, http.StatusBadRequest, "is_a_directory", "Path is a directory.")
-		return
-	}
-	f, err := os.Open(abs)
-	if err != nil {
-		writeOSError(w, err)
+		writeErrOrOS(w, err)
 		return
 	}
 	defer f.Close()
@@ -896,6 +887,36 @@ func writeErrOrOS(w http.ResponseWriter, err error) {
 
 var errNotRegularFile = newAPIError(http.StatusBadRequest, "not_a_regular_file", "Only regular files and folders can be read.")
 
+// openRegular opens the regular file at abs for reading, with its info. A
+// folder fails with is_a_directory, and anything else that isn't a regular
+// file with not_a_regular_file before it is opened: opening a FIFO blocks
+// until something writes to it, and a device like /dev/zero never ends.
+func openRegular(abs string) (*os.File, os.FileInfo, error) {
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if info.IsDir() {
+		return nil, nil, newAPIError(http.StatusBadRequest, "is_a_directory", "Path is a directory.")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, errNotRegularFile
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Checked again on what was opened, in case the path changed meanwhile.
+	if info, err = f.Stat(); err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		if err == nil {
+			err = errNotRegularFile
+		}
+		return nil, nil, err
+	}
+	return f, info, nil
+}
+
 // copyPath copies a file or folder tree from src to dst. Inside a folder,
 // symlinks are treated as upload-batch treats them: one to a file within the
 // roots is copied as that file, while one to a folder (which could loop) or
@@ -1019,20 +1040,9 @@ func (a *agentServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	f, err := os.Open(abs)
+	f, info, err := openRegular(abs)
 	if err != nil {
-		writeOSError(w, err)
-		return
-	}
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		writeOSError(w, err)
-		return
-	}
-	if info.IsDir() {
-		f.Close()
-		writeError(w, http.StatusBadRequest, "is_a_directory", "Path is a directory.")
+		writeErrOrOS(w, err)
 		return
 	}
 	name := req.Name

@@ -406,18 +406,11 @@ func (a *agentServer) uploadBatchFile(it queuedUpload) (*storageNode, error) {
 		return nil, err
 	}
 	// The file may have changed, or gone, since the batch was queued.
-	f, err := os.Open(it.file.LocalPath)
+	f, info, err := openRegular(it.file.LocalPath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is no longer a regular file", it.file.LocalPath)
-	}
 	a.transfers.update(it.id, func(rec *transferRecord) {
 		rec.ParentID = parentID
 		rec.BytesTotal = info.Size()
