@@ -235,7 +235,7 @@ func (a *agentServer) handleDownloadBatch(w http.ResponseWriter, r *http.Request
 	}
 	a.answerDownloadBatch(w, req.DryRun, req.BatchID, transferBatch{Direction: "download", LocalDir: localDir}, files, skipped,
 		func(ctx context.Context, f downloadBatchFile, dest string, onProgress func(written, total int64)) error {
-			return a.sc.downloadToFile(ctx, f.NodeID, dest, f.Size, onProgress)
+			return a.sc.downloadToNewFile(ctx, f.NodeID, dest, f.Size, onProgress)
 		})
 }
 

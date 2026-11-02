@@ -169,7 +169,9 @@ func runGuarded(ctx context.Context, attempt transferAttempt) (bool, error) {
 //
 // fetch makes the request with the given extra headers. errFor turns a
 // response with an unexpected status into the error to fail (or retry) with.
-func resumableDownload(ctx context.Context, destPath string, total int64, onProgress func(written, total int64),
+// With noClobber, a file that appeared at destPath while downloading is kept
+// and the download fails instead (see placeNoClobber).
+func resumableDownload(ctx context.Context, destPath string, total int64, noClobber bool, onProgress func(written, total int64),
 	fetch func(ctx context.Context, headers map[string]string) (*http.Response, error),
 	errFor func(resp *http.Response) error) error {
 	tmpPath := destPath + tmpSuffix
@@ -256,11 +258,38 @@ func resumableDownload(ctx context.Context, destPath string, total int64, onProg
 		os.Remove(tmpPath)
 		return err
 	}
-	if err := os.Rename(tmpPath, destPath); err != nil {
+	place := os.Rename
+	if noClobber {
+		place = placeNoClobber
+	}
+	if err := place(tmpPath, destPath); err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
 	return nil
+}
+
+// errDestExists is placeNoClobber's error for a destination already taken.
+var errDestExists = errors.New("a file or folder with this name already exists")
+
+// placeNoClobber moves finished download tmp to dest, failing with
+// errDestExists rather than replacing anything already there. A hard link
+// does that atomically; where the disk doesn't support them it falls back
+// to checking first, which leaves only a brief window for a race.
+func placeNoClobber(tmp, dest string) error {
+	err := os.Link(tmp, dest)
+	if err == nil {
+		return os.Remove(tmp)
+	}
+	if errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("%s: %w", dest, errDestExists)
+	}
+	if _, lerr := os.Lstat(dest); lerr == nil {
+		return fmt.Errorf("%s: %w", dest, errDestExists)
+	} else if !errors.Is(lerr, os.ErrNotExist) {
+		return lerr
+	}
+	return os.Rename(tmp, dest)
 }
 
 // createExclusive creates file p for writing, which must be new: a symlink

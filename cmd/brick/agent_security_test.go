@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
@@ -299,5 +300,57 @@ func TestCreateExclusiveDoesNotFollowSymlink(t *testing.T) {
 	f.Close()
 	if got, _ := os.ReadFile(p); len(got) != 0 {
 		t.Errorf("leftover = %q, want it emptied", got)
+	}
+}
+
+// A file that appears where a batch download is going, while it downloads,
+// is kept, and the download fails.
+func TestAgentDownloadBatchKeepsFileThatAppearedMeanwhile(t *testing.T) {
+	fake := newFakeStorageAPI()
+	release := make(chan struct{})
+	ta := newTestAgent(t, gatedDownloadServer(t, fake, release), fake, true)
+	addFakeFile(fake, "f1", "report.txt", []byte("0123456789"))
+
+	var out batchResp
+	if status := ta.do("POST", "/transfer/download-batch", downloadBatchReq{NodeIDs: []string{"f1"}, LocalDir: ta.root}, &out); status != http.StatusAccepted {
+		t.Fatalf("download-batch: status %d, want 202", status)
+	}
+	id := out.Batch.TransferIDs[0]
+	ta.waitForTransfer(id, func(rec transferRecord) bool { return rec.BytesDone > 0 })
+	dest := writeTestFile(t, ta.root, "report.txt", "mine")
+	close(release)
+
+	rec := ta.waitForTransfer(id, func(rec transferRecord) bool { return rec.State != transferRunning })
+	if rec.State != transferFailed {
+		t.Errorf("transfer = %s, want failed", rec.State)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "mine" {
+		t.Errorf("report.txt = %q, want the file that appeared kept", got)
+	}
+	if entries, _ := os.ReadDir(ta.root); len(entries) != 1 {
+		t.Errorf("root holds %v, want only report.txt (no temporary file left)", entries)
+	}
+}
+
+func TestPlaceNoClobber(t *testing.T) {
+	dir := t.TempDir()
+	tmp := writeTestFile(t, dir, "a.brick-tmp", "new")
+	dest := filepath.Join(dir, "a")
+	if err := placeNoClobber(tmp, dest); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "new" {
+		t.Errorf("dest = %q, want new", got)
+	}
+	if _, err := os.Lstat(tmp); !os.IsNotExist(err) {
+		t.Errorf("tmp still there: %v", err)
+	}
+
+	tmp = writeTestFile(t, dir, "a.brick-tmp", "newer")
+	if err := placeNoClobber(tmp, dest); !errors.Is(err, errDestExists) {
+		t.Errorf("onto an existing file: err %v, want errDestExists", err)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "new" {
+		t.Errorf("dest = %q, want it kept", got)
 	}
 }

@@ -207,7 +207,18 @@ func (sc *storageClient) resolvePath(ctx context.Context, path string) (*storage
 // download that fails part way resumes where it stopped (see
 // resumableDownload).
 func (sc *storageClient) downloadToFile(ctx context.Context, nodeID, destPath string, total int64, onProgress func(written, total int64)) error {
-	return resumableDownload(ctx, destPath, total, onProgress, func(ctx context.Context, headers map[string]string) (*http.Response, error) {
+	return sc.downloadNode(ctx, nodeID, destPath, total, false, onProgress)
+}
+
+// downloadToNewFile is downloadToFile for a destPath that must not exist: if
+// something appears there while downloading, it is kept and the download
+// fails with errDestExists.
+func (sc *storageClient) downloadToNewFile(ctx context.Context, nodeID, destPath string, total int64, onProgress func(written, total int64)) error {
+	return sc.downloadNode(ctx, nodeID, destPath, total, true, onProgress)
+}
+
+func (sc *storageClient) downloadNode(ctx context.Context, nodeID, destPath string, total int64, noClobber bool, onProgress func(written, total int64)) error {
+	return resumableDownload(ctx, destPath, total, noClobber, onProgress, func(ctx context.Context, headers map[string]string) (*http.Response, error) {
 		return sc.streamGet(ctx, "/files/"+nodeID, headers)
 	}, sc.errFrom)
 }

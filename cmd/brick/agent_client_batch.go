@@ -143,11 +143,11 @@ func (sc *storageClient) clientUploadDryRun(ctx context.Context, id string, path
 }
 
 // clientReadToFile streams file p on attached client id, through the Storage
-// API, to destPath. A read that fails part way resumes where it stopped (see
-// resumableDownload), or starts over if the source is a client from before
-// /fs/read served ranges.
+// API, to destPath, which must not exist (as for downloadToNewFile). A read
+// that fails part way resumes where it stopped (see resumableDownload), or
+// starts over if the source is a client from before /fs/read served ranges.
 func (sc *storageClient) clientReadToFile(ctx context.Context, id, p, destPath string, total int64, onProgress func(written, total int64)) error {
-	return resumableDownload(ctx, destPath, total, onProgress, func(ctx context.Context, headers map[string]string) (*http.Response, error) {
+	return resumableDownload(ctx, destPath, total, true, onProgress, func(ctx context.Context, headers map[string]string) (*http.Response, error) {
 		return sc.streamGet(ctx, clientPath(id, "/fs/read?"+url.Values{"path": {p}}.Encode()), headers)
 	}, sourceReadError)
 }
