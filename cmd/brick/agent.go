@@ -306,15 +306,43 @@ func writeOSError(w http.ResponseWriter, err error) {
 }
 
 // evalSafe resolves symlinks on the longest existing prefix of p so that the
-// containment check below cannot be defeated by a symlinked leaf or parent.
+// containment check below cannot be defeated by a symlink anywhere along it:
+// root/link/new/file, with link pointing out of the roots and new not there
+// yet, resolves through link, since writing it would create new there.
+//
+// A p that is itself a symlink that can't be resolved (dangling) resolves as
+// its folder plus its name, so it can still be deleted or replaced. One that
+// can't be resolved further up the path resolves to "", which is inside no
+// root: whatever is written through it would land somewhere unknown.
 func evalSafe(p string) string {
-	if rp, err := filepath.EvalSymlinks(p); err == nil {
-		return rp
+	cur := p
+	var rest []string // the missing names below cur, innermost first
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			break
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p // nothing along p exists; no symlink to follow either
+		}
+		rest = append(rest, filepath.Base(cur))
+		cur = parent
 	}
-	if rp, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
-		return filepath.Join(rp, filepath.Base(p))
+	rp, err := filepath.EvalSymlinks(cur)
+	if err != nil {
+		if len(rest) > 0 {
+			return ""
+		}
+		dir, err := filepath.EvalSymlinks(filepath.Dir(p))
+		if err != nil {
+			return ""
+		}
+		return filepath.Join(dir, filepath.Base(p))
 	}
-	return p
+	for i := len(rest) - 1; i >= 0; i-- {
+		rp = filepath.Join(rp, rest[i])
+	}
+	return rp
 }
 
 // resolveSafe expands ~, makes p absolute, and verifies it stays within one of
@@ -362,8 +390,14 @@ func (a *agentServer) rootOf(abs string) (agentRoot, bool) {
 	real := evalSafe(abs)
 	var best agentRoot
 	bestLen := -1
+	if real == "" {
+		return best, false
+	}
 	for _, root := range a.roots {
 		rootReal := evalSafe(root.path)
+		if rootReal == "" {
+			continue // a root that can't be resolved contains nothing
+		}
 		// prefix carries a trailing separator so "/a/b" doesn't match "/a/bc";
 		// for the filesystem root ("/") rootReal already ends in a separator, so
 		// guard against producing "//" which would reject every child path.
@@ -382,6 +416,9 @@ func (a *agentServer) rootOf(abs string) (agentRoot, bool) {
 // not be deleted or moved).
 func (a *agentServer) isRoot(abs string) bool {
 	real := evalSafe(abs)
+	if real == "" {
+		return false
+	}
 	for _, root := range a.roots {
 		if real == evalSafe(root.path) {
 			return true
