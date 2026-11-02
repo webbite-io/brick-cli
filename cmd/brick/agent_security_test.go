@@ -269,3 +269,35 @@ func TestAgentRefusesToDeleteOrMoveFolderHoldingRoot(t *testing.T) {
 		t.Errorf("file in the read-only root = %q, want it kept", got)
 	}
 }
+
+func TestCreateExclusiveDoesNotFollowSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := writeTestFile(t, dir, "target.txt", "precious")
+	p := filepath.Join(dir, "file.brick-tmp")
+	symlinkOrSkip(t, target, p)
+
+	f, err := createExclusive(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("new"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if got, _ := os.ReadFile(target); string(got) != "precious" {
+		t.Errorf("symlink target = %q, want it untouched", got)
+	}
+	if info, err := os.Lstat(p); err != nil || !info.Mode().IsRegular() {
+		t.Errorf("%s = %v, %v; want a new regular file", p, info, err)
+	}
+
+	// A leftover regular file is replaced too.
+	f, err = createExclusive(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if got, _ := os.ReadFile(p); len(got) != 0 {
+		t.Errorf("leftover = %q, want it emptied", got)
+	}
+}

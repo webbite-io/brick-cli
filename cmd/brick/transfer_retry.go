@@ -173,7 +173,7 @@ func resumableDownload(ctx context.Context, destPath string, total int64, onProg
 	fetch func(ctx context.Context, headers map[string]string) (*http.Response, error),
 	errFor func(resp *http.Response) error) error {
 	tmpPath := destPath + tmpSuffix
-	out, err := os.Create(tmpPath)
+	out, err := createExclusive(tmpPath)
 	if err != nil {
 		return err
 	}
@@ -261,6 +261,21 @@ func resumableDownload(ctx context.Context, destPath string, total int64, onProg
 		return err
 	}
 	return nil
+}
+
+// createExclusive creates file p for writing, which must be new: a symlink
+// already at p is not followed, so it can't send the write somewhere else.
+// Whatever is at p (say a temporary file left by an earlier run that was cut
+// off) is removed first; a symlink is removed itself, not what it points to.
+func createExclusive(p string) (*os.File, error) {
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+	if !errors.Is(err, os.ErrExist) {
+		return f, err
+	}
+	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
 }
 
 // responseValidator returns what an If-Range for the rest of resp's body
