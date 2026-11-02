@@ -336,7 +336,9 @@ func TestConcurrentDownloadsToSamePlace(t *testing.T) {
 			}()
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: pr}, nil
 		}
-		go func() { result <- resumableDownload(context.Background(), dest, int64(len(data)), true, nil, fetch, errFor) }()
+		go func() {
+			result <- resumableDownload(context.Background(), dest, int64(len(data)), true, nil, fetch, errFor)
+		}()
 		return half, result
 	}
 

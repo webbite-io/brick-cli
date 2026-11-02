@@ -1518,11 +1518,11 @@ func printable(s string) string {
 
 // connectAgentOnce dials the storage API, takes the yamux server role, and
 // serves the agent API h on the streams it opens until the session ends or
-// ctx is cancelled. It reads cfg.AccessToken fresh so reconnects pick up refreshed
-// tokens, and refreshes once on a 401/403. onConnected, if non-nil, is called
-// once the connection is actually established (right after the "Brick CLI
-// connected..." log line) — see connectAgentWithReconnect's doc comment for
-// why.
+// ctx is cancelled. It reads cfg.AccessToken fresh so reconnects pick up
+// refreshed tokens, and refreshes once on a 401/403. onConnected, if non-nil,
+// is called once the connection is actually established (right after the
+// "Brick CLI connected..." log line) — see connectAgentWithReconnect's doc
+// comment for why.
 func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Config, secret string, h http.Handler, remoteControl bool, onConnected func()) error {
 	hostname, _ := os.Hostname()
 	q := url.Values{}

@@ -80,8 +80,8 @@ func errTooManyTransfers() error {
 }
 
 // transferBatch is a batch upload or download as reported by
-// GET /transfers/{id} for the batch's id: one transfer per file, run one at a
-// time.
+// GET /transfers/{id} for the batch's id: one transfer per file, run by the
+// transfer queue (see transferWorkers).
 type transferBatch struct {
 	ID        string `json:"id"`
 	Direction string `json:"direction"`          // "upload", "download" or "copy"
