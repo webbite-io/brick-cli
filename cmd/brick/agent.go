@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -553,43 +554,56 @@ func (a *agentServer) handleList(w http.ResponseWriter, r *http.Request) {
 		writeOSError(w, err)
 		return
 	}
-	infos := make([]os.FileInfo, 0, len(dirents))
-	for _, d := range dirents {
-		if !showHidden && strings.HasPrefix(d.Name(), ".") {
-			continue
-		}
-		info, err := d.Info()
-		if err != nil {
-			continue
-		}
-		infos = append(infos, info)
+	if !showHidden {
+		dirents = slices.DeleteFunc(dirents, func(d os.DirEntry) bool { return strings.HasPrefix(d.Name(), ".") })
 	}
 
-	// Ties fall back to name, the way the Brick API falls back to node ID.
-	less := func(x, y os.FileInfo) bool {
-		switch sortField {
-		case "sizeBytes":
-			if x.Size() != y.Size() {
-				return x.Size() < y.Size()
-			}
-		case "updatedAt":
-			if !x.ModTime().Equal(y.ModTime()) {
-				return x.ModTime().Before(y.ModTime())
-			}
-		}
-		return x.Name() < y.Name()
-	}
-	sort.SliceStable(infos, func(i, j int) bool {
+	var infos []os.FileInfo
+	var count int
+	if sortField == "name" {
+		// ReadDir already sorts by name, byte-wise, so only the page needs
+		// its entries' info (an lstat each). One that went away meanwhile
+		// is left out of the page but still counted.
 		if sortOrder == "desc" {
-			return less(infos[j], infos[i])
+			slices.Reverse(dirents)
 		}
-		return less(infos[i], infos[j])
-	})
-
-	count := len(infos)
-	infos = infos[min(offset, count):]
-	if limit > 0 && limit < len(infos) {
-		infos = infos[:limit]
+		count = len(dirents)
+		dirents = page(dirents, offset, limit)
+		infos = make([]os.FileInfo, 0, len(dirents))
+		for _, d := range dirents {
+			if info, err := d.Info(); err == nil {
+				infos = append(infos, info)
+			}
+		}
+	} else {
+		infos = make([]os.FileInfo, 0, len(dirents))
+		for _, d := range dirents {
+			if info, err := d.Info(); err == nil {
+				infos = append(infos, info)
+			}
+		}
+		// Ties fall back to name, the way the Brick API falls back to node ID.
+		less := func(x, y os.FileInfo) bool {
+			switch sortField {
+			case "sizeBytes":
+				if x.Size() != y.Size() {
+					return x.Size() < y.Size()
+				}
+			case "updatedAt":
+				if !x.ModTime().Equal(y.ModTime()) {
+					return x.ModTime().Before(y.ModTime())
+				}
+			}
+			return x.Name() < y.Name()
+		}
+		sort.SliceStable(infos, func(i, j int) bool {
+			if sortOrder == "desc" {
+				return less(infos[j], infos[i])
+			}
+			return less(infos[i], infos[j])
+		})
+		count = len(infos)
+		infos = page(infos, offset, limit)
 	}
 
 	entries := make([]fsEntry, len(infos))
@@ -597,6 +611,15 @@ func (a *agentServer) handleList(w http.ResponseWriter, r *http.Request) {
 		entries[i] = toEntry(info)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"path": abs, "entries": entries, "count": count})
+}
+
+// page returns the part of s that offset and limit (0: no limit) select.
+func page[T any](s []T, offset, limit int) []T {
+	s = s[min(offset, len(s)):]
+	if limit > 0 && limit < len(s) {
+		s = s[:limit]
+	}
+	return s
 }
 
 func (a *agentServer) handleStat(w http.ResponseWriter, r *http.Request) {

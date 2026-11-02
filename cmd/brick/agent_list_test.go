@@ -67,6 +67,9 @@ func TestAgentListSortFilterAndPaginate(t *testing.T) {
 		{"&limit=2&offset=2", []string{"b.txt", "c.txt"}},
 		{"&limit=0&offset=1", []string{"a.txt", "b.txt", "c.txt"}},
 		{"&offset=9", []string{}},
+		{"&sortOrder=desc&limit=2&offset=1", []string{"b.txt", "a.txt"}},
+		{"&sortOrder=desc&showHidden=false&offset=2", []string{"a.txt"}},
+		{"&showHidden=false&limit=5&offset=1", []string{"b.txt", "c.txt"}},
 		{"&sort=sizeBytes&sortOrder=desc&showHidden=false&limit=1&offset=1", []string{"c.txt"}},
 	}
 	for _, tc := range cases {
