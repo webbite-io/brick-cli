@@ -545,3 +545,48 @@ func TestResolveBatchStopsWhenRequestGoesAway(t *testing.T) {
 		t.Errorf("resolveBatch = %v, %v; want the one file", files, err)
 	}
 }
+
+func TestAgentUploadBatchSymlinksInTree(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	writeTestFile(t, root, "tree/real.txt", "real")
+	writeTestFile(t, root, "other/inside.txt", "inside")
+	secret := writeTestFile(t, base, "outside/secret.txt", "secret")
+	tree := filepath.Join(root, "tree")
+	symlinkOrSkip(t, filepath.Join(tree, "real.txt"), filepath.Join(tree, "again.txt"))
+	symlinkOrSkip(t, filepath.Join(root, "other", "inside.txt"), filepath.Join(tree, "to-inside.txt"))
+	symlinkOrSkip(t, secret, filepath.Join(tree, "to-secret.txt"))
+	symlinkOrSkip(t, filepath.Join(root, "other"), filepath.Join(tree, "to-dir"))
+	symlinkOrSkip(t, filepath.Join(base, "gone"), filepath.Join(tree, "dangling"))
+	symlinkOrSkip(t, tree, filepath.Join(root, "tree-link"))
+	ta := newTestAgentWithRoots(t, sc, fake, true, []agentRoot{{path: root}})
+
+	var out dryRunResp
+	if status := ta.do("POST", "/transfer/upload-batch", map[string]interface{}{
+		"paths": []string{filepath.Join(root, "tree-link")}, "recursive": true, "dryRun": true,
+	}, &out); status != http.StatusOK {
+		t.Fatalf("dry run: status %d", status)
+	}
+	var got []string
+	for _, f := range out.Files {
+		got = append(got, f.RemoteDir+"/"+f.Name)
+	}
+	slices.Sort(got)
+	// again.txt and real.txt are one file: whichever the walk meets first
+	// (again.txt, by name) is taken.
+	if want := []string{"tree-link/again.txt", "tree-link/to-inside.txt"}; !slices.Equal(got, want) {
+		t.Errorf("files = %v, want %v", got, want)
+	}
+	codes := skipCodes(out.Skipped)
+	for name, code := range map[string]string{
+		"real.txt": "duplicate", "to-secret.txt": "path_outside_roots", "to-dir": "symlinked_directory", "dangling": "not_found",
+	} {
+		if codes[name] != code {
+			t.Errorf("skip for %s = %q, want %q (all: %+v)", name, codes[name], code, out.Skipped)
+		}
+	}
+	if len(out.Skipped) != 4 {
+		t.Errorf("skipped %d, want 4: %+v", len(out.Skipped), out.Skipped)
+	}
+}
