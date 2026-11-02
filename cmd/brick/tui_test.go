@@ -336,6 +336,43 @@ func TestTopRowShowsPausedNoticeOnlyWhenPaused(t *testing.T) {
 	}
 }
 
+func TestTopRowShowsRemoteControlNotice(t *testing.T) {
+	m := newSyncTUIModel("1.2.3", "/sync/folder", func() {}, new(atomic.Bool), func() {})
+	m.width, m.height = 120, 24
+
+	if row := m.topRow(); strings.Contains(row, "Remote Control") {
+		t.Errorf("topRow() without remote control = %q, should not show the notice", row)
+	}
+
+	cases := []struct {
+		name       string
+		roots      []agentRoot
+		wantAccess string // "" means no access level shown
+	}{
+		{"no roots", nil, ""},
+		{"one read-only root", []agentRoot{{path: "/a", readOnly: true}}, "(R/O)"},
+		{"one read/write root", []agentRoot{{path: "/a"}}, "(R/W)"},
+		{"several roots", []agentRoot{{path: "/a"}, {path: "/b", readOnly: true}}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m.setRemoteControl(tc.roots)
+			m.paused = true
+			row := m.topRow()
+			want := "v1.2.3 · ⚡ Remote Control On"
+			if tc.wantAccess != "" {
+				want += " " + tc.wantAccess
+			}
+			if !strings.Contains(row, want+" · ⚠️ Syncing is paused") {
+				t.Errorf("topRow() = %q, want %q right after the version and before the paused notice", row, want)
+			}
+			if tc.wantAccess == "" && (strings.Contains(row, "R/O") || strings.Contains(row, "R/W")) {
+				t.Errorf("topRow() = %q, should not show an access level", row)
+			}
+		})
+	}
+}
+
 func TestSyncTUIModelTopRowEllipsizesFolder(t *testing.T) {
 	m := newSyncTUIModel("1.2.3", "/very/long/path/that/does/not/fit/on/screen", func() {}, new(atomic.Bool), func() {})
 	m.width, m.height = 40, 24

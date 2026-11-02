@@ -180,6 +180,12 @@ type syncTUIModel struct {
 	quota  *storageQuota
 	paused bool
 
+	// remoteControl is set (see setRemoteControl) when remote control is on
+	// for this run; rcAccess is "R/O" or "R/W" when exactly one root is
+	// exposed, and empty otherwise. Both are shown in topRow.
+	remoteControl bool
+	rcAccess      string
+
 	// rcOnly is set for `brick rc`, which runs no sync: the Detach and
 	// Pause shortcuts are neither offered nor handled.
 	rcOnly bool
@@ -220,6 +226,19 @@ func newRCTUIModel(version string, cancel context.CancelFunc) *syncTUIModel {
 	m := newSyncTUIModel(version, rcFolderLabel, cancel, &atomic.Bool{}, func() {})
 	m.rcOnly = true
 	return m
+}
+
+// setRemoteControl marks remote control as on in topRow, along with the
+// access level of roots when there's exactly one of them.
+func (m *syncTUIModel) setRemoteControl(roots []agentRoot) {
+	m.remoteControl = true
+	m.rcAccess = ""
+	if len(roots) == 1 {
+		m.rcAccess = "R/W"
+		if roots[0].readOnly {
+			m.rcAccess = "R/O"
+		}
+	}
 }
 
 func (m *syncTUIModel) Init() tea.Cmd { return nil }
@@ -450,12 +469,19 @@ func (m *syncTUIModel) View() string {
 	return b.String()
 }
 
-// topRow renders "Webbite Brick CLI vX.Y.Z" on the left and the synced folder
+// topRow renders "Webbite Brick CLI vX.Y.Z" on the left, followed by the
+// remote control and paused notices when they apply, and the synced folder
 // on the right, ellipsizing the folder from the left (keeping its more
 // identifying tail) if the two don't both fit.
 func (m *syncTUIModel) topRow() string {
 	title := "Webbite Brick CLI"
 	left := fmt.Sprintf("%s v%s", title, m.version)
+	if m.remoteControl {
+		left += remoteControlNoticePlain
+		if m.rcAccess != "" {
+			left += " (" + m.rcAccess + ")"
+		}
+	}
 	if m.paused {
 		left += pausedNoticePlain
 	}
@@ -470,6 +496,16 @@ func (m *syncTUIModel) topRow() string {
 	}
 	styledLeft := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226")).Render(title) +
 		lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf(" v%s", m.version))
+	if m.remoteControl {
+		styledLeft += " · " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render("⚡ Remote Control On")
+		if m.rcAccess != "" {
+			accessColor := lipgloss.Color("196") // red: read-only
+			if m.rcAccess == "R/W" {
+				accessColor = lipgloss.Color("120") // green: read/write
+			}
+			styledLeft += " " + lipgloss.NewStyle().Bold(true).Foreground(accessColor).Render("("+m.rcAccess+")")
+		}
+	}
 	if m.paused {
 		styledLeft += " · " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208")).Render("⚠️ Syncing is paused")
 	}
@@ -481,6 +517,10 @@ func (m *syncTUIModel) topRow() string {
 // when computing layout — must be kept in sync with the styled text built in
 // topRow.
 const pausedNoticePlain = " · ⚠️ Syncing is paused"
+
+// remoteControlNoticePlain is the unstyled form of the remote control notice
+// (without its access level), used the same way as pausedNoticePlain.
+const remoteControlNoticePlain = " · ⚡ Remote Control On"
 
 // ellipsizeLeft clips s to width columns, prefixing an ellipsis and keeping
 // the tail when it's too wide — for a path, the end is more identifying

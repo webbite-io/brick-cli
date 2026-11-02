@@ -3478,6 +3478,9 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 
 	if interactive {
 		model := newSyncTUIModel(Version, folder, cancel, &detachRequested, togglePause)
+		if remoteControl {
+			model.setRemoteControl(resolveAgentRoots(cfg))
+		}
 		prog = tea.NewProgram(model, tea.WithAltScreen())
 		eng.onQuota = func(q *storageQuota) { prog.Send(quotaMsg{q}) }
 		tuiOutput := io.Writer(newTUILogWriter(prog))

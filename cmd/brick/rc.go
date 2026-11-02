@@ -135,6 +135,7 @@ func runRemoteControlLoop(cfg *Config, sc *storageClient) error {
 
 	if interactive {
 		model := newRCTUIModel(Version, cancel)
+		model.setRemoteControl(resolveAgentRoots(cfg))
 		prog = tea.NewProgram(model, tea.WithAltScreen())
 		tuiOutput := io.Writer(newTUILogWriter(prog))
 		if syncLog != nil {
