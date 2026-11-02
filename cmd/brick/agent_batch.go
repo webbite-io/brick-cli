@@ -14,7 +14,7 @@ import (
 	"sync"
 )
 
-// --- Batch upload: many local files to Drive, queued and run one at a time ---
+// --- Batch upload: many local files to Drive, queued and run a few at a time ---
 //
 // POST /transfer/upload-batch takes local paths (files, or with recursive
 // folders too) and a destination parentId. The paths are resolved up front
@@ -23,8 +23,8 @@ import (
 // dryRun the list and its total size are returned without uploading, so the
 // caller can e.g. check it against the quota first. Otherwise every file is
 // registered as a queued transfer under one batch and the request answers
-// 202 straight away; the agent's upload queue then uploads them in order,
-// one file at a time across all batches.
+// 202 straight away; the agent's transfer queue then uploads them in order,
+// transferWorkers files at a time across all batches.
 //
 // A picked folder keeps its name: uploading ~/Photos recursively into
 // parentId puts its files under Photos/... there, creating the folders (or
@@ -304,8 +304,10 @@ type queuedUpload struct {
 }
 
 // batchFolders maps a batch's remote folder paths to the ids of the folders
-// created (or found) for them. Only the queue's single worker touches it.
+// created (or found) for them. The queue's workers share it, and mu, held
+// while folders are created, keeps two of them from creating the same one.
 type batchFolders struct {
+	mu       sync.Mutex
 	parentID string
 	ids      map[string]string
 }
@@ -313,6 +315,8 @@ type batchFolders struct {
 // folder returns the id of folder dir ("a/b") under the batch's parentId,
 // creating any part of it that doesn't exist yet.
 func (bf *batchFolders) folder(ctx context.Context, sc *storageClient, dir string) (string, error) {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
 	id := bf.parentID
 	if dir == "" {
 		return id, nil
@@ -343,9 +347,15 @@ type queuedJob struct {
 	run func() (*storageNode, error)
 }
 
-// transferQueue holds batch files waiting to be transferred, oldest first. A
-// single worker (runTransferQueue) takes them one at a time, whichever way
-// they go.
+// transferWorkers is how many batch files are transferred at once, across
+// all batches and whichever way they go: enough that the round trips around
+// each file (creating its folder, starting its request) overlap with other
+// files' bytes, few enough not to crowd the connection. A variable so tests
+// that need files to run one at a time can say so.
+var transferWorkers = 3
+
+// transferQueue holds batch files waiting to be transferred, oldest first.
+// runTransferQueue's workers take them from the front.
 type transferQueue struct {
 	mu    sync.Mutex
 	items []queuedJob
@@ -366,6 +376,8 @@ func (q *transferQueue) push(items ...queuedJob) {
 	}
 }
 
+// pop takes the oldest item. If more are left, it passes the wake-up on, as
+// push wakes only one of the workers waiting.
 func (q *transferQueue) pop() (queuedJob, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -375,24 +387,44 @@ func (q *transferQueue) pop() (queuedJob, bool) {
 	it := q.items[0]
 	q.items[0] = queuedJob{}
 	q.items = q.items[1:]
+	if len(q.items) > 0 {
+		select {
+		case q.wake <- struct{}{}:
+		default:
+		}
+	}
 	return it, true
 }
 
-// runTransferQueue transfers queued batch files until ctx (the session) ends,
-// then marks whatever is still queued as canceled.
+// runTransferQueue transfers queued batch files, transferWorkers at a time,
+// until ctx (the session) ends, then marks whatever is still queued as
+// canceled.
 func (a *agentServer) runTransferQueue(ctx context.Context) {
-	for {
+	var wg sync.WaitGroup
+	for range max(transferWorkers, 1) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a.runTransferWorker(ctx)
+		}()
+	}
+	wg.Wait()
+	for it, ok := a.queue.pop(); ok; it, ok = a.queue.pop() {
+		a.transfers.finish(it.ctx, it.id, nil, it.ctx.Err())
+	}
+}
+
+// runTransferWorker transfers queued batch files one after another until ctx
+// ends.
+func (a *agentServer) runTransferWorker(ctx context.Context) {
+	for ctx.Err() == nil {
 		it, ok := a.queue.pop()
 		if !ok {
 			select {
 			case <-a.queue.wake:
-				continue
 			case <-ctx.Done():
 			}
-			for it, ok := a.queue.pop(); ok; it, ok = a.queue.pop() {
-				a.transfers.finish(it.ctx, it.id, nil, it.ctx.Err())
-			}
-			return
+			continue
 		}
 		a.runQueuedJob(it)
 	}

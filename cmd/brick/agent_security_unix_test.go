@@ -60,6 +60,7 @@ func TestAgentRefusesToReadOrUploadFIFO(t *testing.T) {
 // A file that turns into a FIFO while its batch waits fails, rather than
 // blocking the queue for every batch after it.
 func TestAgentUploadBatchFileTurnedFIFOFails(t *testing.T) {
+	oneTransferAtATime(t)
 	fake := newFakeStorageAPI()
 	release := make(chan struct{})
 	ta := newTestAgent(t, gatedUploadServer(t, fake, release), fake, true)

@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-// --- Batch download: many Drive files to local disk, queued and run one at a time ---
+// --- Batch download: many Drive files to local disk, queued and run a few at a time ---
 //
 // POST /transfer/download-batch is upload-batch the other way round. It takes
 // Drive node ids (files, or with recursive folders too) and a local
@@ -23,7 +23,8 @@ import (
 // dryRun the list and its total size are returned without downloading.
 // Otherwise every file is registered as a queued transfer under one batch,
 // the request answers 202 straight away, and the agent's transfer queue
-// downloads them in order, one file at a time across all batches.
+// downloads them in order, transferWorkers files at a time across all
+// batches.
 //
 // A picked folder keeps its name: downloading Drive's Photos recursively into
 // localDir puts its files under Photos/... there, creating the folders (or

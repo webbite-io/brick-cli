@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -254,7 +255,18 @@ func gatedUploadServer(t *testing.T, fake *fakeStorageAPI, release <-chan struct
 	return &storageClient{baseURL: server.URL, apiURL: server.URL, accountID: "acct-1", cfg: &Config{AccessToken: "test-token"}}
 }
 
+// oneTransferAtATime makes agents created during the test run their queue
+// with a single worker, for tests that need a file to still be queued while
+// the one ahead of it runs.
+func oneTransferAtATime(t *testing.T) {
+	t.Helper()
+	n := transferWorkers
+	transferWorkers = 1
+	t.Cleanup(func() { transferWorkers = n })
+}
+
 func TestAgentUploadBatchRunsOneAtATimeAndCancels(t *testing.T) {
+	oneTransferAtATime(t)
 	fake := newFakeStorageAPI()
 	release := make(chan struct{})
 	ta := newTestAgent(t, gatedUploadServer(t, fake, release), fake, true)
@@ -360,5 +372,109 @@ func TestAgentUploadBatchLimits(t *testing.T) {
 		"paths": []string{writeTestFile(t, ta.root, "x", "x")}, "parentId": "root", "batchId": "nope",
 	}, nil); status != http.StatusBadRequest {
 		t.Errorf("non-UUID batchId: status %d, want 400", status)
+	}
+}
+
+// With the default pool, transferWorkers files run at once and the rest wait
+// their turn, taking a worker as one frees up.
+func TestAgentUploadBatchRunsAFewAtATime(t *testing.T) {
+	fake := newFakeStorageAPI()
+	release := make(chan struct{})
+	ta := newTestAgent(t, gatedUploadServer(t, fake, release), fake, true)
+	var paths []string
+	for i := 0; i < transferWorkers+2; i++ {
+		paths = append(paths, writeTestFile(t, ta.root, fmt.Sprintf("f%d.txt", i), "data"))
+	}
+	var out batchResp
+	if status := ta.do("POST", "/transfer/upload-batch", map[string]interface{}{"paths": paths, "parentId": "root"}, &out); status != http.StatusAccepted {
+		t.Fatalf("POST /transfer/upload-batch: status %d, want 202", status)
+	}
+	ids := out.Batch.TransferIDs
+
+	states := func() map[string]int {
+		var list struct {
+			Active  []transferRecord `json:"active"`
+			History []transferRecord `json:"history"`
+		}
+		ta.do("GET", "/transfers?batchId="+out.Batch.ID, nil, &list)
+		n := map[string]int{}
+		for _, rec := range append(list.Active, list.History...) {
+			n[rec.State]++
+		}
+		return n
+	}
+	waitStates := func(want map[string]int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			got := states()
+			if maps.Equal(got, want) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("states = %v, want %v", got, want)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	waitStates(map[string]int{transferRunning: transferWorkers, transferQueued: 2})
+	// The first transferWorkers files are the ones running.
+	for _, id := range ids[:transferWorkers] {
+		if rec := ta.transfer(id); rec.State != transferRunning {
+			t.Errorf("%s is %s, want running", rec.Name, rec.State)
+		}
+	}
+
+	// Cancelling a queued file leaves the rest going; finishing one lets the
+	// next queued one start.
+	ta.do("DELETE", "/transfers/"+ids[len(ids)-1], nil, nil)
+	release <- struct{}{}
+	waitStates(map[string]int{transferCompleted: 1, transferRunning: transferWorkers, transferCanceled: 1})
+
+	var cancelled struct {
+		Batch transferBatch `json:"batch"`
+	}
+	if status := ta.do("DELETE", "/transfers/"+out.Batch.ID, nil, &cancelled); status != http.StatusOK {
+		t.Fatalf("DELETE batch: status %d, want 200", status)
+	}
+	if b := cancelled.Batch; b.State != transferCanceled || b.Completed != 1 || b.Canceled != transferWorkers+1 {
+		t.Errorf("cancelled batch = %+v, want 1 completed and the rest canceled", b)
+	}
+}
+
+// The workers share a batch's folders: each is created once, however many of
+// its files upload at the same time.
+func TestAgentUploadBatchCreatesEachFolderOnce(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	ta := newTestAgent(t, sc, fake, true)
+	for i := 0; i < 30; i++ {
+		writeTestFile(t, ta.root, fmt.Sprintf("Photos/%d/sub/f%d.txt", i%3, i), "x")
+	}
+	var out batchResp
+	if status := ta.do("POST", "/transfer/upload-batch", map[string]interface{}{
+		"paths": []string{filepath.Join(ta.root, "Photos")}, "parentId": "root", "recursive": true,
+	}, &out); status != http.StatusAccepted {
+		t.Fatalf("upload-batch: status %d, want 202", status)
+	}
+	b := ta.waitForBatch(out.Batch.ID, func(b transferBatch) bool { return b.FinishedAt != nil })
+	if b.Completed != 30 {
+		t.Fatalf("batch = %+v, want 30 completed", b)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	folders := map[string]int{}
+	for _, n := range fake.nodes {
+		if n.NodeType == "folder" {
+			folders[n.ParentID+"/"+n.Name]++
+		}
+	}
+	if len(folders) != 1+3+3 {
+		t.Errorf("created folders %v, want Photos, 3 numbered folders and a sub in each", folders)
+	}
+	for k, n := range folders {
+		if n != 1 {
+			t.Errorf("folder %s created %d times", k, n)
+		}
 	}
 }

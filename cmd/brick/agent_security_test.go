@@ -462,6 +462,7 @@ func TestAgentCapsActiveTransfers(t *testing.T) {
 // A queued upload whose folder was swapped for a symlink out of the roots
 // while it waited fails rather than uploading what the symlink leads to.
 func TestAgentUploadBatchRechecksRootsWhenItRuns(t *testing.T) {
+	oneTransferAtATime(t)
 	fake := newFakeStorageAPI()
 	release := make(chan struct{})
 	base := t.TempDir()
@@ -598,6 +599,7 @@ func TestAgentUploadBatchSymlinksInTree(t *testing.T) {
 // GET /transfers?batchId= answers as filtering the full lists by batch would,
 // in the same order, though it reads only the batch's records.
 func TestAgentTransfersBatchListMatchesFilteredLists(t *testing.T) {
+	oneTransferAtATime(t)
 	fake := newFakeStorageAPI()
 	release := make(chan struct{})
 	ta := newTestAgent(t, gatedUploadServer(t, fake, release), fake, true)
