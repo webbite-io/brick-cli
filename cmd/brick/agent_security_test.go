@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -279,35 +280,87 @@ func TestAgentRefusesToDeleteOrMoveFolderHoldingRoot(t *testing.T) {
 	}
 }
 
-func TestCreateExclusiveDoesNotFollowSymlink(t *testing.T) {
+// tempFileFor returns the name of a temporary file left next to dest by a
+// download to it, or "" if there is none.
+func tempFileFor(dest string) string {
+	entries, _ := os.ReadDir(filepath.Dir(dest))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), filepath.Base(dest)+".") && strings.HasSuffix(e.Name(), tmpSuffix) {
+			return filepath.Join(filepath.Dir(dest), e.Name())
+		}
+	}
+	return ""
+}
+
+func TestCreateTempForIsNewEachTime(t *testing.T) {
 	dir := t.TempDir()
-	target := writeTestFile(t, dir, "target.txt", "precious")
-	p := filepath.Join(dir, "file.brick-tmp")
-	symlinkOrSkip(t, target, p)
-
-	f, err := createExclusive(p)
+	dest := filepath.Join(dir, "file")
+	a, err := createTempFor(dest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteString("new"); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	if got, _ := os.ReadFile(target); string(got) != "precious" {
-		t.Errorf("symlink target = %q, want it untouched", got)
-	}
-	if info, err := os.Lstat(p); err != nil || !info.Mode().IsRegular() {
-		t.Errorf("%s = %v, %v; want a new regular file", p, info, err)
-	}
-
-	// A leftover regular file is replaced too.
-	f, err = createExclusive(p)
+	defer a.Close()
+	b, err := createTempFor(dest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	if got, _ := os.ReadFile(p); len(got) != 0 {
-		t.Errorf("leftover = %q, want it emptied", got)
+	defer b.Close()
+	if a.Name() == b.Name() {
+		t.Errorf("two downloads to %s share %s", dest, a.Name())
+	}
+	for _, f := range []*os.File{a, b} {
+		if !strings.HasPrefix(filepath.Base(f.Name()), "file.") || !strings.HasSuffix(f.Name(), tmpSuffix) {
+			t.Errorf("temporary file %s isn't named after file with %s", f.Name(), tmpSuffix)
+		}
+	}
+}
+
+// Two downloads to the same place at once each write their own temporary
+// file: the first to finish puts its whole file there and the other fails,
+// rather than the first putting the other's half-written file in place.
+func TestConcurrentDownloadsToSamePlace(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "file")
+	errFor := func(*http.Response) error { return errors.New("unexpected") }
+	// download starts a download of data that sends half of it, then waits
+	// for release before sending the rest.
+	download := func(data string, release <-chan struct{}) (halfway <-chan struct{}, done <-chan error) {
+		half, result := make(chan struct{}), make(chan error, 1)
+		fetch := func(context.Context, map[string]string) (*http.Response, error) {
+			pr, pw := io.Pipe()
+			go func() {
+				pw.Write([]byte(data[:len(data)/2]))
+				close(half)
+				<-release
+				pw.Write([]byte(data[len(data)/2:]))
+				pw.Close()
+			}()
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: pr}, nil
+		}
+		go func() { result <- resumableDownload(context.Background(), dest, int64(len(data)), true, nil, fetch, errFor) }()
+		return half, result
+	}
+
+	releaseA, releaseB := make(chan struct{}), make(chan struct{})
+	halfA, doneA := download("AAAAAAAAAA", releaseA)
+	<-halfA // A's temporary file exists and holds half its data
+	halfB, doneB := download("BBBBBBBBBB", releaseB)
+	<-halfB
+	close(releaseA)
+	if err := <-doneA; err != nil {
+		t.Fatalf("first download: %v", err)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "AAAAAAAAAA" {
+		t.Errorf("file = %q after the first download, want its whole file", got)
+	}
+	close(releaseB)
+	if err := <-doneB; !errors.Is(err, errDestExists) {
+		t.Errorf("second download: err %v, want errDestExists", err)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "AAAAAAAAAA" {
+		t.Errorf("file = %q after the second download, want the first one's kept", got)
+	}
+	if left := tempFileFor(dest); left != "" {
+		t.Errorf("temp file %s left behind", left)
 	}
 }
 

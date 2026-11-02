@@ -128,8 +128,8 @@ func assertFileContent(t *testing.T, path string, want []byte) {
 	if !bytes.Equal(got, want) {
 		t.Errorf("%s = %q, want %q", path, got, want)
 	}
-	if _, err := os.Stat(path + tmpSuffix); !os.IsNotExist(err) {
-		t.Errorf("temp file %s left behind (stat err %v)", path+tmpSuffix, err)
+	if left := tempFileFor(path); left != "" {
+		t.Errorf("temp file %s left behind", left)
 	}
 }
 
@@ -204,8 +204,8 @@ func TestDownloadNotRetriedOnServerError(t *testing.T) {
 	if n := fs.requestCount(); n != 1 {
 		t.Errorf("server saw %d requests, want 1", n)
 	}
-	if _, err := os.Stat(dest + tmpSuffix); !os.IsNotExist(err) {
-		t.Errorf("temp file left behind (stat err %v)", err)
+	if left := tempFileFor(dest); left != "" {
+		t.Errorf("temp file %s left behind", left)
 	}
 }
 
@@ -221,8 +221,8 @@ func TestDownloadGivesUpAfterRetryWindow(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "gave up") {
 		t.Fatalf("downloadToFile = %v, want it to give up", err)
 	}
-	if _, err := os.Stat(dest + tmpSuffix); !os.IsNotExist(err) {
-		t.Errorf("temp file left behind (stat err %v)", err)
+	if left := tempFileFor(dest); left != "" {
+		t.Errorf("temp file %s left behind", left)
 	}
 }
 

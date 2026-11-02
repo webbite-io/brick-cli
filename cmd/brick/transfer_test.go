@@ -338,8 +338,8 @@ func TestDownloadToFileAndUploadStreamRoundTrip(t *testing.T) {
 	if string(got) != string(content) {
 		t.Error("downloaded content does not match uploaded content")
 	}
-	if _, err := os.Stat(dest + tmpSuffix); !os.IsNotExist(err) {
-		t.Errorf("temp file %s should not exist after a successful download", dest+tmpSuffix)
+	if left := tempFileFor(dest); left != "" {
+		t.Errorf("temp file %s left behind", left)
 	}
 	if len(dlProgress) == 0 || dlProgress[len(dlProgress)-1] != int64(len(content)) {
 		t.Errorf("download progress calls = %v, want to end at %d", dlProgress, len(content))

@@ -216,8 +216,8 @@ func TestAgentDownloadStreamsToFile(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Errorf("downloaded %d bytes, want %d", len(got), len(data))
 	}
-	if _, err := os.Stat(local + tmpSuffix); !os.IsNotExist(err) {
-		t.Errorf("temp file %s left behind (stat err %v)", local+tmpSuffix, err)
+	if left := tempFileFor(local); left != "" {
+		t.Errorf("temp file %s left behind", left)
 	}
 	if rec := out.Transfer; rec.State != transferCompleted || rec.Direction != "download" || rec.NodeID != "f1" || rec.BytesDone != int64(len(data)) {
 		t.Errorf("transfer record = %+v, want a completed download of f1", rec)
@@ -335,8 +335,8 @@ func TestAgentAsyncTransferCanceledOnShutdown(t *testing.T) {
 
 	ta.cancel()
 	ta.waitForTransfer(id, func(rec transferRecord) bool { return rec.State == transferCanceled })
-	if _, err := os.Stat(local + tmpSuffix); !os.IsNotExist(err) {
-		t.Errorf("temp file left behind after cancel (stat err %v)", err)
+	if left := tempFileFor(local); left != "" {
+		t.Errorf("temp file %s left behind", left)
 	}
 }
 
@@ -396,8 +396,8 @@ func TestAgentCancelAsyncTransfer(t *testing.T) {
 	if out.Transfer.State != transferCanceled || out.Transfer.FinishedAt == nil {
 		t.Errorf("cancelled transfer = %+v, want state canceled with a finish time", out.Transfer)
 	}
-	if _, err := os.Stat(local + tmpSuffix); !os.IsNotExist(err) {
-		t.Errorf("temp file left behind after cancel (stat err %v)", err)
+	if left := tempFileFor(local); left != "" {
+		t.Errorf("temp file %s left behind", left)
 	}
 
 	var errResp struct {

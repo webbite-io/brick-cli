@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -174,11 +175,11 @@ func runGuarded(ctx context.Context, attempt transferAttempt) (bool, error) {
 func resumableDownload(ctx context.Context, destPath string, total int64, noClobber bool, onProgress func(written, total int64),
 	fetch func(ctx context.Context, headers map[string]string) (*http.Response, error),
 	errFor func(resp *http.Response) error) error {
-	tmpPath := destPath + tmpSuffix
-	out, err := createExclusive(tmpPath)
+	out, err := createTempFor(destPath)
 	if err != nil {
 		return err
 	}
+	tmpPath := out.Name()
 	var written int64
 	var validator string // the ETag or Last-Modified of what's in out
 	report := func() {
@@ -292,19 +293,24 @@ func placeNoClobber(tmp, dest string) error {
 	return os.Rename(tmp, dest)
 }
 
-// createExclusive creates file p for writing, which must be new: a symlink
-// already at p is not followed, so it can't send the write somewhere else.
-// Whatever is at p (say a temporary file left by an earlier run that was cut
-// off) is removed first; a symlink is removed itself, not what it points to.
-func createExclusive(p string) (*os.File, error) {
-	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
-	if !errors.Is(err, os.ErrExist) {
-		return f, err
+// createTempFor creates the temporary file a download to destPath is written
+// to before it is put in place: next to it, named after it with a random part
+// and tmpSuffix, so the sync engine ignores it and two downloads to the same
+// place never share one. It is created new (O_EXCL), so a symlink that
+// happens to have its name is not followed.
+func createTempFor(destPath string) (*os.File, error) {
+	for range 10 {
+		var b [4]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, err
+		}
+		p := fmt.Sprintf("%s.%x%s", destPath, b, tmpSuffix)
+		f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+		if !errors.Is(err, os.ErrExist) {
+			return f, err
+		}
 	}
-	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	return os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+	return nil, fmt.Errorf("could not pick a temporary file name for %s", destPath)
 }
 
 // responseValidator returns what an If-Range for the rest of resp's body
