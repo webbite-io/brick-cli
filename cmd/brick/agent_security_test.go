@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -654,4 +658,59 @@ func TestAgentTransfersBatchListMatchesFilteredLists(t *testing.T) {
 		t.Error("batchId answered no batch")
 	}
 	close(release)
+}
+
+// download-batch lists a tree's folders several at a time, but resolves it to
+// the same files, in the same order, as listing them one by one would.
+func TestAgentDownloadBatchListsFoldersConcurrently(t *testing.T) {
+	fake := newFakeStorageAPI()
+	addFakeNode(fake, "top", "root", "top", "folder", "")
+	addFakeNode(fake, "z", "top", "z.txt", "file", "z")
+	var want []string
+	var deeper []string
+	for i := 0; i < 6; i++ {
+		f := fmt.Sprintf("f%d", i)
+		addFakeNode(fake, f, "top", f, "folder", "")
+		addFakeNode(fake, f+"x", f, "x.txt", "file", "x")
+		addFakeNode(fake, f+"s", f, "s", "folder", "")
+		addFakeNode(fake, f+"y", f+"s", "y.txt", "file", "y")
+		want = append(want, "top/"+f+"/x.txt")
+		deeper = append(deeper, "top/"+f+"/s/y.txt")
+	}
+	want = append(append([]string{"top/z.txt"}, want...), deeper...)
+
+	var inFlight, maxInFlight atomic.Int32
+	inner := fake.mux("acct-1")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/children") {
+			n := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for {
+				m := maxInFlight.Load()
+				if n <= m || maxInFlight.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	sc := &storageClient{baseURL: server.URL, apiURL: server.URL, accountID: "acct-1", cfg: &Config{AccessToken: "test-token"}}
+	ta := newTestAgent(t, sc, fake, true)
+
+	var out downloadDryRunResp
+	if status := ta.do("POST", "/transfer/download-batch", downloadBatchReq{NodeIDs: []string{"top"}, Recursive: true, DryRun: true}, &out); status != http.StatusOK {
+		t.Fatalf("dry run: status %d", status)
+	}
+	var got []string
+	for _, f := range out.Files {
+		got = append(got, path.Join(f.Dir, f.Name))
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("files = %v, want %v", got, want)
+	}
+	if m := maxInFlight.Load(); m < 2 || m > resolveListConcurrency {
+		t.Errorf("listed %d folders at once at most, want 2..%d", m, resolveListConcurrency)
+	}
 }

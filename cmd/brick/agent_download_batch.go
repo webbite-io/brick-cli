@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // --- Batch download: many Drive files to local disk, queued and run one at a time ---
@@ -120,39 +121,62 @@ func (dr *downloadResolver) addNode(id string) error {
 	}
 }
 
+// resolveListConcurrency is how many folders addTree lists at once.
+const resolveListConcurrency = 4
+
 // addTree adds every file under folder, breadth first, under a local folder
-// of the same name.
+// of the same name. Folders are listed up to resolveListConcurrency at a
+// time, each round taking the next ones in the queue, and their children
+// handled in queue order, so the result is as if they were listed one by
+// one.
 func (dr *downloadResolver) addTree(folder storageNode) error {
 	type queued struct {
 		id  string
 		dir string
 	}
+	type listing struct {
+		children []storageNode
+		err      error
+	}
 	queue := []queued{{id: folder.ID, dir: folder.Name}}
 	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		children, err := dr.sc.listChildren(dr.ctx, cur.id)
-		if err != nil {
-			if ctxErr := dr.ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			dr.skip(cur.dir, "upstream_error", err.Error())
-			continue
+		round := queue[:min(len(queue), resolveListConcurrency)]
+		queue = queue[len(round):]
+		listings := make([]listing, len(round))
+		var wg sync.WaitGroup
+		for i, cur := range round {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				listings[i].children, listings[i].err = dr.sc.listChildren(dr.ctx, cur.id)
+			}()
 		}
-		for _, ch := range children {
-			if ch.IsDeleted {
+		wg.Wait()
+
+		for i, cur := range round {
+			children, err := listings[i].children, listings[i].err
+			if err != nil {
+				if ctxErr := dr.ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				dr.skip(cur.dir, "upstream_error", err.Error())
 				continue
 			}
-			switch ch.NodeType {
-			case "folder":
-				if !validLocalName(ch.Name) {
-					dr.skip(path.Join(cur.dir, ch.Name), "invalid_name", "The folder's name can't be used on this device.")
+			for _, ch := range children {
+				if ch.IsDeleted {
 					continue
 				}
-				queue = append(queue, queued{id: ch.ID, dir: path.Join(cur.dir, ch.Name)})
-			case "file":
-				if err := dr.addNodeFile(ch, cur.dir); err != nil {
-					return err
+				switch ch.NodeType {
+				case "folder":
+					if !validLocalName(ch.Name) {
+						dr.skip(path.Join(cur.dir, ch.Name), "invalid_name", "The folder's name can't be used on this device.")
+						continue
+					}
+					queue = append(queue, queued{id: ch.ID, dir: path.Join(cur.dir, ch.Name)})
+				case "file":
+					if err := dr.addNodeFile(ch, cur.dir); err != nil {
+						return err
+					}
 				}
 			}
 		}
