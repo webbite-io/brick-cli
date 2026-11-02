@@ -46,7 +46,7 @@ func TestConnectAgentWithReconnectSignalsConnectedOnce(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		connectAgentWithReconnect(ctx, server.URL, server.URL, cfg, "secret", "127.0.0.1:0", false, connected)
+		connectAgentWithReconnect(ctx, server.URL, server.URL, cfg, "secret", http.NotFoundHandler(), false, connected)
 	}()
 
 	select {
@@ -88,7 +88,7 @@ func TestConnectAgentWithReconnectToleratesNilConnectedChannel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		connectAgentWithReconnect(ctx, server.URL, server.URL, cfg, "secret", "127.0.0.1:0", false, nil)
+		connectAgentWithReconnect(ctx, server.URL, server.URL, cfg, "secret", http.NotFoundHandler(), false, nil)
 	}()
 
 	// No connected channel to wait on — just give it a moment to actually
@@ -127,7 +127,7 @@ func TestConnectAgentWithReconnectResetsBackoffAfterConnecting(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		connectAgentWithReconnect(ctx, server.URL, server.URL, cfg, "secret", "127.0.0.1:0", false, nil)
+		connectAgentWithReconnect(ctx, server.URL, server.URL, cfg, "secret", http.NotFoundHandler(), false, nil)
 	}()
 
 	// Without the reset, the second drop would wait 5s.

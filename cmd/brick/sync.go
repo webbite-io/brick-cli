@@ -3513,30 +3513,25 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 	agentRoots := resolveAgentRoots(cfg)
 	agentSecret := newAgentSecret()
 	settings := &syncExcludeDirsSettings{cfg: cfg, eng: eng, notify: notify}
-	if _, agentLn, aerr := startAgentServer(ctx, agentRoots, agentSecret, sc, remoteControl, cfg.TransferHistoryLimit, settings); aerr != nil {
-		log.Printf("could not start remote file agent: %v", aerr)
-	} else {
-		agentAddr := agentLn.Addr().String()
-		defer agentLn.Close()
-		agentConnected := make(chan struct{})
-		go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agentAddr, remoteControl, agentConnected)
-		defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)
-		if remoteControl {
-			// Logged rather than printed: in interactive mode the sync TUI
-			// owns the whole screen, and writing to stdout behind its back
-			// would be clobbered by its next repaint.
-			log.Printf("Remote control enabled (roots: %s)", formatAgentRoots(agentRoots))
-		}
-		// Give the agent connection a short head start so its own "Brick CLI
-		// connected..." line reliably lands ahead of the initial reconcile
-		// pass's own output below — purely for readable log ordering, capped
-		// so a slow or unreachable connection never meaningfully delays sync
-		// startup (it keeps retrying in the background regardless).
-		select {
-		case <-agentConnected:
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-		}
+	agent := startAgentServer(ctx, agentRoots, agentSecret, sc, remoteControl, cfg.TransferHistoryLimit, settings)
+	agentConnected := make(chan struct{})
+	go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agent.handler(), remoteControl, agentConnected)
+	defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)
+	if remoteControl {
+		// Logged rather than printed: in interactive mode the sync TUI
+		// owns the whole screen, and writing to stdout behind its back
+		// would be clobbered by its next repaint.
+		log.Printf("Remote control enabled (roots: %s)", formatAgentRoots(agentRoots))
+	}
+	// Give the agent connection a short head start so its own "Brick CLI
+	// connected..." line reliably lands ahead of the initial reconcile
+	// pass's own output below — purely for readable log ordering, capped
+	// so a slow or unreachable connection never meaningfully delays sync
+	// startup (it keeps retrying in the background regardless).
+	select {
+	case <-agentConnected:
+	case <-time.After(2 * time.Second):
+	case <-ctx.Done():
 	}
 
 	// Capture the server clock before the initial full reconcile so the first

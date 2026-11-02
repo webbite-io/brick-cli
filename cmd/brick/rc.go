@@ -161,12 +161,8 @@ func runRemoteControlLoop(cfg *Config, sc *storageClient) error {
 	// sync_not_running.
 	agentRoots := resolveAgentRoots(cfg)
 	agentSecret := newAgentSecret()
-	_, agentLn, err := startAgentServer(ctx, agentRoots, agentSecret, sc, true, cfg.TransferHistoryLimit, nil)
-	if err != nil {
-		return fmt.Errorf("could not start remote file agent: %w", err)
-	}
-	defer agentLn.Close()
-	go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agentLn.Addr().String(), true, nil)
+	agent := startAgentServer(ctx, agentRoots, agentSecret, sc, true, cfg.TransferHistoryLimit, nil)
+	go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agent.handler(), true, nil)
 	defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)
 	if len(agentRoots) == 0 {
 		log.Printf("Remote control enabled, but no folders are exposed (add --agent-root or agentRoots in the config file)")

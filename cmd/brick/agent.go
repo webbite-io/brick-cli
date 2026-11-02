@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -12,7 +11,6 @@ import (
 	"io/fs"
 	"log"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,9 +34,8 @@ import (
 // protocol-level constant shared with rbite (the storage API's remote-agent
 // registry hardcodes this exact header name for any attaching client, brick
 // included), so it is intentionally not rebranded. The storage API injects the
-// per-session secret on every proxied request; the local agent listener only
-// honors requests carrying it, so other local processes that stumble onto the
-// loopback port cannot use it.
+// per-session secret on every proxied request, and the agent only honors
+// requests carrying it.
 const agentSecretHeader = "X-RBite-Agent-Secret"
 
 // yamuxConfig returns the yamux configuration used for the agent tunnel. It
@@ -149,19 +146,13 @@ type fsEntry struct {
 	ModTime string `json:"modTime"`
 }
 
-// startAgentServer binds a loopback listener and serves the agent API. The
-// caller closes the returned listener to stop it. historyLimit caps the
-// finished-transfer history (<= 0 means defaultTransferHistoryLimit).
-func startAgentServer(ctx context.Context, roots []agentRoot, secret string, sc *storageClient, remoteControl bool, historyLimit int, settings excludeDirsSettings) (*agentServer, net.Listener, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, nil, err
-	}
+// startAgentServer creates the agent API server; connectAgentWithReconnect
+// serves its handler over the tunnel to the storage API. historyLimit caps
+// the finished-transfer history (<= 0 means defaultTransferHistoryLimit).
+func startAgentServer(ctx context.Context, roots []agentRoot, secret string, sc *storageClient, remoteControl bool, historyLimit int, settings excludeDirsSettings) *agentServer {
 	a := newAgentServer(ctx, roots, secret, sc, remoteControl, historyLimit)
 	a.settings = settings
-	srv := &http.Server{Handler: a.handler()}
-	go srv.Serve(ln) //nolint:errcheck
-	return a, ln, nil
+	return a
 }
 
 func newAgentServer(ctx context.Context, roots []agentRoot, secret string, sc *storageClient, remoteControl bool, historyLimit int) *agentServer {
@@ -1298,48 +1289,58 @@ func (c *wsConn) closeGracefully() {
 	_ = c.ws.WriteControl(websocket.CloseMessage, msg, time.Now().Add(2*time.Second))
 }
 
-// proxyAgentStream reads a single HTTP request off stream, forwards it to the
-// local agent HTTP API at agentAddr, and writes the response back. The storage
-// API opens one yamux stream per proxied request, so this handles exactly one
-// request/response pair before returning.
-func proxyAgentStream(stream net.Conn, agentAddr string) {
-	defer stream.Close()
-	start := time.Now()
-
-	req, err := http.ReadRequest(bufio.NewReader(stream))
-	if err != nil {
-		log.Printf("Failed to read request: %v", err)
-		return
+// newAgentHTTPServer returns the server for the agent API on a tunnel: the
+// storage API opens one yamux stream per request it forwards, and each is
+// served straight from h, with no hop through a local port. Keep-alives are
+// off, so each stream is closed once its response is written, as the
+// storage API expects.
+func newAgentHTTPServer(h http.Handler) *http.Server {
+	srv := &http.Server{
+		Handler: logRemoteControl(h),
+		// The storage API sends the headers right away; this only stops a
+		// stream that never does from holding a goroutine.
+		ReadHeaderTimeout: 30 * time.Second,
 	}
+	srv.SetKeepAlivesEnabled(false)
+	return srv
+}
 
-	target := remoteControlTarget(req)
+// statusRecorder is a ResponseWriter that remembers the status written.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
 
-	localConn, err := net.Dial("tcp", agentAddr)
-	if err != nil {
-		log.Printf("Local dial failed (%s): %v", agentAddr, err)
-		return
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
 	}
-	defer localConn.Close()
+	s.ResponseWriter.WriteHeader(code)
+}
 
-	req.Host = agentAddr
-	if err := req.Write(localConn); err != nil {
-		log.Printf("Failed to forward request: %v", err)
-		return
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
 	}
+	return s.ResponseWriter.Write(b)
+}
 
-	resp, err := http.ReadResponse(bufio.NewReader(localConn), req)
-	if err != nil {
-		log.Printf("Failed to read response: %v", err)
-		return
-	}
-	defer resp.Body.Close()
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
-	if err := resp.Write(stream); err != nil {
-		log.Printf("Failed to write response: %v", err)
-		return
-	}
-
-	log.Print(remoteControlLogLine(req.Method, req.URL.Path, target, resp.StatusCode, time.Since(start)))
+// logRemoteControl logs each request h serves as a remote control line in
+// the status window (see remoteControlLogLine) once it has been answered.
+func logRemoteControl(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		target := remoteControlTarget(r)
+		rec := &statusRecorder{ResponseWriter: w}
+		h.ServeHTTP(rec, r)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
+		log.Print(remoteControlLogLine(r.Method, r.URL.Path, target, rec.status, time.Since(start)))
+	})
 }
 
 // remoteControlAction is how the status window names an agent API endpoint:
@@ -1473,13 +1474,13 @@ func printable(s string) string {
 }
 
 // connectAgentOnce dials the storage API, takes the yamux server role, and
-// proxies incoming streams to the local agent until the session ends or ctx is
-// cancelled. It reads cfg.AccessToken fresh so reconnects pick up refreshed
+// serves the agent API h on the streams it opens until the session ends or
+// ctx is cancelled. It reads cfg.AccessToken fresh so reconnects pick up refreshed
 // tokens, and refreshes once on a 401/403. onConnected, if non-nil, is called
 // once the connection is actually established (right after the "Brick CLI
 // connected..." log line) — see connectAgentWithReconnect's doc comment for
 // why.
-func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string, remoteControl bool, onConnected func()) error {
+func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Config, secret string, h http.Handler, remoteControl bool, onConnected func()) error {
 	hostname, _ := os.Hostname()
 	q := url.Values{}
 	q.Set("clientId", cfg.ClientID)
@@ -1545,35 +1546,23 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 		onConnected()
 	}
 
-	streamCh := make(chan net.Conn)
+	srv := newAgentHTTPServer(h)
+	defer srv.Close()
 	errCh := make(chan error, 1)
-	go func() {
-		for {
-			stream, err := session.Accept()
-			if err != nil {
-				errCh <- err
-				return
-			}
-			streamCh <- stream
-		}
-	}()
+	go func() { errCh <- srv.Serve(session) }()
 
-	for {
-		select {
-		case <-ctx.Done():
-			// A deliberate local shutdown (Ctrl-C, detach, ...) — send a
-			// proper close frame before the deferred session.Close()/ws.Close()
-			// above drop the raw connection, so the server logs a clean
-			// disconnect rather than an abnormal-closure error. Only this
-			// branch does: the errCh case below means the connection is
-			// already gone, with nothing left to send a close frame over.
-			conn.closeGracefully()
-			return nil
-		case err := <-errCh:
-			return fmt.Errorf("Session closed: %w", err)
-		case stream := <-streamCh:
-			go proxyAgentStream(stream, agentAddr)
-		}
+	select {
+	case <-ctx.Done():
+		// A deliberate local shutdown (Ctrl-C, detach, ...) — send a
+		// proper close frame before the deferred srv.Close()/session.Close()/
+		// ws.Close() above drop the raw connection, so the server logs a
+		// clean disconnect rather than an abnormal-closure error. Only this
+		// branch does: the errCh case below means the connection is
+		// already gone, with nothing left to send a close frame over.
+		conn.closeGracefully()
+		return nil
+	case err := <-errCh:
+		return fmt.Errorf("Session closed: %w", err)
 	}
 }
 
@@ -1588,7 +1577,7 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 // network), without letting a slow or unreachable connection delay sync
 // startup by more than that bound; this goroutine's own retry loop keeps
 // going regardless of whether anyone was waiting.
-func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, cfg *Config, secret, agentAddr string, remoteControl bool, connected chan<- struct{}) {
+func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, cfg *Config, secret string, h http.Handler, remoteControl bool, connected chan<- struct{}) {
 	var signalOnce sync.Once
 	signalConnected := func() {
 		if connected != nil {
@@ -1599,7 +1588,7 @@ func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, c
 	attempt := 0
 	for {
 		established := false
-		err := connectAgentOnce(ctx, storageURL, apiURL, cfg, secret, agentAddr, remoteControl, func() {
+		err := connectAgentOnce(ctx, storageURL, apiURL, cfg, secret, h, remoteControl, func() {
 			established = true
 			signalConnected()
 		})
