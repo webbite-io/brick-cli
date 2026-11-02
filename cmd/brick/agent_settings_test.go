@@ -309,3 +309,24 @@ func TestUnexcludedFolderIsDownloadedNotTrashed(t *testing.T) {
 		t.Errorf("state.ExcludeDirs = %v, want it updated to the new (empty) list", eng.state.ExcludeDirs)
 	}
 }
+
+func TestAgentSettingsReadOnlyDeviceRefusesChanges(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	ta := newTestAgentWithRoots(t, sc, fake, true, []agentRoot{{path: t.TempDir(), readOnly: true}})
+	stub := &stubExcludeDirs{dirs: []string{"Photos"}}
+	ta.server.settings = stub
+
+	if status := ta.do("GET", "/settings", nil, nil); status != http.StatusOK {
+		t.Errorf("GET: status %d, want 200", status)
+	}
+	var errResp struct {
+		Error apiError `json:"error"`
+	}
+	body := map[string]any{"selectiveSync": map[string][]string{"excludeDirs": {}}}
+	if status := ta.do("PATCH", "/settings", body, &errResp); status != http.StatusForbidden || errResp.Error.Code != "read_only_device" {
+		t.Errorf("PATCH: status %d code %q, want 403 read_only_device", status, errResp.Error.Code)
+	}
+	if !slices.Equal(stub.dirs, []string{"Photos"}) {
+		t.Errorf("a refused PATCH changed the list to %v", stub.dirs)
+	}
+}

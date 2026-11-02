@@ -47,9 +47,17 @@ func (a *agentServer) handleGetSettings(w http.ResponseWriter, r *http.Request) 
 // longer excluded are downloaded on the next sync pass. A body that names
 // roots is refused: which folders remote control may reach, and whether it
 // may change them, is up to the device, not to remote control.
+//
+// A device whose roots are all read-only refuses any change: un-excluding a
+// folder makes it write that folder's files to disk, which read-only access
+// promises remote control can't do.
 func (a *agentServer) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if a.settings == nil {
 		writeError(w, http.StatusServiceUnavailable, "sync_not_running", "No sync is running to apply settings to.")
+		return
+	}
+	if !a.hasWritableRoot() {
+		writeError(w, http.StatusForbidden, "read_only_device", "Remote control has read-only access to this device, so its settings can only be changed on the device.")
 		return
 	}
 	const usage = `The body must be {"selectiveSync": {"excludeDirs": [...]}}.`
@@ -86,6 +94,17 @@ func (a *agentServer) handleUpdateSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusOK, a.settingsResponse())
+}
+
+// hasWritableRoot reports whether remote control may change anything on the
+// device: whether any of its roots is writable.
+func (a *agentServer) hasWritableRoot() bool {
+	for _, root := range a.roots {
+		if !root.readOnly {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeExcludeDirs validates excludeDirs entries and puts them in the
