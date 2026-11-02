@@ -413,19 +413,32 @@ func (a *agentServer) rootOf(abs string) (agentRoot, bool) {
 	return best, bestLen >= 0
 }
 
-// isRoot reports whether abs is exactly one of the configured roots (which must
-// not be deleted or moved).
-func (a *agentServer) isRoot(abs string) bool {
+// holdsRoot reports whether abs is one of the configured roots or a folder
+// with one somewhere inside it. Neither may be deleted or moved: that would
+// take the root with it, and with it a read-only root nested in a writable
+// one.
+func (a *agentServer) holdsRoot(abs string) bool {
 	real := evalSafe(abs)
 	if real == "" {
 		return false
 	}
+	prefix := real
+	if !strings.HasSuffix(prefix, string(os.PathSeparator)) {
+		prefix += string(os.PathSeparator)
+	}
 	for _, root := range a.roots {
-		if real == evalSafe(root.path) {
+		rootReal := evalSafe(root.path)
+		if rootReal != "" && (rootReal == real || strings.HasPrefix(rootReal, prefix)) {
 			return true
 		}
 	}
 	return false
+}
+
+// rootProtectedMessage is the root_protected message for refusing to op a
+// path.
+func rootProtectedMessage(op string) string {
+	return "Refusing to " + op + " an allowed root or a folder holding one."
 }
 
 func (a *agentServer) resolveParam(w http.ResponseWriter, r *http.Request, key string) (string, bool) {
@@ -718,8 +731,8 @@ func (a *agentServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if a.isRoot(abs) {
-		writeError(w, http.StatusForbidden, "root_protected", "Refusing to delete an allowed root.")
+	if a.holdsRoot(abs) {
+		writeError(w, http.StatusForbidden, "root_protected", rootProtectedMessage("delete"))
 		return
 	}
 	if err := os.RemoveAll(abs); err != nil {
@@ -756,8 +769,8 @@ func (a *agentServer) handleDeleteBatch(w http.ResponseWriter, r *http.Request) 
 	skipped := []batchSkip{}
 	for _, p := range req.Paths {
 		abs, err := a.resolveWritable(p)
-		if err == nil && a.isRoot(abs) {
-			err = newAPIError(http.StatusForbidden, "root_protected", "Refusing to delete an allowed root.")
+		if err == nil && a.holdsRoot(abs) {
+			err = newAPIError(http.StatusForbidden, "root_protected", rootProtectedMessage("delete"))
 		}
 		if err == nil {
 			err = os.RemoveAll(abs)
@@ -846,8 +859,8 @@ func (a *agentServer) handleMove(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if a.isRoot(from) {
-		writeError(w, http.StatusForbidden, "root_protected", "Refusing to move an allowed root.")
+	if a.holdsRoot(from) {
+		writeError(w, http.StatusForbidden, "root_protected", rootProtectedMessage("move"))
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {

@@ -224,3 +224,48 @@ func TestAgentCopyOntoSameFileUnderOtherCase(t *testing.T) {
 		t.Errorf("a.txt = %q, want it untouched", got)
 	}
 }
+
+func TestAgentRefusesToDeleteOrMoveFolderHoldingRoot(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	rw := t.TempDir()
+	ro := filepath.Join(rw, "a", "docs") // read-only, nested in the writable root
+	writeTestFile(t, ro, "keep.txt", "keep")
+	writeTestFile(t, rw, "a/other.txt", "other")
+	writeTestFile(t, rw, "ab/x.txt", "x") // shares a's name as a prefix
+	ta := newTestAgentWithRoots(t, sc, fake, true, []agentRoot{{path: rw}, {path: ro, readOnly: true}})
+	a := filepath.Join(rw, "a")
+
+	var errResp struct {
+		Error apiError `json:"error"`
+	}
+	for _, tc := range []struct {
+		name, method, path string
+		body               interface{}
+	}{
+		{"delete", "DELETE", "/fs/delete?path=" + url.QueryEscape(a), nil},
+		{"move", "POST", "/fs/move", fromToReq{From: a, To: filepath.Join(rw, "moved")}},
+	} {
+		errResp.Error = apiError{}
+		if status := ta.do(tc.method, tc.path, tc.body, &errResp); status != http.StatusForbidden || errResp.Error.Code != "root_protected" {
+			t.Errorf("%s: status %d code %q, want 403 root_protected", tc.name, status, errResp.Error.Code)
+		}
+	}
+	var batch struct {
+		Deleted []string    `json:"deleted"`
+		Skipped []batchSkip `json:"skipped"`
+	}
+	other := filepath.Join(a, "other.txt")
+	ab := filepath.Join(rw, "ab")
+	if status := ta.do("POST", "/fs/delete-batch", map[string]interface{}{"paths": []string{a, other, ab}}, &batch); status != http.StatusOK {
+		t.Fatalf("delete-batch: status %d", status)
+	}
+	if len(batch.Skipped) != 1 || batch.Skipped[0].Path != a || batch.Skipped[0].Code != "root_protected" {
+		t.Errorf("skipped = %+v, want only %s as root_protected", batch.Skipped, a)
+	}
+	if len(batch.Deleted) != 2 {
+		t.Errorf("deleted = %v, want a/other.txt and ab", batch.Deleted)
+	}
+	if got, _ := os.ReadFile(filepath.Join(ro, "keep.txt")); string(got) != "keep" {
+		t.Errorf("file in the read-only root = %q, want it kept", got)
+	}
+}
