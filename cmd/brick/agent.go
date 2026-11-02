@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -221,7 +222,9 @@ func (a *agentServer) auth(h http.HandlerFunc) http.HandlerFunc {
 // with remote control disabled.
 func (a *agentServer) authSecret(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if a.secret == "" || r.Header.Get(agentSecretHeader) != a.secret {
+		// Compared in constant time, so how long a wrong guess takes to be
+		// refused says nothing about how much of it was right.
+		if a.secret == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get(agentSecretHeader)), []byte(a.secret)) != 1 {
 			writeError(w, http.StatusForbidden, "forbidden", "Missing or invalid agent secret.")
 			return
 		}

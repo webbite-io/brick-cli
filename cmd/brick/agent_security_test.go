@@ -354,3 +354,29 @@ func TestPlaceNoClobber(t *testing.T) {
 		t.Errorf("dest = %q, want it kept", got)
 	}
 }
+
+func TestAgentRejectsWrongSecret(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	ta := newTestAgent(t, sc, fake, true)
+	for _, secret := range []string{"", "wrong", testAgentSecret[:len(testAgentSecret)-1], testAgentSecret + "x", testAgentSecret} {
+		req, err := http.NewRequest("GET", ta.url+"/version", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if secret != "" {
+			req.Header.Set(agentSecretHeader, secret)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		want := http.StatusForbidden
+		if secret == testAgentSecret {
+			want = http.StatusOK
+		}
+		if resp.StatusCode != want {
+			t.Errorf("secret %q: status %d, want %d", secret, resp.StatusCode, want)
+		}
+	}
+}
