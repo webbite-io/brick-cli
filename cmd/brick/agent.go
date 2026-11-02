@@ -1618,7 +1618,7 @@ func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, c
 // already cancelled by the time this deferred call runs, and this request
 // must still go out for the shutdown to be clean.
 func deregisterAgent(storageURL, apiURL string, cfg *Config) {
-	path := "/v1/accounts/" + cfg.ActiveAccountID + "/clients/" + cfg.ClientID
+	path := "/v1/accounts/" + url.PathEscape(cfg.ActiveAccountID) + "/clients/" + url.PathEscape(cfg.ClientID)
 	if resp, err := authedRequest(context.Background(), storageURL, apiURL, "DELETE", path, nil, nil, cfg); err == nil {
 		resp.Body.Close()
 	}

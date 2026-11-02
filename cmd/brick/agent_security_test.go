@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -378,5 +381,30 @@ func TestAgentRejectsWrongSecret(t *testing.T) {
 		if resp.StatusCode != want {
 			t.Errorf("secret %q: status %d, want %d", secret, resp.StatusCode, want)
 		}
+	}
+}
+
+// Ids from a remote control request are escaped into the Storage API path, so
+// one can't name a different endpoint.
+func TestStorageClientEscapesIDs(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.EscapedPath()+"?"+r.URL.RawQuery)
+		http.Error(w, "no", http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	sc := &storageClient{baseURL: server.URL, apiURL: server.URL, accountID: "acct-1", cfg: &Config{AccessToken: "t"}}
+	ctx := context.Background()
+	const id = "../../other?x=1"
+	_, _ = sc.getNode(ctx, id)
+	_ = sc.downloadToFile(ctx, id, filepath.Join(t.TempDir(), "f"), 1, nil)
+	_, _ = sc.listChildren(ctx, id)
+	want := []string{
+		"/v1/accounts/acct-1/nodes/..%2F..%2Fother%3Fx=1?",
+		"/v1/accounts/acct-1/files/..%2F..%2Fother%3Fx=1?",
+		"/v1/accounts/acct-1/nodes/..%2F..%2Fother%3Fx=1/children?limit=200&offset=0",
+	}
+	if !slices.Equal(paths, want) {
+		t.Errorf("requested %q, want %q", paths, want)
 	}
 }

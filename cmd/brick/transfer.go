@@ -161,7 +161,7 @@ func resolveUploadTarget(ctx context.Context, sc *storageClient, target string) 
 // --- storageClient methods new to the transfer feature ---
 
 func (sc *storageClient) getNode(ctx context.Context, id string) (*storageNode, error) {
-	resp, err := sc.request(ctx, "GET", "/nodes/"+id, nil, nil)
+	resp, err := sc.request(ctx, "GET", "/nodes/"+url.PathEscape(id), nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +219,7 @@ func (sc *storageClient) downloadToNewFile(ctx context.Context, nodeID, destPath
 
 func (sc *storageClient) downloadNode(ctx context.Context, nodeID, destPath string, total int64, noClobber bool, onProgress func(written, total int64)) error {
 	return resumableDownload(ctx, destPath, total, noClobber, onProgress, func(ctx context.Context, headers map[string]string) (*http.Response, error) {
-		return sc.streamGet(ctx, "/files/"+nodeID, headers)
+		return sc.streamGet(ctx, "/files/"+url.PathEscape(nodeID), headers)
 	}, sc.errFrom)
 }
 
@@ -368,7 +368,7 @@ func (sc *storageClient) uploadStream(ctx context.Context, parentID, name string
 // --overwrite` for a large file that already exists at the destination.
 func (sc *storageClient) replaceStream(ctx context.Context, nodeID string, r io.ReadSeeker, size int64, onProgress func(written int64)) (*storageNode, error) {
 	headers := map[string]string{"Content-Type": "application/octet-stream"}
-	return sc.streamRequest(ctx, "PUT", "/files/"+nodeID, r, size, headers, onProgress, http.StatusOK)
+	return sc.streamRequest(ctx, "PUT", "/files/"+url.PathEscape(nodeID), r, size, headers, onProgress, http.StatusOK)
 }
 
 // walkRemoteTree walks the entire remote tree under rootID (breadth-first)

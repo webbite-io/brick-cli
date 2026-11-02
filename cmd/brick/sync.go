@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -156,7 +157,7 @@ func (sc *storageClient) listChildren(ctx context.Context, parentID string) ([]s
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		path := fmt.Sprintf("/nodes/%s/children?limit=%d&offset=%d", parentID, limit, offset)
+		path := fmt.Sprintf("/nodes/%s/children?limit=%d&offset=%d", url.PathEscape(parentID), limit, offset)
 		resp, err := sc.request(ctx, "GET", path, nil, nil)
 		if err != nil {
 			return nil, err
@@ -325,7 +326,7 @@ func (sc *storageClient) serverNow(ctx context.Context) (int64, error) {
 }
 
 func (sc *storageClient) download(ctx context.Context, nodeID string) ([]byte, string, error) {
-	resp, err := sc.request(ctx, "GET", "/files/"+nodeID, nil, nil)
+	resp, err := sc.request(ctx, "GET", "/files/"+url.PathEscape(nodeID), nil, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -363,7 +364,7 @@ func (sc *storageClient) upload(ctx context.Context, parentID, name string, data
 
 func (sc *storageClient) replace(ctx context.Context, nodeID string, data []byte) (*storageNode, error) {
 	headers := map[string]string{"Content-Type": "application/octet-stream"}
-	resp, err := sc.request(ctx, "PUT", "/files/"+nodeID, data, headers)
+	resp, err := sc.request(ctx, "PUT", "/files/"+url.PathEscape(nodeID), data, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +382,7 @@ func (sc *storageClient) replace(ctx context.Context, nodeID string, data []byte
 // delete soft-deletes a node (file or folder), moving it to trash. A 404 means
 // it's already gone remotely, which is treated as success.
 func (sc *storageClient) delete(ctx context.Context, nodeID string) error {
-	resp, err := sc.request(ctx, "DELETE", "/nodes/"+nodeID, nil, nil)
+	resp, err := sc.request(ctx, "DELETE", "/nodes/"+url.PathEscape(nodeID), nil, nil)
 	if err != nil {
 		return err
 	}
