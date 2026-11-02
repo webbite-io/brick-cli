@@ -590,3 +590,68 @@ func TestAgentUploadBatchSymlinksInTree(t *testing.T) {
 		t.Errorf("skipped %d, want 4: %+v", len(out.Skipped), out.Skipped)
 	}
 }
+
+// GET /transfers?batchId= answers as filtering the full lists by batch would,
+// in the same order, though it reads only the batch's records.
+func TestAgentTransfersBatchListMatchesFilteredLists(t *testing.T) {
+	fake := newFakeStorageAPI()
+	release := make(chan struct{})
+	ta := newTestAgent(t, gatedUploadServer(t, fake, release), fake, true)
+	var paths []string
+	for _, name := range []string{"a", "b", "c", "d"} {
+		paths = append(paths, writeTestFile(t, ta.root, name, name))
+	}
+	var first, second batchResp
+	ta.do("POST", "/transfer/upload-batch", map[string]interface{}{"paths": paths, "parentId": "root"}, &first)
+	ta.do("POST", "/transfer/upload-batch", map[string]interface{}{"paths": paths[:2], "parentId": "root"}, &second)
+	ids := first.Batch.TransferIDs
+	release <- struct{}{}
+	ta.waitForTransfer(ids[0], func(rec transferRecord) bool { return rec.State == transferCompleted })
+	ta.do("DELETE", "/transfers/"+ids[3], nil, nil) // finishes, canceled, before ids[2]
+	ta.waitForTransfer(ids[1], func(rec transferRecord) bool { return rec.State == transferRunning })
+
+	type lists struct {
+		Active  []transferRecord `json:"active"`
+		History []transferRecord `json:"history"`
+	}
+	ids2 := func(recs []transferRecord) []string {
+		out := []string{}
+		for _, r := range recs {
+			out = append(out, r.ID)
+		}
+		return out
+	}
+	filter := func(recs []transferRecord, batch string) []transferRecord {
+		out := []transferRecord{}
+		for _, r := range recs {
+			if r.BatchID == batch {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+	var all, batch lists
+	ta.do("GET", "/transfers", nil, &all)
+	if status := ta.do("GET", "/transfers?batchId="+first.Batch.ID, nil, &batch); status != http.StatusOK {
+		t.Fatalf("GET /transfers?batchId=: status %d", status)
+	}
+	if got, want := ids2(batch.Active), ids2(filter(all.Active, first.Batch.ID)); !slices.Equal(got, want) {
+		t.Errorf("active = %v, want %v", got, want)
+	}
+	if got, want := ids2(batch.History), ids2(filter(all.History, first.Batch.ID)); !slices.Equal(got, want) {
+		t.Errorf("history = %v, want %v", got, want)
+	}
+	if want := []string{ids[3], ids[0]}; !slices.Equal(ids2(batch.History), want) {
+		t.Errorf("history = %v, want newest first %v", ids2(batch.History), want)
+	}
+
+	var onlyActive map[string]any
+	ta.do("GET", "/transfers?state=active&batchId="+first.Batch.ID, nil, &onlyActive)
+	if _, ok := onlyActive["history"]; ok {
+		t.Error("state=active answered a history list")
+	}
+	if _, ok := onlyActive["batch"]; !ok {
+		t.Error("batchId answered no batch")
+	}
+	close(release)
+}

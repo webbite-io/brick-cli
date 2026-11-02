@@ -59,7 +59,8 @@ type transferRecord struct {
 	Retries    int    `json:"retries,omitempty"`
 	RetryError string `json:"retryError,omitempty"`
 
-	seq uint64 // registration order, which the active list is sorted by
+	seq      uint64 // registration order, which the active list is sorted by
+	finished uint64 // finishing order, which the history is sorted by
 }
 
 // maxBatchHistory caps how many finished batches the agent remembers.
@@ -113,6 +114,8 @@ type transferRegistry struct {
 	active  map[string]*activeTransfer
 	history []*transferRecord // oldest first
 	seq     uint64
+	// finishedSeq numbers transfers as they finish, for transferRecord.finished.
+	finishedSeq uint64
 
 	batches         map[string]*transferBatch // running and recently finished
 	finishedBatches []string                  // oldest first, capped at maxBatchHistory
@@ -333,6 +336,8 @@ func (tr *transferRegistry) finishLocked(id string, node *storageNode, err error
 	defer close(at.done)
 	defer at.cancel() // release the context's resources
 	rec := at.rec
+	tr.finishedSeq++
+	rec.finished = tr.finishedSeq
 
 	now := time.Now().UTC()
 	rec.UpdatedAt = now
@@ -477,20 +482,59 @@ func (tr *transferRegistry) get(id string) (transferRecord, bool) {
 }
 
 // list returns copies of the active transfers (oldest first) and of the
-// history (newest first).
-func (tr *transferRegistry) list() (active, history []transferRecord) {
+// history (newest first). Only the lists asked for are built; the other is
+// nil.
+func (tr *transferRegistry) list(wantActive, wantHistory bool) (active, history []transferRecord) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	active = make([]transferRecord, 0, len(tr.active))
-	for _, at := range tr.active {
-		active = append(active, *at.rec)
+	if wantActive {
+		active = make([]transferRecord, 0, len(tr.active))
+		for _, at := range tr.active {
+			active = append(active, *at.rec)
+		}
+		sort.Slice(active, func(i, j int) bool { return active[i].seq < active[j].seq })
 	}
-	sort.Slice(active, func(i, j int) bool { return active[i].seq < active[j].seq })
-	history = make([]transferRecord, 0, len(tr.history))
-	for i := len(tr.history) - 1; i >= 0; i-- {
-		history = append(history, *tr.history[i])
+	if wantHistory {
+		history = make([]transferRecord, 0, len(tr.history))
+		for i := len(tr.history) - 1; i >= 0; i-- {
+			history = append(history, *tr.history[i])
+		}
 	}
 	return active, history
+}
+
+// listBatch is list for the files of batch id, with the batch: it reads only
+// that batch's records rather than every transfer's. ok is false if there is
+// no such batch.
+func (tr *transferRegistry) listBatch(id string, wantActive, wantHistory bool) (batch transferBatch, active, history []transferRecord, ok bool) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	b, ok := tr.batches[id]
+	if !ok {
+		return transferBatch{}, nil, nil, false
+	}
+	if wantActive {
+		active = []transferRecord{}
+	}
+	if wantHistory {
+		history = []transferRecord{}
+	}
+	// TransferIDs are in registration order, as the active list is sorted.
+	for _, tid := range b.TransferIDs {
+		rec, known := tr.byID[tid] // gone once it drops out of the history
+		if !known {
+			continue
+		}
+		if _, isActive := tr.active[tid]; isActive {
+			if wantActive {
+				active = append(active, *rec)
+			}
+		} else if wantHistory {
+			history = append(history, *rec)
+		}
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].finished > history[j].finished })
+	return tr.batchViewLocked(b), active, history, true
 }
 
 // cancel stops running transfer id and waits up to wait for it to finish.
@@ -535,37 +579,30 @@ func (a *agentServer) handleTransfers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_state", `The state parameter must be "active" or "history".`)
 		return
 	}
-	active, history := a.transfers.list()
+	wantActive, wantHistory := state != "history", state != "active"
 	resp := map[string]interface{}{"historyLimit": a.transfers.limit}
+	var active, history []transferRecord
 	if batchID := r.URL.Query().Get("batchId"); batchID != "" {
 		if parsed, err := uuid.Parse(batchID); err == nil {
 			batchID = parsed.String()
 		}
-		batch, ok := a.transfers.getBatch(batchID)
+		batch, act, hist, ok := a.transfers.listBatch(batchID, wantActive, wantHistory)
 		if !ok {
 			writeError(w, http.StatusNotFound, "batch_not_found", "No batch with this id in the current session.")
 			return
 		}
 		resp["batch"] = batch
-		active, history = filterBatch(active, batchID), filterBatch(history, batchID)
+		active, history = act, hist
+	} else {
+		active, history = a.transfers.list(wantActive, wantHistory)
 	}
-	if state != "history" {
+	if wantActive {
 		resp["active"] = active
 	}
-	if state != "active" {
+	if wantHistory {
 		resp["history"] = history
 	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-func filterBatch(recs []transferRecord, batchID string) []transferRecord {
-	out := make([]transferRecord, 0, len(recs))
-	for _, rec := range recs {
-		if rec.BatchID == batchID {
-			out = append(out, rec)
-		}
-	}
-	return out
 }
 
 // transferIDParam returns the request's {id} path value in the canonical

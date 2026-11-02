@@ -353,7 +353,7 @@ func TestTransferRegistryHistoryLimit(t *testing.T) {
 		tr.finish(ctx, id, nil, errors.New("boom"))
 	}
 
-	_, history := tr.list()
+	_, history := tr.list(true, true)
 	if len(history) != 2 || history[0].ID != ids[2] || history[1].ID != ids[1] {
 		t.Errorf("history = %+v, want the two newest (%s, %s), newest first", history, ids[2], ids[1])
 	}
