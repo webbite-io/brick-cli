@@ -454,3 +454,41 @@ func TestAgentCapsActiveTransfers(t *testing.T) {
 		t.Errorf("batch after the queue emptied: status %d, want 202", status)
 	}
 }
+
+// A queued upload whose folder was swapped for a symlink out of the roots
+// while it waited fails rather than uploading what the symlink leads to.
+func TestAgentUploadBatchRechecksRootsWhenItRuns(t *testing.T) {
+	fake := newFakeStorageAPI()
+	release := make(chan struct{})
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	outside := filepath.Join(base, "outside")
+	ta := newTestAgentWithRoots(t, gatedUploadServer(t, fake, release), fake, true, []agentRoot{{path: root}})
+	first := writeTestFile(t, root, "first.txt", "first")
+	queued := writeTestFile(t, root, "sub/secret.txt", "ok")
+	writeTestFile(t, outside, "secret.txt", "SECRET")
+
+	var out batchResp
+	if status := ta.do("POST", "/transfer/upload-batch", map[string]interface{}{"paths": []string{first, queued}, "parentId": "root"}, &out); status != http.StatusAccepted {
+		t.Fatalf("upload-batch: status %d, want 202", status)
+	}
+	ids := out.Batch.TransferIDs
+	ta.waitForTransfer(ids[0], func(rec transferRecord) bool { return rec.State == transferRunning })
+	if err := os.RemoveAll(filepath.Join(root, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	symlinkOrSkip(t, outside, filepath.Join(root, "sub"))
+	close(release)
+
+	rec := ta.waitForTransfer(ids[1], func(rec transferRecord) bool { return rec.State != transferQueued && rec.State != transferRunning })
+	if rec.State != transferFailed {
+		t.Errorf("swapped file = %s, want failed", rec.State)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for _, n := range fake.nodes {
+		if string(n.data) == "SECRET" {
+			t.Errorf("the file outside the roots was uploaded as %s", n.Name)
+		}
+	}
+}

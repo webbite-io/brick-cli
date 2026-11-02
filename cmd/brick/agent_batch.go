@@ -405,7 +405,11 @@ func (a *agentServer) uploadBatchFile(it queuedUpload) (*storageNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The file may have changed, or gone, since the batch was queued.
+	// The file may have changed, or gone, since the batch was queued, and a
+	// folder on its path may have been swapped for a symlink out of the roots.
+	if _, err := a.resolveSafe(it.file.LocalPath); err != nil {
+		return nil, err
+	}
 	f, info, err := openRegular(it.file.LocalPath)
 	if err != nil {
 		return nil, err
