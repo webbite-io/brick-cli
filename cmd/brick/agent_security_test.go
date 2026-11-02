@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 // symlinkOrSkip makes link point at target, skipping the test where symlinks
@@ -406,5 +407,50 @@ func TestStorageClientEscapesIDs(t *testing.T) {
 	}
 	if !slices.Equal(paths, want) {
 		t.Errorf("requested %q, want %q", paths, want)
+	}
+}
+
+func TestAgentCapsActiveTransfers(t *testing.T) {
+	defer func(n int) { maxActiveTransfers = n }(maxActiveTransfers)
+	maxActiveTransfers = 3
+	fake := newFakeStorageAPI()
+	release := make(chan struct{})
+	ta := newTestAgent(t, gatedUploadServer(t, fake, release), fake, true)
+	var paths []string
+	for _, name := range []string{"a", "b", "c"} {
+		paths = append(paths, writeTestFile(t, ta.root, name, name))
+	}
+
+	var errResp struct {
+		Error apiError `json:"error"`
+	}
+	if status := ta.do("POST", "/transfer/upload-batch", map[string]interface{}{"paths": paths, "parentId": "root"}, nil); status != http.StatusAccepted {
+		t.Fatalf("first batch: status %d, want 202", status)
+	}
+	if status := ta.do("POST", "/transfer/upload-batch", map[string]interface{}{"paths": paths[:1], "parentId": "root"}, &errResp); status != http.StatusTooManyRequests || errResp.Error.Code != "too_many_transfers" {
+		t.Errorf("batch past the cap: status %d code %q, want 429 too_many_transfers", status, errResp.Error.Code)
+	}
+	errResp.Error = apiError{}
+	if status := ta.do("POST", "/transfer/upload", uploadReq{LocalPath: paths[0], ParentID: "root", Async: true}, &errResp); status != http.StatusTooManyRequests || errResp.Error.Code != "too_many_transfers" {
+		t.Errorf("transfer past the cap: status %d code %q, want 429 too_many_transfers", status, errResp.Error.Code)
+	}
+
+	// Once they finish there is room again.
+	close(release)
+	var list struct {
+		Active []transferRecord `json:"active"`
+	}
+	for i := 0; ; i++ {
+		ta.do("GET", "/transfers?state=active", nil, &list)
+		if len(list.Active) == 0 {
+			break
+		}
+		if i > 500 {
+			t.Fatalf("transfers never finished: %+v", list.Active)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status := ta.do("POST", "/transfer/upload-batch", map[string]interface{}{"paths": paths, "parentId": "root"}, nil); status != http.StatusAccepted {
+		t.Errorf("batch after the queue emptied: status %d, want 202", status)
 	}
 }

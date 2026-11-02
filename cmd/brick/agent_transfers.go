@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"sort"
@@ -63,6 +64,19 @@ type transferRecord struct {
 
 // maxBatchHistory caps how many finished batches the agent remembers.
 const maxBatchHistory = 100
+
+// maxActiveTransfers caps how many transfers may be running or queued at
+// once, ten full batches' worth, so a caller that keeps queueing batches
+// can't grow the queue (and the memory holding it) without end. A variable
+// so tests can lower it.
+var maxActiveTransfers = 10 * maxBatchFiles
+
+// errTooManyTransfers is the error for a transfer or batch past
+// maxActiveTransfers.
+func errTooManyTransfers() error {
+	return newAPIError(http.StatusTooManyRequests, "too_many_transfers",
+		fmt.Sprintf("At most %d transfers can be running or queued at once; wait for some to finish, or cancel some.", maxActiveTransfers))
+}
 
 // transferBatch is a batch upload or download as reported by
 // GET /transfers/{id} for the batch's id: one transfer per file, run one at a
@@ -156,6 +170,9 @@ func (tr *transferRegistry) begin(id string, rec transferRecord, cancel context.
 	if tr.idTakenLocked(id) {
 		return "", newAPIError(http.StatusConflict, "transfer_exists", "A transfer with this transferId already exists.")
 	}
+	if len(tr.active)+1 > maxActiveTransfers {
+		return "", errTooManyTransfers()
+	}
 	tr.addLocked(id, rec, transferRunning, cancel)
 	return id, nil
 }
@@ -201,6 +218,9 @@ func (tr *transferRegistry) beginBatch(batchID string, dest transferBatch, items
 	defer tr.mu.Unlock()
 	if tr.idTakenLocked(batchID) {
 		return transferBatch{}, newAPIError(http.StatusConflict, "batch_exists", "A transfer or batch with this batchId already exists.")
+	}
+	if len(tr.active)+len(items) > maxActiveTransfers {
+		return transferBatch{}, errTooManyTransfers()
 	}
 	now := time.Now().UTC()
 	b := &transferBatch{
