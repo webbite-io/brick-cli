@@ -492,3 +492,39 @@ func TestAgentUploadBatchRechecksRootsWhenItRuns(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentRootCreatedAfterStartIsResolved(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	base := t.TempDir()
+	later := filepath.Join(base, "later")
+	ta := newTestAgentWithRoots(t, sc, fake, true, []agentRoot{{path: later}})
+	writeTestFile(t, later, "a.txt", "a") // the root appears only now
+
+	if status := ta.do("GET", "/fs/stat?path="+url.QueryEscape(filepath.Join(later, "a.txt")), nil, nil); status != http.StatusOK {
+		t.Errorf("stat in a root created after start: status %d, want 200", status)
+	}
+	var errResp struct {
+		Error apiError `json:"error"`
+	}
+	if status := ta.do("GET", "/fs/stat?path="+url.QueryEscape(base), nil, &errResp); status != http.StatusForbidden || errResp.Error.Code != "path_outside_roots" {
+		t.Errorf("stat outside: status %d code %q, want 403 path_outside_roots", status, errResp.Error.Code)
+	}
+}
+
+func TestAgentSymlinkedRoot(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	writeTestFile(t, real, "a.txt", "a")
+	link := filepath.Join(base, "link")
+	symlinkOrSkip(t, real, link)
+	ta := newTestAgentWithRoots(t, sc, fake, true, []agentRoot{{path: link}})
+	for _, p := range []string{filepath.Join(link, "a.txt"), filepath.Join(real, "a.txt")} {
+		if status := ta.do("GET", "/fs/stat?path="+url.QueryEscape(p), nil, nil); status != http.StatusOK {
+			t.Errorf("stat %s: status %d, want 200", p, status)
+		}
+	}
+	if status := ta.do("DELETE", "/fs/delete?path="+url.QueryEscape(link), nil, nil); status != http.StatusForbidden {
+		t.Errorf("delete the symlinked root: status %d, want 403", status)
+	}
+}

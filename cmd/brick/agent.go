@@ -114,7 +114,11 @@ type agentRoot struct {
 }
 
 type agentServer struct {
-	roots         []agentRoot
+	roots []agentRoot
+	// rootReals holds each root's real path, resolved once at start-up,
+	// or "" for one that couldn't be (it is then resolved on every use,
+	// in case it appears later). See realRoot.
+	rootReals     []string
 	secret        string
 	sc            *storageClient
 	remoteControl bool
@@ -164,6 +168,12 @@ func newAgentServer(ctx context.Context, roots []agentRoot, secret string, sc *s
 		ctx:           ctx,
 		transfers:     newTransferRegistry(historyLimit),
 		queue:         newTransferQueue(),
+	}
+	a.rootReals = make([]string, len(roots))
+	for i, root := range roots {
+		if real, err := filepath.EvalSymlinks(root.path); err == nil {
+			a.rootReals[i] = real
+		}
 	}
 	go a.runTransferQueue(ctx)
 	return a
@@ -388,8 +398,8 @@ func (a *agentServer) rootOf(abs string) (agentRoot, bool) {
 	if real == "" {
 		return best, false
 	}
-	for _, root := range a.roots {
-		rootReal := evalSafe(root.path)
+	for i, root := range a.roots {
+		rootReal := a.realRoot(i)
 		if rootReal == "" {
 			continue // a root that can't be resolved contains nothing
 		}
@@ -407,6 +417,16 @@ func (a *agentServer) rootOf(abs string) (agentRoot, bool) {
 	return best, bestLen >= 0
 }
 
+// realRoot returns root i's real path: as resolved at start-up, which keeps
+// following the folder a symlinked root led to then, or resolved now for a
+// root that didn't exist then.
+func (a *agentServer) realRoot(i int) string {
+	if i < len(a.rootReals) && a.rootReals[i] != "" {
+		return a.rootReals[i]
+	}
+	return evalSafe(a.roots[i].path)
+}
+
 // holdsRoot reports whether abs is one of the configured roots or a folder
 // with one somewhere inside it. Neither may be deleted or moved: that would
 // take the root with it, and with it a read-only root nested in a writable
@@ -420,8 +440,8 @@ func (a *agentServer) holdsRoot(abs string) bool {
 	if !strings.HasSuffix(prefix, string(os.PathSeparator)) {
 		prefix += string(os.PathSeparator)
 	}
-	for _, root := range a.roots {
-		rootReal := evalSafe(root.path)
+	for i := range a.roots {
+		rootReal := a.realRoot(i)
 		if rootReal != "" && (rootReal == real || strings.HasPrefix(rootReal, prefix)) {
 			return true
 		}
