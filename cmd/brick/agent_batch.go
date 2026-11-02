@@ -68,6 +68,7 @@ var errTooManyBatchFiles = newAPIError(http.StatusBadRequest, "too_many_files",
 
 // batchResolver turns a batch upload's paths into its files.
 type batchResolver struct {
+	ctx       context.Context // the request's: walking stops if it goes away
 	a         *agentServer
 	recursive bool
 	seen      map[string]bool // real paths of the files taken so far
@@ -75,8 +76,8 @@ type batchResolver struct {
 	skipped   []batchSkip
 }
 
-func (a *agentServer) resolveBatch(paths []string, recursive bool) ([]batchFile, []batchSkip, error) {
-	br := &batchResolver{a: a, recursive: recursive, seen: map[string]bool{}}
+func (a *agentServer) resolveBatch(ctx context.Context, paths []string, recursive bool) ([]batchFile, []batchSkip, error) {
+	br := &batchResolver{ctx: ctx, a: a, recursive: recursive, seen: map[string]bool{}}
 	for _, p := range paths {
 		if err := br.addPath(p); err != nil {
 			return nil, nil, err
@@ -105,9 +106,12 @@ func (br *batchResolver) skipErr(p string, err error) {
 }
 
 // addPath adds the file at requested path p, or (recursive) every file under
-// the folder at p. Only errTooManyBatchFiles is returned; every other problem
-// is recorded as a skip.
+// the folder at p. Only errTooManyBatchFiles and the request's cancellation
+// are returned; every other problem is recorded as a skip.
 func (br *batchResolver) addPath(p string) error {
+	if err := br.ctx.Err(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(p) == "" {
 		// resolveSafe would take this to mean the first root.
 		br.skip(p, "invalid_path", "Path is empty.")
@@ -124,7 +128,7 @@ func (br *batchResolver) addPath(p string) error {
 		return nil
 	}
 	if !info.IsDir() {
-		return br.addFile(abs, "", info)
+		return br.addFile(abs, evalSafe(abs), "", info)
 	}
 	if !br.recursive {
 		br.skip(abs, "is_a_directory", "Path is a directory; set recursive to upload its contents.")
@@ -136,10 +140,17 @@ func (br *batchResolver) addPath(p string) error {
 // addTree adds every file under folder abs, under a remote folder of the
 // same name. Symlinks inside it are followed to files within the roots but
 // not into folders, which could loop.
+//
+// The walk starts from abs's real path and doesn't follow symlinks, so every
+// path it reaches is already real: only a symlink's own target needs
+// resolving, and only a symlink needs more than the lstat WalkDir did.
 func (br *batchResolver) addTree(abs string) error {
 	walkRoot := evalSafe(abs)
 	top := filepath.Base(abs)
 	return filepath.WalkDir(walkRoot, func(p string, d fs.DirEntry, err error) error {
+		if ctxErr := br.ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			br.skipErr(p, err)
 			if d != nil && d.IsDir() {
@@ -150,12 +161,14 @@ func (br *batchResolver) addTree(abs string) error {
 		if d.IsDir() {
 			return nil
 		}
-		info, err := os.Stat(p) // follows a symlink
-		if err != nil {
-			br.skipErr(p, err)
-			return nil
-		}
+		real := p
+		var info os.FileInfo
 		if d.Type()&fs.ModeSymlink != 0 {
+			info, err = os.Stat(p) // follows the symlink
+			if err != nil {
+				br.skipErr(p, err)
+				return nil
+			}
 			if info.IsDir() {
 				br.skip(p, "symlinked_directory", "Symlinked folders are not followed.")
 				return nil
@@ -164,20 +177,24 @@ func (br *batchResolver) addTree(abs string) error {
 				br.skip(p, "path_outside_roots", "Symlink points outside the allowed roots.")
 				return nil
 			}
+			real = evalSafe(p)
+		} else if info, err = d.Info(); err != nil {
+			br.skipErr(p, err)
+			return nil
 		}
 		rel, _ := filepath.Rel(walkRoot, filepath.Dir(p))
-		return br.addFile(p, path.Join(top, filepath.ToSlash(rel)), info)
+		return br.addFile(p, real, path.Join(top, filepath.ToSlash(rel)), info)
 	})
 }
 
-// addFile adds the file at abs (to go in remoteDir), unless it was already
-// added under another path or can't be read.
-func (br *batchResolver) addFile(abs, remoteDir string, info os.FileInfo) error {
+// addFile adds the file at abs, whose real path is real (to go in
+// remoteDir), unless it was already added under another path or can't be
+// read.
+func (br *batchResolver) addFile(abs, real, remoteDir string, info os.FileInfo) error {
 	if !info.Mode().IsRegular() {
 		br.skip(abs, "not_a_regular_file", "Only regular files can be uploaded.")
 		return nil
 	}
-	real := evalSafe(abs)
 	if br.seen[real] {
 		br.skip(abs, "duplicate", "The file is already in this batch.")
 		return nil
@@ -217,7 +234,7 @@ func (a *agentServer) handleUploadBatch(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	files, skipped, err := a.resolveBatch(req.Paths, req.Recursive)
+	files, skipped, err := a.resolveBatch(r.Context(), req.Paths, req.Recursive)
 	if err != nil {
 		writeErr(w, err)
 		return

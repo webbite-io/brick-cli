@@ -528,3 +528,20 @@ func TestAgentSymlinkedRoot(t *testing.T) {
 		t.Errorf("delete the symlinked root: status %d, want 403", status)
 	}
 }
+
+// A batch whose request went away stops resolving rather than walking the
+// rest of the tree for nobody.
+func TestResolveBatchStopsWhenRequestGoesAway(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "dir/a.txt", "a")
+	a := newAgentServer(context.Background(), []agentRoot{{path: root}}, "s", nil, true, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := a.resolveBatch(ctx, []string{filepath.Join(root, "dir")}, true); !errors.Is(err, context.Canceled) {
+		t.Errorf("resolveBatch with a cancelled request: err %v, want context.Canceled", err)
+	}
+	files, _, err := a.resolveBatch(context.Background(), []string{filepath.Join(root, "dir")}, true)
+	if err != nil || len(files) != 1 {
+		t.Errorf("resolveBatch = %v, %v; want the one file", files, err)
+	}
+}
