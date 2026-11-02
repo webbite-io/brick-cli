@@ -465,7 +465,7 @@ func selectAccount(accounts []accountInfo, checklist *onboardingChecklist) (id, 
 		return accounts[0].ID, accounts[0].Name, nil
 	}
 
-	checklist.println("\nYou have access to more than one account, which one do you want to use?")
+	checklist.println("You have access to more than one account, which one do you want to use?")
 	checklist.println("")
 
 	options := make([]huh.Option[string], len(accounts))
