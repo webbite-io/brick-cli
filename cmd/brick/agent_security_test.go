@@ -136,3 +136,91 @@ func TestAgentDeletesDanglingSymlink(t *testing.T) {
 		t.Errorf("dangling symlink still there: %v", err)
 	}
 }
+
+func TestAgentCopySkipsSymlinksOutOfRoots(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	outside := filepath.Join(base, "outside")
+	for _, d := range []string{root, outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secret := writeTestFile(t, outside, "secret.txt", "secret")
+	inside := writeTestFile(t, root, "inside.txt", "inside")
+	writeTestFile(t, root, "src/plain.txt", "plain")
+	src := filepath.Join(root, "src")
+	symlinkOrSkip(t, secret, filepath.Join(src, "to-secret"))
+	symlinkOrSkip(t, inside, filepath.Join(src, "to-inside"))
+	symlinkOrSkip(t, outside, filepath.Join(src, "to-dir"))
+	symlinkOrSkip(t, filepath.Join(base, "gone"), filepath.Join(src, "dangling"))
+	ta := newTestAgentWithRoots(t, sc, fake, true, []agentRoot{{path: root}})
+
+	dst := filepath.Join(root, "dst")
+	var out struct {
+		Skipped []batchSkip `json:"skipped"`
+	}
+	if status := ta.do("POST", "/fs/copy", fromToReq{From: src, To: dst}, &out); status != http.StatusOK {
+		t.Fatalf("copy: status %d, want 200", status)
+	}
+	codes := map[string]string{}
+	for _, s := range out.Skipped {
+		codes[filepath.Base(s.Path)] = s.Code
+	}
+	want := map[string]string{"to-secret": "path_outside_roots", "to-dir": "symlinked_directory", "dangling": "not_found"}
+	for name, code := range want {
+		if codes[name] != code {
+			t.Errorf("skipped[%s] = %q, want %q (all: %v)", name, codes[name], code, codes)
+		}
+	}
+	if len(codes) != len(want) {
+		t.Errorf("skipped = %v, want exactly %v", codes, want)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "to-secret")); !os.IsNotExist(err) {
+		t.Errorf("symlink out of the roots was copied: %v", err)
+	}
+	for name, data := range map[string]string{"plain.txt": "plain", "to-inside": "inside"} {
+		p := filepath.Join(dst, name)
+		got, err := os.ReadFile(p)
+		if err != nil || string(got) != data {
+			t.Errorf("%s = %q, %v; want %q", name, got, err, data)
+		}
+		if info, err := os.Lstat(p); err == nil && !info.Mode().IsRegular() {
+			t.Errorf("%s copied as %v, want a regular file", name, info.Mode())
+		}
+	}
+}
+
+func TestAgentCopyFollowsSymlinkedStartingFolder(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	ta := newTestAgent(t, sc, fake, true)
+	writeTestFile(t, ta.root, "real/a.txt", "a")
+	link := filepath.Join(ta.root, "link")
+	symlinkOrSkip(t, filepath.Join(ta.root, "real"), link)
+	if status := ta.do("POST", "/fs/copy", fromToReq{From: link, To: filepath.Join(ta.root, "copy")}, nil); status != http.StatusOK {
+		t.Fatalf("copy: status %d, want 200", status)
+	}
+	if got, err := os.ReadFile(filepath.Join(ta.root, "copy", "a.txt")); err != nil || string(got) != "a" {
+		t.Errorf("copy/a.txt = %q, %v; want \"a\"", got, err)
+	}
+}
+
+func TestAgentCopyOntoSameFileUnderOtherCase(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	ta := newTestAgent(t, sc, fake, true)
+	a := writeTestFile(t, ta.root, "a.txt", "data")
+	upper := filepath.Join(ta.root, "A.txt")
+	if _, err := os.Stat(upper); err != nil {
+		t.Skip("disk is case-sensitive")
+	}
+	var errResp struct {
+		Error apiError `json:"error"`
+	}
+	if status := ta.do("POST", "/fs/copy", fromToReq{From: a, To: upper}, &errResp); status != http.StatusConflict || errResp.Error.Code != "exists" {
+		t.Errorf("copy a.txt to A.txt: status %d code %q, want 409 exists", status, errResp.Error.Code)
+	}
+	if got, _ := os.ReadFile(a); string(got) != "data" {
+		t.Errorf("a.txt = %q, want it untouched", got)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"mime"
 	"net"
@@ -819,7 +820,7 @@ func (a *agentServer) resolveFromTo(w http.ResponseWriter, r *http.Request, from
 		writeErr(w, err)
 		return "", "", false
 	}
-	if err := checkFromTo(from, to); err != nil {
+	if err := checkFromTo(from, to, fromWritable); err != nil {
 		writeErr(w, err)
 		return "", "", false
 	}
@@ -829,8 +830,9 @@ func (a *agentServer) resolveFromTo(w http.ResponseWriter, r *http.Request, from
 // checkFromTo refuses a move or copy that would write over something already
 // at to, or put a folder inside itself (which a copy would recurse into
 // forever). Moving a path onto itself under another case, as a rename on a
-// case-insensitive disk does, isn't writing over anything.
-func checkFromTo(from, to string) error {
+// case-insensitive disk does, isn't writing over anything (isMove); copying
+// it there would be.
+func checkFromTo(from, to string, isMove bool) error {
 	realFrom, realTo := evalSafe(from), evalSafe(to)
 	if realTo != realFrom && strings.HasPrefix(realTo, realFrom+string(filepath.Separator)) {
 		return newAPIError(http.StatusBadRequest, "invalid_destination", "A folder can't go inside itself.")
@@ -842,7 +844,7 @@ func checkFromTo(from, to string) error {
 	if err != nil {
 		return err
 	}
-	if fromInfo, err := os.Lstat(from); err == nil && os.SameFile(fromInfo, toInfo) && from != to {
+	if fromInfo, err := os.Lstat(from); isMove && err == nil && os.SameFile(fromInfo, toInfo) && from != to {
 		return nil
 	}
 	return newAPIError(http.StatusConflict, "exists", "A file or folder with this name already exists.")
@@ -873,27 +875,56 @@ func (a *agentServer) handleCopy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := copyPath(from, to); err != nil {
-		writeOSError(w, err)
+	skipped, err := a.copyPath(from, to)
+	if err != nil {
+		writeErrOrOS(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"from": from, "to": to, "ok": true})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"from": from, "to": to, "ok": true, "skipped": skipped})
 }
 
-// copyPath copies a file or directory tree from src to dst.
-func copyPath(src, dst string) error {
+// writeErrOrOS writes an *apiError as itself and anything else as
+// writeOSError classifies it.
+func writeErrOrOS(w http.ResponseWriter, err error) {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		writeErr(w, err)
+		return
+	}
+	writeOSError(w, err)
+}
+
+var errNotRegularFile = newAPIError(http.StatusBadRequest, "not_a_regular_file", "Only regular files and folders can be read.")
+
+// copyPath copies a file or folder tree from src to dst. Inside a folder,
+// symlinks are treated as upload-batch treats them: one to a file within the
+// roots is copied as that file, while one to a folder (which could loop) or
+// to anything outside the roots is left out, as is anything that isn't a
+// regular file (a FIFO would block the copy forever). What was left out is
+// returned; a failure to copy what wasn't is the error.
+func (a *agentServer) copyPath(src, dst string) ([]batchSkip, error) {
+	skipped := []batchSkip{}
 	info, err := os.Stat(src)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !info.IsDir() {
-		return copyFile(src, dst, info.Mode())
+		if !info.Mode().IsRegular() {
+			return nil, errNotRegularFile
+		}
+		return skipped, copyFile(src, dst, info.Mode())
 	}
-	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+	skip := func(p, code, message string) {
+		skipped = append(skipped, batchSkip{Path: p, Code: code, Message: sentence(message)})
+	}
+	// Walked by its real path, as WalkDir doesn't descend into a symlinked
+	// starting folder.
+	walkRoot := evalSafe(src)
+	err = filepath.WalkDir(walkRoot, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(src, path)
+		rel, err := filepath.Rel(walkRoot, p)
 		if err != nil {
 			return err
 		}
@@ -905,10 +936,35 @@ func copyPath(src, dst string) error {
 		if err != nil {
 			return err
 		}
-		return copyFile(path, target, fi.Mode())
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			fi, err = os.Stat(p)
+			switch {
+			case err != nil:
+				skip(p, "not_found", "Symlink points to nothing.")
+				return nil
+			case fi.IsDir():
+				skip(p, "symlinked_directory", "Symlinked folders are not followed.")
+				return nil
+			}
+			if _, ok := a.rootOf(p); !ok {
+				skip(p, "path_outside_roots", "Symlink points outside the allowed roots.")
+				return nil
+			}
+		}
+		if !fi.Mode().IsRegular() {
+			skip(p, "not_a_regular_file", "Only regular files can be copied.")
+			return nil
+		}
+		return copyFile(p, target, fi.Mode())
 	})
+	if err != nil {
+		return nil, err
+	}
+	return skipped, nil
 }
 
+// copyFile copies the regular file src to dst, which must not exist yet,
+// with src's permission bits (not setuid, setgid or sticky).
 func copyFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
@@ -918,13 +974,15 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // --- Transfer between local disk and the storage API ---
