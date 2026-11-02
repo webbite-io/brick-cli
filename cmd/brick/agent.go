@@ -1446,16 +1446,30 @@ func displayName(p string) string {
 func remoteControlLogLine(method, path, target string, status int, elapsed time.Duration) string {
 	action, ok := remoteControlActions[remoteControlKey(method, path)]
 	if !ok {
-		return fmt.Sprintf("Remote Control: %s %s %d %s", method, path, status, elapsed.Round(time.Millisecond))
+		return fmt.Sprintf("Remote Control: %s %s %d %s", printable(method), printable(path), status, elapsed.Round(time.Millisecond))
 	}
 	text := action.generic
 	if target != "" && action.named != "" {
-		text = fmt.Sprintf(action.named, `"`+target+`"`)
+		text = fmt.Sprintf(action.named, `"`+printable(target)+`"`)
 	}
 	if status >= 400 {
 		return fmt.Sprintf("Remote Control: %s failed (%d).", text, status)
 	}
 	return "Remote Control: " + text + "."
+}
+
+// printable replaces the characters in s that would do something other than
+// show up in the status window or brick.log, as a name from a request may
+// hold them: control characters (a newline faking a log line, an escape
+// sequence for the terminal) and the bidirectional overrides that make text
+// read in a different order than it's stored.
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || (r >= '\u202a' && r <= '\u202e') || (r >= '\u2066' && r <= '\u2069') {
+			return '?'
+		}
+		return r
+	}, s)
 }
 
 // connectAgentOnce dials the storage API, takes the yamux server role, and

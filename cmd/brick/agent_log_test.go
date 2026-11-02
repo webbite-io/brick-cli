@@ -45,6 +45,9 @@ func TestRemoteControlLogLine(t *testing.T) {
 		{"DELETE", "/transfers/abc123", "", 204, "Remote Control: Cancelling a transfer."},
 		{"GET", "/fs/read", "a.txt", 404, `Remote Control: Reading "a.txt" failed (404).`},
 		{"GET", "/nope", "", 404, "Remote Control: GET /nope 404 5ms"},
+		{"GET", "/fs/read", "a\nRemote Control: Deleting \"b\".\x1b[2J", 200, `Remote Control: Reading "a?Remote Control: Deleting "b".?[2J".`},
+		{"GET", "/fs/read", "evil\u202egpj.exe", 200, `Remote Control: Reading "evil?gpj.exe".`},
+		{"GET", "/no\x1bpe", "", 404, "Remote Control: GET /no?pe 404 5ms"},
 	} {
 		if got := remoteControlLogLine(tc.method, tc.path, tc.target, tc.status, 5*time.Millisecond); got != tc.want {
 			t.Errorf("%s %s %d: got %q, want %q", tc.method, tc.path, tc.status, got, tc.want)
