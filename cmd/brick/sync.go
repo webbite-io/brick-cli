@@ -4198,7 +4198,8 @@ func (s *syncExcludeDirsSettings) setExcludeDirs(dirs []string) error {
 
 // promptForRemoteControl asks, during first-time onboarding, whether to
 // enable remote file access (-r/--remote-control) by default and, if so,
-// which folder to expose as its root. The choice is persisted to
+// which folder to expose as its root and at what access level (read-only by
+// default, or read/write). The choice is persisted to
 // cfg.RemoteControl/cfg.AgentRoots so it takes effect on every future run
 // without needing -r; declining here just means -r can still be used to
 // force it on for a single invocation later.
@@ -4260,22 +4261,49 @@ func promptForRemoteControl(cfg *Config, checklist *onboardingChecklist) error {
 		return err
 	}
 
+	const (
+		optReadOnly  = "readOnly"
+		optReadWrite = "readWrite"
+	)
+	access := optReadOnly
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Access level via remote control:").
+			Options(
+				huh.NewOption("Read-Only (read and upload files)", optReadOnly),
+				huh.NewOption("Read/Write (read, upload, download, modify and delete files)", optReadWrite),
+			).
+			Value(&access),
+	)).Run(); err != nil {
+		return err
+	}
+	// Read-only stays unset so the entry is saved in the plain-path form.
+	var readOnly *bool
+	if access == optReadWrite {
+		readOnly = new(bool)
+	}
+
 	cfg.RemoteControl = true
 	present := false
-	for _, r := range cfg.AgentRoots {
+	for i, r := range cfg.AgentRoots {
 		if r.Path == abs {
+			cfg.AgentRoots[i].ReadOnly = readOnly
 			present = true
 			break
 		}
 	}
 	if !present {
-		cfg.AgentRoots = append(cfg.AgentRoots, AgentRoot{Path: abs}) // read-only by default
+		cfg.AgentRoots = append(cfg.AgentRoots, AgentRoot{Path: abs, ReadOnly: readOnly})
 	}
 	if err := saveConfig(cfg); err != nil {
 		return err
 	}
 
-	checklist.done("Remote file access enabled (root folder: %s)", displayPath(abs))
+	level := "read-only"
+	if access == optReadWrite {
+		level = "read/write"
+	}
+	checklist.done("Remote file access enabled (root folder: %s, %s)", displayPath(abs), level)
 	return nil
 }
 
