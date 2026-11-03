@@ -1516,6 +1516,11 @@ func printable(s string) string {
 	}, s)
 }
 
+// agentClientType identifies this program to the storage API on connect, so
+// GET .../clients can tell brick apart from other clients that attach the
+// same way.
+const agentClientType = "brick-cli"
+
 // connectAgentOnce dials the storage API, takes the yamux server role, and
 // serves the agent API h on the streams it opens until the session ends or
 // ctx is cancelled. It reads cfg.AccessToken fresh so reconnects pick up
@@ -1531,6 +1536,8 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 	q.Set("os", runtime.GOOS)
 	q.Set("arch", runtime.GOARCH)
 	q.Set("remoteControl", strconv.FormatBool(remoteControl))
+	q.Set("version", Version)
+	q.Set("clientType", agentClientType)
 	muxURL := toWSURL(storageURL) + "/v1/accounts/" + url.PathEscape(cfg.ActiveAccountID) + "/agent/connect?" + q.Encode()
 
 	presented := currentAccessToken(cfg)
