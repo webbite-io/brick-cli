@@ -850,9 +850,9 @@ func (e *syncEngine) setPaused(p bool) {
 		return
 	}
 	if p {
-		log.Printf("⏸ sync paused")
+		log.Printf(syncLogPrefix + "⏸ Paused")
 	} else {
-		log.Printf("▶ sync resumed")
+		log.Printf(syncLogPrefix + "▶ Resumed")
 	}
 }
 
@@ -862,7 +862,7 @@ func (e *syncEngine) setPaused(p bool) {
 // already logged the pause — so every place this can surface (reconcileAll's
 // own state bookkeeping, and each of its callers below) treats it the same
 // way it already treats ctx cancellation: silently, without recording a sync
-// error or printing a second log line under "⏸ sync paused".
+// error or printing a second log line under "Sync: ⏸ Paused".
 var errPausedMidPass = errors.New("sync paused mid-pass")
 
 // checkInterrupted reports whether reconcileAll should stop iterating and
@@ -947,7 +947,7 @@ func (e *syncEngine) refreshQuota(ctx context.Context) (*storageQuota, error) {
 func (e *syncEngine) refreshQuotaAsync(ctx context.Context) {
 	go func() {
 		if _, err := e.refreshQuota(ctx); err != nil && ctx.Err() == nil {
-			e.quotaErrOnce.Do(func() { log.Printf("could not read storage quota: %v", err) })
+			e.quotaErrOnce.Do(func() { logSyncErr(err, "could not read storage quota: %v", err) })
 		}
 	}()
 }
@@ -1400,7 +1400,7 @@ func (e *syncEngine) applyRemoteFolderMoves(remoteFolders map[string]storageNode
 			}
 		}
 		e.moved.Add(1)
-		log.Printf("→ moved %s to %s", m.oldRel, m.newRel)
+		log.Printf(syncLogPrefix+"→ Moved %s to %s", m.oldRel, m.newRel)
 		e.publishActivity("move-folder", m.newRel)
 	}
 }
@@ -1447,7 +1447,7 @@ func (e *syncEngine) applyRemoteFileMoves(remoteFiles map[string]storageNode, lo
 		entry.RemoteEtag = node.Etag
 		e.state.Entries[newRel] = entry
 		e.moved.Add(1)
-		log.Printf("→ moved %s to %s", oldRel, newRel)
+		log.Printf(syncLogPrefix+"→ Moved %s to %s", oldRel, newRel)
 		e.publishActivity("move", newRel)
 	}
 }
@@ -1803,7 +1803,7 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullWalk bool, c
 		handledDeletes[rel] = true
 		e.pruneRemoteSubtree(rel, remoteFolders, remoteFiles, folderID)
 		e.deleted.Add(1)
-		log.Printf("🗑  trashed folder %s (deleted locally)", rel)
+		log.Printf(syncLogPrefix+"🗑  Trashed folder %s (deleted locally)", rel)
 		e.publishActivity("trash-folder", rel)
 	}
 
@@ -1883,7 +1883,7 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullWalk bool, c
 				return err
 			}
 			filesFailed = true
-			log.Printf("sync %s: %v", rel, err)
+			logSyncErr(err, "sync %s: %v", rel, err)
 		}
 	}
 	// Every currently-known file has now been reconciled, so the next pass may
@@ -1954,7 +1954,7 @@ func (e *syncEngine) reconcileAllImpl(ctx context.Context, forceFullWalk bool, c
 		}
 		delete(localDirs, rel)
 		e.deleted.Add(1)
-		log.Printf("🗑  removed folder %s (deleted on server)", rel)
+		log.Printf(syncLogPrefix+"🗑  Removed folder %s (deleted on server)", rel)
 		e.publishActivity("remove-folder", rel)
 	}
 
@@ -2317,7 +2317,7 @@ func (e *syncEngine) reconcileFile(ctx context.Context, rel string, remoteFiles 
 			delete(localFiles, rel)
 			delete(e.state.Entries, rel)
 			e.deleted.Add(1)
-			log.Printf("🗑  removed %s (deleted on server)", rel)
+			log.Printf(syncLogPrefix+"🗑  Removed %s (deleted on server)", rel)
 			e.publishActivity("remove", rel)
 			return nil
 		}
@@ -2455,7 +2455,7 @@ func (e *syncEngine) keepBothFile(ctx context.Context, rel string, remoteNode st
 	if err := e.uploadNewFile(ctx, copyRel, remoteFolders, folderID); err != nil {
 		return err
 	}
-	log.Printf("⧉ kept both copies of %s (as %s)", rel, copyRel)
+	log.Printf(syncLogPrefix+"⧉ Kept both copies of %s (as %s)", rel, copyRel)
 	e.publishActivity("keep-both", rel)
 	return nil
 }
@@ -2517,7 +2517,7 @@ func (e *syncEngine) downloadFile(ctx context.Context, rel string, node storageN
 		SyncedAt:   time.Now(),
 	}
 	e.downloaded.Add(1)
-	log.Printf("↓ downloaded %s", rel)
+	log.Printf(syncLogPrefix+"↓ Downloaded %s", rel)
 	e.publishActivity("download", rel)
 	return nil
 }
@@ -2530,7 +2530,7 @@ func (e *syncEngine) deleteRemoteFile(ctx context.Context, rel, nodeID string) e
 	}
 	delete(e.state.Entries, rel)
 	e.deleted.Add(1)
-	log.Printf("🗑  trashed %s (deleted locally)", rel)
+	log.Printf(syncLogPrefix+"🗑  Trashed %s (deleted locally)", rel)
 	e.publishActivity("trash", rel)
 	return nil
 }
@@ -2591,7 +2591,7 @@ func (e *syncEngine) uploadNewFile(ctx context.Context, rel string, remoteFolder
 		return err
 	}
 	e.recordUpload(rel, node, body)
-	log.Printf("↑ uploaded %s", rel)
+	log.Printf(syncLogPrefix+"↑ Uploaded %s", rel)
 	e.publishActivity("upload", rel)
 	return nil
 }
@@ -2610,7 +2610,7 @@ func (e *syncEngine) replaceFile(ctx context.Context, rel, nodeID string) error 
 		return err
 	}
 	e.recordUpload(rel, node, body)
-	log.Printf("↑ uploaded %s (updated)", rel)
+	log.Printf(syncLogPrefix+"↑ Uploaded %s (updated)", rel)
 	e.publishActivity("update", rel)
 	return nil
 }
@@ -3444,7 +3444,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 	if syncLog != nil {
 		baseLogOutput = io.MultiWriter(os.Stderr, syncLog)
 	}
-	baseLogOutput = newTimestampWriter(baseLogOutput)
+	baseLogOutput = newTimestampWriter(newPlainLogWriter(baseLogOutput))
 	log.SetOutput(baseLogOutput)
 
 	var detachRequested atomic.Bool
@@ -3460,6 +3460,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 				prog.Wait()
 			}
 			if interactive {
+				connStatus.setDisplay(nil)
 				log.SetOutput(baseLogOutput)
 				yamuxLogQuiet.Store(false)
 			}
@@ -3494,10 +3495,12 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 		}
 		prog = tea.NewProgram(model, tea.WithAltScreen())
 		eng.onQuota = func(q *storageQuota) { prog.Send(quotaMsg{q}) }
-		tuiOutput := io.Writer(newTUILogWriter(prog))
+		tw := newTUILogWriter(prog)
+		tuiOutput := io.Writer(tw)
 		if syncLog != nil {
-			tuiOutput = io.MultiWriter(tuiOutput, syncLog)
+			tuiOutput = io.MultiWriter(tw, newPlainLogWriter(syncLog))
 		}
+		connStatus.setDisplay(tw.show)
 		log.SetOutput(newTimestampWriter(tuiOutput))
 		yamuxLogQuiet.Store(true)
 		go func() {
@@ -3542,7 +3545,7 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 	// next poll rather than falling into a gap.
 	bootstrapTime, btErr := eng.sc.serverNow(ctx)
 	if btErr != nil && ctx.Err() == nil {
-		log.Printf("could not read server time for incremental sync: %v", btErr)
+		logSyncErr(btErr, "could not read server time for incremental sync: %v", btErr)
 	}
 
 	// Wrap just this bootstrap pass's tree-fetch and local-compare steps with
@@ -3585,8 +3588,10 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 			return false, reconcileErr
 		}
 		if ctx.Err() == nil && !errors.Is(reconcileErr, errPausedMidPass) {
-			log.Printf("initial sync error: %v", reconcileErr)
+			logSyncErr(reconcileErr, "initial sync error: %v", reconcileErr)
 		}
+	} else {
+		connStatus.ok(connSourceSync)
 	}
 	if bootstrapTime > 0 {
 		eng.setCursor(bootstrapTime)
@@ -3647,9 +3652,10 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 						return
 					}
 					if ctx.Err() == nil && !errors.Is(err, errPausedMidPass) {
-						log.Printf("sync error: %v", err)
+						logSyncErr(err, "sync error: %v", err)
 					}
 				} else {
+					connStatus.ok(connSourceSync)
 					// Local changes (uploads/deletes) just landed remotely, so
 					// the usage figures the banner reports are
 					// now stale.
@@ -3700,10 +3706,11 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 						return
 					}
 					if ctx.Err() == nil && !errors.Is(pollErr, errPausedMidPass) {
-						log.Printf("remote poll error: %v", pollErr)
+						logSyncErr(pollErr, "remote poll error: %v", pollErr)
 					}
 					continue
 				}
+				connStatus.ok(connSourceSync)
 				if reconciled {
 					eng.addWatchesRecursive(watcher)
 					// Remote changes just landed locally, so the usage figures

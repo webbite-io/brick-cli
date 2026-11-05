@@ -31,7 +31,7 @@ func main() {
 	// Use "YYYY-MM-DD HH:ii:ss" timestamps in all log output instead of the
 	// standard log package's default "2026/09/25 12:12:51" format.
 	log.SetFlags(0)
-	log.SetOutput(newTimestampWriter(os.Stderr))
+	log.SetOutput(newTimestampWriter(newPlainLogWriter(os.Stderr)))
 
 	var (
 		showVersion    bool

@@ -126,24 +126,38 @@ func (w *tuiLogWriter) forward() {
 	}
 }
 
+// Write queues each line for the TUI, in the form it shows (see
+// tuiLogLine), leaving out those logged with logFileOnly.
 func (w *tuiLogWriter) Write(p []byte) (int, error) {
 	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
-		select {
-		case w.lines <- line:
-		default:
-			// Queue is full — drop the oldest buffered line to make room
-			// rather than blocking the caller.
-			select {
-			case <-w.lines:
-			default:
-			}
-			select {
-			case w.lines <- line:
-			default:
-			}
+		if line, ok := tuiLogLine(line); ok {
+			w.enqueue(line)
 		}
 	}
 	return len(p), nil
+}
+
+// show puts line in the TUI only, timestamped like a log line — for the
+// connectivity notices (see connectivity.setDisplay).
+func (w *tuiLogWriter) show(line string) {
+	w.enqueue(logLinePrefix() + line)
+}
+
+func (w *tuiLogWriter) enqueue(line string) {
+	select {
+	case w.lines <- line:
+	default:
+		// Queue is full — drop the oldest buffered line to make room
+		// rather than blocking the caller.
+		select {
+		case <-w.lines:
+		default:
+		}
+		select {
+		case w.lines <- line:
+		default:
+		}
+	}
 }
 
 // searchHitStyle highlights a matched substring the way search hits are

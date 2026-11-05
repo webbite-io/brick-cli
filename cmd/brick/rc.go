@@ -114,7 +114,7 @@ func runRemoteControlLoop(cfg *Config, sc *storageClient) error {
 	if syncLog != nil {
 		baseLogOutput = io.MultiWriter(os.Stderr, syncLog)
 	}
-	baseLogOutput = newTimestampWriter(baseLogOutput)
+	baseLogOutput = newTimestampWriter(newPlainLogWriter(baseLogOutput))
 	log.SetOutput(baseLogOutput)
 
 	var prog *tea.Program
@@ -126,6 +126,7 @@ func runRemoteControlLoop(cfg *Config, sc *storageClient) error {
 				prog.Wait()
 			}
 			if interactive {
+				connStatus.setDisplay(nil)
 				log.SetOutput(baseLogOutput)
 				yamuxLogQuiet.Store(false)
 			}
@@ -145,10 +146,12 @@ func runRemoteControlLoop(cfg *Config, sc *storageClient) error {
 		model.setRemoteControl(agentRoots)
 		model.setRCAccessToggle(rcAccessToggle(cfg, agent))
 		prog = tea.NewProgram(model, tea.WithAltScreen())
-		tuiOutput := io.Writer(newTUILogWriter(prog))
+		tw := newTUILogWriter(prog)
+		tuiOutput := io.Writer(tw)
 		if syncLog != nil {
-			tuiOutput = io.MultiWriter(tuiOutput, syncLog)
+			tuiOutput = io.MultiWriter(tw, newPlainLogWriter(syncLog))
 		}
+		connStatus.setDisplay(tw.show)
 		log.SetOutput(newTimestampWriter(tuiOutput))
 		yamuxLogQuiet.Store(true)
 		go func() {
@@ -160,7 +163,7 @@ func runRemoteControlLoop(cfg *Config, sc *storageClient) error {
 			if q, qerr := sc.quota(ctx); qerr == nil {
 				prog.Send(quotaMsg{q})
 			} else if ctx.Err() == nil {
-				log.Printf("could not read storage quota: %v", qerr)
+				logSyncErr(qerr, "could not read storage quota: %v", qerr)
 			}
 		}()
 	}

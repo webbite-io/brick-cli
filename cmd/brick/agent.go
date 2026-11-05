@@ -62,7 +62,8 @@ func yamuxConfig() *yamux.Config {
 // yamuxLogQuiet, while set, drops yamux's own log output. The sync TUI sets
 // it for as long as it's on screen: every yamux error there ends the session
 // and is already reported, more readably, by connectAgentWithReconnect's
-// "Brick CLI disconnected (...); reconnecting..." line.
+// "Brick CLI disconnected (...); reconnecting..." line in brick.log, and in
+// the TUI as a connectivity issue (see connectivity).
 var yamuxLogQuiet atomic.Bool
 
 // yamuxLogger forwards yamux's log output to the standard logger unless
@@ -1614,7 +1615,13 @@ func connectAgentOnce(ctx context.Context, storageURL, apiURL string, cfg *Confi
 		}
 	}()
 
-	log.Printf("Brick CLI connected to Brick Online (clientId=%s)", cfg.ClientID)
+	// Coming back from a connectivity issue, the TUI already says so (see
+	// connectivity.ok), so this line goes to brick.log only.
+	if connStatus.ok(connSourceAgent) {
+		logFileOnly("Brick CLI connected to Brick Online (clientId=%s)", cfg.ClientID)
+	} else {
+		log.Printf("Brick CLI connected to Brick Online (clientId=%s)", cfg.ClientID)
+	}
 	if onConnected != nil {
 		onConnected()
 	}
@@ -1678,7 +1685,7 @@ func connectAgentWithReconnect(ctx context.Context, storageURL, apiURL string, c
 			attempt = 0
 		}
 		delay := reconnectBackoff[min(attempt, len(reconnectBackoff)-1)]
-		log.Printf("Brick CLI disconnected (%v); reconnecting in %v...", err, delay)
+		connStatus.fail(connSourceAgent, "Brick CLI disconnected (%v); reconnecting in %v...", err, delay)
 		select {
 		case <-ctx.Done():
 			return
