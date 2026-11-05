@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -221,6 +223,45 @@ func (sc *storageClient) downloadNode(ctx context.Context, nodeID, destPath stri
 	return resumableDownload(ctx, destPath, total, noClobber, onProgress, func(ctx context.Context, headers map[string]string) (*http.Response, error) {
 		return sc.streamGet(ctx, "/files/"+url.PathEscape(nodeID), headers)
 	}, sc.errFrom)
+}
+
+// downloadedFile is what downloadForSync reports about the file it wrote.
+type downloadedFile struct {
+	size   int64
+	etag   string // the response's ETag, unquoted; "" if it had none
+	sha256 string // hex SHA-256 of the bytes put at destPath
+}
+
+// downloadForSync is downloadToFile for the sync engine, which records what
+// it wrote: the file's ETag, and the size and SHA-256 of the bytes put at
+// destPath. They're hashed off the temporary file before it is put in place,
+// so an edit landing right after can't be mistaken for the download.
+func (sc *storageClient) downloadForSync(ctx context.Context, nodeID, destPath string, total int64) (*downloadedFile, error) {
+	var d downloadedFile
+	fetch := func(ctx context.Context, headers map[string]string) (*http.Response, error) {
+		resp, err := sc.streamGet(ctx, "/files/"+url.PathEscape(nodeID), headers)
+		if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+			d.etag = strings.Trim(resp.Header.Get("ETag"), `"`)
+		}
+		return resp, err
+	}
+	hashTemp := func(tmpPath string) error {
+		f, err := os.Open(tmpPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		h := sha256.New()
+		if d.size, err = io.Copy(h, f); err != nil {
+			return err
+		}
+		d.sha256 = hex.EncodeToString(h.Sum(nil))
+		return nil
+	}
+	if err := resumableDownloadThen(ctx, destPath, total, false, nil, fetch, sc.errFrom, hashTemp); err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
 // streamGet is request for a GET whose response body is a file: it has no

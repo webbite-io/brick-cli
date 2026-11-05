@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"log"
@@ -323,60 +324,6 @@ func (sc *storageClient) checkUpdatesDelta(ctx context.Context, since int64) (no
 func (sc *storageClient) serverNow(ctx context.Context) (int64, error) {
 	_, serverTime, err := sc.checkUpdates(ctx, int64(1)<<62)
 	return serverTime, err
-}
-
-func (sc *storageClient) download(ctx context.Context, nodeID string) ([]byte, string, error) {
-	resp, err := sc.request(ctx, "GET", "/files/"+url.PathEscape(nodeID), nil, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", sc.errFrom(resp)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-	return data, strings.Trim(resp.Header.Get("ETag"), `"`), nil
-}
-
-func (sc *storageClient) upload(ctx context.Context, parentID, name string, data []byte) (*storageNode, error) {
-	headers := map[string]string{
-		"Content-Type": "application/octet-stream",
-		"X-Parent-ID":  parentID,
-		"X-Filename":   name,
-	}
-	resp, err := sc.request(ctx, "POST", "/files", data, headers)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		return nil, sc.errFrom(resp)
-	}
-	var result storageUploadResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return &result.Node, nil
-}
-
-func (sc *storageClient) replace(ctx context.Context, nodeID string, data []byte) (*storageNode, error) {
-	headers := map[string]string{"Content-Type": "application/octet-stream"}
-	resp, err := sc.request(ctx, "PUT", "/files/"+url.PathEscape(nodeID), data, headers)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, sc.errFrom(resp)
-	}
-	var result storageUploadResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return &result.Node, nil
 }
 
 // delete soft-deletes a node (file or folder), moving it to trash. A 404 means
@@ -2536,26 +2483,28 @@ func dupPath(rel string) string {
 // suppresses that event, to avoid it being mistaken for an independent local
 // edit and echoed back as an upload), so without this the cache would never
 // learn the file now exists until the next full walk.
+//
+// The file streams to disk rather than through memory, in one attempt: a
+// download that fails is left for the next pass, as before (see
+// withSingleAttempt).
 func (e *syncEngine) downloadFile(ctx context.Context, rel string, node storageNode, localFiles map[string]int64, localDirs map[string]bool) error {
 	e.setInFlight(rel, "download")
 	defer e.clearInFlight()
 
-	data, etag, err := e.sc.download(ctx, node.ID)
-	if err != nil {
-		return err
-	}
-	if etag == "" {
-		etag = node.Etag
-	}
 	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
 	}
 	e.markRecentlyWritten(abs)
-	if err := atomicWrite(abs, data); err != nil {
+	got, err := e.sc.downloadForSync(withSingleAttempt(ctx), node.ID, abs, node.SizeBytes)
+	if err != nil {
 		return err
 	}
-	localFiles[rel] = int64(len(data))
+	etag := got.etag
+	if etag == "" {
+		etag = node.Etag
+	}
+	localFiles[rel] = got.size
 	if parent := parentOf(rel); parent != "" {
 		localDirs[parent] = true
 	}
@@ -2563,8 +2512,8 @@ func (e *syncEngine) downloadFile(ctx context.Context, rel string, node storageN
 		RelPath:    rel,
 		NodeID:     node.ID,
 		RemoteEtag: etag,
-		LocalHash:  hashBytes(data),
-		LocalSize:  int64(len(data)),
+		LocalHash:  got.sha256,
+		LocalSize:  got.size,
 		SyncedAt:   time.Now(),
 	}
 	e.downloaded.Add(1)
@@ -2628,20 +2577,20 @@ func (e *syncEngine) uploadNewFile(ctx context.Context, rel string, remoteFolder
 	e.setInFlight(rel, "upload")
 	defer e.clearInFlight()
 
-	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
-	data, err := os.ReadFile(abs)
+	body, size, err := openUpload(filepath.Join(e.folder, filepath.FromSlash(rel)))
 	if err != nil {
 		return err
 	}
+	defer body.Close()
 	parentID, err := e.ensureRemoteFolder(ctx, parentOf(rel), remoteFolders, folderID)
 	if err != nil {
 		return err
 	}
-	node, err := e.sc.upload(ctx, parentID, baseName(rel), data)
+	node, err := e.sc.uploadStream(withSingleAttempt(ctx), parentID, baseName(rel), body, size, nil)
 	if err != nil {
 		return err
 	}
-	e.recordUpload(rel, node, data)
+	e.recordUpload(rel, node, body)
 	log.Printf("↑ uploaded %s", rel)
 	e.publishActivity("upload", rel)
 	return nil
@@ -2651,32 +2600,81 @@ func (e *syncEngine) replaceFile(ctx context.Context, rel, nodeID string) error 
 	e.setInFlight(rel, "upload")
 	defer e.clearInFlight()
 
-	abs := filepath.Join(e.folder, filepath.FromSlash(rel))
-	data, err := os.ReadFile(abs)
+	body, size, err := openUpload(filepath.Join(e.folder, filepath.FromSlash(rel)))
 	if err != nil {
 		return err
 	}
-	node, err := e.sc.replace(ctx, nodeID, data)
+	defer body.Close()
+	node, err := e.sc.replaceStream(withSingleAttempt(ctx), nodeID, body, size, nil)
 	if err != nil {
 		return err
 	}
-	e.recordUpload(rel, node, data)
+	e.recordUpload(rel, node, body)
 	log.Printf("↑ uploaded %s (updated)", rel)
 	e.publishActivity("update", rel)
 	return nil
 }
 
-func (e *syncEngine) recordUpload(rel string, node *storageNode, data []byte) {
+func (e *syncEngine) recordUpload(rel string, node *storageNode, sent *uploadBody) {
 	e.state.Entries[rel] = SyncEntry{
 		RelPath:    rel,
 		NodeID:     node.ID,
 		RemoteEtag: node.Etag,
-		LocalHash:  hashBytes(data),
-		LocalSize:  int64(len(data)),
+		LocalHash:  sent.sum(),
+		LocalSize:  sent.n,
 		SyncedAt:   time.Now(),
 	}
 	e.uploaded.Add(1)
 }
+
+// uploadBody streams a file to the server, hashing what it reads so the sync
+// entry records exactly the bytes sent, not what the file holds by the time
+// the upload finishes. A resent request reads the body again from the start
+// (see authedStreamRequest), which starts the hash over.
+type uploadBody struct {
+	f *os.File
+	r *io.SectionReader // the file's first size bytes: what Content-Length promised
+	h hash.Hash
+	n int64
+}
+
+// openUpload opens path to be uploaded, returning its size.
+func openUpload(path string) (*uploadBody, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	return &uploadBody{f: f, r: io.NewSectionReader(f, 0, fi.Size()), h: sha256.New()}, fi.Size(), nil
+}
+
+func (b *uploadBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.h.Write(p[:n])
+	b.n += int64(n)
+	return n, err
+}
+
+func (b *uploadBody) Seek(offset int64, whence int) (int64, error) {
+	pos, err := b.r.Seek(offset, whence)
+	if err != nil {
+		return pos, err
+	}
+	if pos != 0 {
+		return pos, errors.New("upload body can only seek back to the start")
+	}
+	b.h.Reset()
+	b.n = 0
+	return 0, nil
+}
+
+func (b *uploadBody) Close() error { return b.f.Close() }
+
+func (b *uploadBody) sum() string { return hex.EncodeToString(b.h.Sum(nil)) }
 
 func (e *syncEngine) saveState() {
 	e.mu.Lock()
@@ -4353,23 +4351,6 @@ func humanSize(bytes int64) string {
 }
 
 // --- small helpers ---
-
-func atomicWrite(path string, data []byte) error {
-	tmp := path + tmpSuffix
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
-func hashBytes(data []byte) string {
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
-}
 
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)

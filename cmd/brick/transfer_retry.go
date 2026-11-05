@@ -108,6 +108,16 @@ func withTransferRetryObserver(ctx context.Context, fn transferRetryObserver) co
 	return context.WithValue(ctx, transferRetryObserverKey{}, fn)
 }
 
+type singleAttemptKey struct{}
+
+// withSingleAttempt returns ctx under which retryTransfer makes one attempt
+// and returns its error, still cut off if it stalls. For a caller that has
+// its own way of trying again later, which a transfer that kept retrying
+// through an outage would only hold up.
+func withSingleAttempt(ctx context.Context) context.Context {
+	return context.WithValue(ctx, singleAttemptKey{}, true)
+}
+
 // transferAttempt is one try at a transfer, run under ctx, which is cut off
 // if touch isn't called for transferStallTimeout. It reports whether it got
 // further than any attempt before it.
@@ -118,11 +128,12 @@ type transferAttempt func(ctx context.Context, touch func()) (progressed bool, e
 // attempt getting further. It returns the last attempt's error.
 func retryTransfer(ctx context.Context, attempt transferAttempt) error {
 	observe, _ := ctx.Value(transferRetryObserverKey{}).(transferRetryObserver)
+	single, _ := ctx.Value(singleAttemptKey{}).(bool)
 	wait := transferRetryMin
 	giveUpAt := time.Now().Add(transferRetryWindow)
 	for {
 		progressed, err := runGuarded(ctx, attempt)
-		if err == nil || ctx.Err() != nil || !isTransient(err) {
+		if err == nil || ctx.Err() != nil || !isTransient(err) || single {
 			return err
 		}
 		if progressed {
@@ -175,6 +186,15 @@ func runGuarded(ctx context.Context, attempt transferAttempt) (bool, error) {
 func resumableDownload(ctx context.Context, destPath string, total int64, noClobber bool, onProgress func(written, total int64),
 	fetch func(ctx context.Context, headers map[string]string) (*http.Response, error),
 	errFor func(resp *http.Response) error) error {
+	return resumableDownloadThen(ctx, destPath, total, noClobber, onProgress, fetch, errFor, nil)
+}
+
+// resumableDownloadThen is resumableDownload, calling beforePlace (if set)
+// with the finished temporary file before it is put in place. An error
+// from it fails the download.
+func resumableDownloadThen(ctx context.Context, destPath string, total int64, noClobber bool, onProgress func(written, total int64),
+	fetch func(ctx context.Context, headers map[string]string) (*http.Response, error),
+	errFor func(resp *http.Response) error, beforePlace func(tmpPath string) error) error {
 	out, err := createTempFor(destPath)
 	if err != nil {
 		return err
@@ -254,6 +274,9 @@ func resumableDownload(ctx context.Context, destPath string, total int64, noClob
 		err = out.Close()
 	} else {
 		out.Close()
+	}
+	if err == nil && beforePlace != nil {
+		err = beforePlace(tmpPath)
 	}
 	if err != nil {
 		os.Remove(tmpPath)
