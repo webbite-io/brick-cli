@@ -133,9 +133,17 @@ func runRemoteControlLoop(cfg *Config, sc *storageClient) error {
 	}
 	defer cleanupInteractive()
 
+	// No settings: with no sync running, GET/PATCH /settings answer
+	// sync_not_running. Created ahead of the TUI, whose Toggle R/W shortcut
+	// changes the agent's root; connected further down.
+	agentRoots := resolveAgentRoots(cfg)
+	agentSecret := newAgentSecret()
+	agent := startAgentServer(ctx, agentRoots, agentSecret, sc, true, cfg.TransferHistoryLimit, nil)
+
 	if interactive {
 		model := newRCTUIModel(Version, cancel)
-		model.setRemoteControl(resolveAgentRoots(cfg))
+		model.setRemoteControl(agentRoots)
+		model.setRCAccessToggle(rcAccessToggle(cfg, agent))
 		prog = tea.NewProgram(model, tea.WithAltScreen())
 		tuiOutput := io.Writer(newTUILogWriter(prog))
 		if syncLog != nil {
@@ -157,11 +165,6 @@ func runRemoteControlLoop(cfg *Config, sc *storageClient) error {
 		}()
 	}
 
-	// No settings: with no sync running, GET/PATCH /settings answer
-	// sync_not_running.
-	agentRoots := resolveAgentRoots(cfg)
-	agentSecret := newAgentSecret()
-	agent := startAgentServer(ctx, agentRoots, agentSecret, sc, true, cfg.TransferHistoryLimit, nil)
 	go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agent.handler(), true, nil)
 	defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)
 	if len(agentRoots) == 0 {

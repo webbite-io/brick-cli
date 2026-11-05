@@ -3475,10 +3475,22 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 		}
 	}
 
+	// Remote file agent: register this device with the storage API. When
+	// remoteControl is enabled, the allowed roots are also exposed so the same
+	// user can browse/list/transfer files remotely; otherwise the storage API is
+	// refused if it tries to call that functionality. Runs alongside sync;
+	// failures here are non-fatal to syncing. Created ahead of the TUI, whose
+	// Toggle R/W shortcut changes the agent's root; connected further down.
+	agentRoots := resolveAgentRoots(cfg)
+	agentSecret := newAgentSecret()
+	settings := &syncExcludeDirsSettings{cfg: cfg, eng: eng, notify: notify}
+	agent := startAgentServer(ctx, agentRoots, agentSecret, sc, remoteControl, cfg.TransferHistoryLimit, settings)
+
 	if interactive {
 		model := newSyncTUIModel(Version, folder, cancel, &detachRequested, togglePause)
 		if remoteControl {
-			model.setRemoteControl(resolveAgentRoots(cfg))
+			model.setRemoteControl(agentRoots)
+			model.setRCAccessToggle(rcAccessToggle(cfg, agent))
 		}
 		prog = tea.NewProgram(model, tea.WithAltScreen())
 		eng.onQuota = func(q *storageQuota) { prog.Send(quotaMsg{q}) }
@@ -3503,15 +3515,6 @@ func runSyncLoop(setup *syncSetup, remoteControl, background bool) (detach bool,
 	// change lands.
 	eng.refreshQuotaAsync(ctx)
 
-	// Remote file agent: register this device with the storage API. When
-	// remoteControl is enabled, the allowed roots are also exposed so the same
-	// user can browse/list/transfer files remotely; otherwise the storage API is
-	// refused if it tries to call that functionality. Runs alongside sync;
-	// failures here are non-fatal to syncing.
-	agentRoots := resolveAgentRoots(cfg)
-	agentSecret := newAgentSecret()
-	settings := &syncExcludeDirsSettings{cfg: cfg, eng: eng, notify: notify}
-	agent := startAgentServer(ctx, agentRoots, agentSecret, sc, remoteControl, cfg.TransferHistoryLimit, settings)
 	agentConnected := make(chan struct{})
 	go connectAgentWithReconnect(ctx, sc.baseURL, sc.apiURL, cfg, agentSecret, agent.handler(), remoteControl, agentConnected)
 	defer deregisterAgent(sc.baseURL, sc.apiURL, cfg)

@@ -116,6 +116,10 @@ type agentRoot struct {
 
 type agentServer struct {
 	roots []agentRoot
+	// rootsMu guards each root's readOnly, which the TUI's Toggle R/W
+	// shortcut can change while requests are being served (see
+	// setRootReadOnly). A root's path never changes.
+	rootsMu sync.RWMutex
 	// rootReals holds each root's real path, resolved once at start-up,
 	// or "" for one that couldn't be (it is then resolved on every use,
 	// in case it appears later). See realRoot.
@@ -394,12 +398,11 @@ func (a *agentServer) resolveWritable(p string) (string, error) {
 // gets its own setting.
 func (a *agentServer) rootOf(abs string) (agentRoot, bool) {
 	real := evalSafe(abs)
-	var best agentRoot
-	bestLen := -1
+	bestIdx, bestLen := -1, -1
 	if real == "" {
-		return best, false
+		return agentRoot{}, false
 	}
-	for i, root := range a.roots {
+	for i := range a.roots {
 		rootReal := a.realRoot(i)
 		if rootReal == "" {
 			continue // a root that can't be resolved contains nothing
@@ -412,10 +415,28 @@ func (a *agentServer) rootOf(abs string) (agentRoot, bool) {
 			prefix += string(os.PathSeparator)
 		}
 		if (real == rootReal || strings.HasPrefix(real, prefix)) && len(rootReal) > bestLen {
-			best, bestLen = root, len(rootReal)
+			bestIdx, bestLen = i, len(rootReal)
 		}
 	}
-	return best, bestLen >= 0
+	if bestIdx < 0 {
+		return agentRoot{}, false
+	}
+	return agentRoot{path: a.roots[bestIdx].path, readOnly: a.rootReadOnly(bestIdx)}, true
+}
+
+// rootReadOnly reports whether root i is currently read-only.
+func (a *agentServer) rootReadOnly(i int) bool {
+	a.rootsMu.RLock()
+	defer a.rootsMu.RUnlock()
+	return a.roots[i].readOnly
+}
+
+// setRootReadOnly changes whether root i is read-only, taking effect from
+// the next request on.
+func (a *agentServer) setRootReadOnly(i int, readOnly bool) {
+	a.rootsMu.Lock()
+	defer a.rootsMu.Unlock()
+	a.roots[i].readOnly = readOnly
 }
 
 // realRoot returns root i's real path: as resolved at start-up, which keeps
@@ -489,6 +510,8 @@ func (a *agentServer) handleRoots(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *agentServer) rootEntries() []rootEntry {
+	a.rootsMu.RLock()
+	defer a.rootsMu.RUnlock()
 	roots := make([]rootEntry, 0, len(a.roots))
 	for _, root := range a.roots {
 		roots = append(roots, rootEntry{Path: root.path, Name: filepath.Base(root.path), ReadOnly: root.readOnly})
@@ -1693,16 +1716,10 @@ func resolveAgentRoots(cfg *Config) []agentRoot {
 	index := map[string]int{}
 	var out []agentRoot
 	add := func(p string, readOnly bool) {
-		if strings.HasPrefix(p, "~") {
-			if home, err := os.UserHomeDir(); err == nil {
-				p = filepath.Join(home, strings.TrimPrefix(p, "~"))
-			}
-		}
-		abs, err := filepath.Abs(p)
+		abs, err := agentRootPath(p)
 		if err != nil {
 			return
 		}
-		abs = filepath.Clean(abs)
 		if i, ok := index[abs]; ok {
 			out[i].readOnly = out[i].readOnly || readOnly
 			return
@@ -1714,6 +1731,21 @@ func resolveAgentRoots(cfg *Config) []agentRoot {
 		add(r.Path, r.isReadOnly())
 	}
 	return out
+}
+
+// agentRootPath expands ~ in a configured root and makes it absolute and
+// clean, the form agentRoot.path holds.
+func agentRootPath(p string) (string, error) {
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(abs), nil
 }
 
 // formatAgentRoots renders roots for the "Remote control enabled" log line.

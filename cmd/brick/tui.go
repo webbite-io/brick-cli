@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync/atomic"
 
@@ -186,6 +187,11 @@ type syncTUIModel struct {
 	remoteControl bool
 	rcAccess      string
 
+	// toggleRCAccess, when set (see setRCAccessToggle), is what the R
+	// shortcut runs to flip the one root between R/O and R/W; nil means
+	// there's no single root to toggle, and the shortcut isn't offered.
+	toggleRCAccess func() (readOnly bool, err error)
+
 	// rcOnly is set for `brick rc`, which runs no sync: the Detach and
 	// Pause shortcuts are neither offered nor handled.
 	rcOnly bool
@@ -220,8 +226,8 @@ func newSyncTUIModel(version, folder string, cancel context.CancelFunc, detachRe
 }
 
 // newRCTUIModel is the TUI for `brick rc`: the same log view, with
-// rcFolderLabel where the sync folder would go and only Ctrl+C and search as
-// commands.
+// rcFolderLabel where the sync folder would go and only Ctrl+C, search and
+// (with a single root) Toggle R/W as commands.
 func newRCTUIModel(version string, cancel context.CancelFunc) *syncTUIModel {
 	m := newSyncTUIModel(version, rcFolderLabel, cancel, &atomic.Bool{}, func() {})
 	m.rcOnly = true
@@ -239,6 +245,22 @@ func (m *syncTUIModel) setRemoteControl(roots []agentRoot) {
 			m.rcAccess = "R/O"
 		}
 	}
+}
+
+// setRCAccessToggle enables the R shortcut with toggle, as built by
+// rcAccessToggle. A nil toggle leaves it off.
+func (m *syncTUIModel) setRCAccessToggle(toggle func() (bool, error)) {
+	if m.rcAccess != "" {
+		m.toggleRCAccess = toggle
+	}
+}
+
+// rcAccessMsg carries the outcome of a Toggle R/W press back to Update:
+// the root's readOnly afterwards, or the error (already logged) that kept it
+// from changing.
+type rcAccessMsg struct {
+	readOnly bool
+	err      error
 }
 
 func (m *syncTUIModel) Init() tea.Cmd { return nil }
@@ -271,6 +293,16 @@ func (m *syncTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case quotaMsg:
 		m.quota = msg.q
+		return m, nil
+
+	case rcAccessMsg:
+		if msg.err != nil {
+			return m, nil
+		}
+		m.rcAccess = "R/W"
+		if msg.readOnly {
+			m.rcAccess = "R/O"
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -327,6 +359,26 @@ func (m *syncTUIModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.togglePause()
 		m.paused = !m.paused
 		return m, nil
+	case "r", "R":
+		if m.toggleRCAccess == nil {
+			return m, nil
+		}
+		// Run off the update loop: saving the config waits on tokenMu,
+		// which a token refresh holds across its network round trip.
+		toggle := m.toggleRCAccess
+		return m, func() tea.Msg {
+			readOnly, err := toggle()
+			if err != nil {
+				log.Printf("Could not change remote control access: %v", err)
+			} else {
+				level := "read/write"
+				if readOnly {
+					level = "read-only"
+				}
+				log.Printf("Remote control access changed to %s", level)
+			}
+			return rcAccessMsg{readOnly: readOnly, err: err}
+		}
 	case "/":
 		m.searching = true
 		m.following = true
@@ -551,6 +603,9 @@ func (m *syncTUIModel) searchRow() string {
 func (m *syncTUIModel) commandsLine() string {
 	colored := ansiLightGreen + "Ctrl+C" + ansiReset + ": Stop"
 	if m.rcOnly {
+		if m.toggleRCAccess != nil {
+			colored += " • " + ansiLightGreen + "R" + ansiReset + ": Toggle R/W"
+		}
 		colored += " • " + ansiLightGreen + "/" + ansiReset + ": Search"
 		return fmt.Sprintf("%sCommands:%s %s", ansiPurple, ansiReset, colored)
 	}
@@ -562,6 +617,9 @@ func (m *syncTUIModel) commandsLine() string {
 		pauseLabel = "Resume sync"
 	}
 	colored += " • " + ansiLightGreen + "P" + ansiReset + ": " + pauseLabel
+	if m.toggleRCAccess != nil {
+		colored += " • " + ansiLightGreen + "R" + ansiReset + ": Toggle R/W"
+	}
 	colored += " • " + ansiLightGreen + "/" + ansiReset + ": Search"
 	return fmt.Sprintf("%sCommands:%s %s", ansiPurple, ansiReset, colored)
 }

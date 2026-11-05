@@ -330,3 +330,83 @@ func TestAgentSettingsReadOnlyDeviceRefusesChanges(t *testing.T) {
 		t.Errorf("a refused PATCH changed the list to %v", stub.dirs)
 	}
 }
+
+func TestRCAccessToggleSavesAndApplies(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CONFIG_FOLDER", "brick-test")
+	cfgPath, err := configPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sc, fake := newTestTransferClient(t)
+	root := t.TempDir()
+	cfg := &Config{ClientID: "c1", AgentRoots: []AgentRoot{{Path: root}}}
+	ta := newTestAgentWithRoots(t, sc, fake, true, resolveAgentRoots(cfg))
+	toggle := rcAccessToggle(cfg, ta.server)
+	if toggle == nil {
+		t.Fatal("rcAccessToggle = nil for a single config root, want a toggle")
+	}
+
+	check := func(wantReadOnly bool) {
+		t.Helper()
+		saved, err := loadOrCreateConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(saved.AgentRoots) != 1 || saved.AgentRoots[0].isReadOnly() != wantReadOnly {
+			t.Errorf("config.yaml agentRoots = %+v, want readOnly %v", saved.AgentRoots, wantReadOnly)
+		}
+		if wantReadOnly && saved.AgentRoots[0].ReadOnly != nil {
+			t.Errorf("read-only root saved with readOnly set, want the plain-path form")
+		}
+		var roots struct {
+			Roots []rootEntry `json:"roots"`
+		}
+		ta.do("GET", "/fs/roots", nil, &roots)
+		if len(roots.Roots) != 1 || roots.Roots[0].ReadOnly != wantReadOnly {
+			t.Errorf("GET /fs/roots = %+v, want readOnly %v", roots.Roots, wantReadOnly)
+		}
+		wantStatus := http.StatusOK
+		if wantReadOnly {
+			wantStatus = http.StatusForbidden
+		}
+		if status := ta.do("POST", "/fs/mkdir?path="+filepath.Join(root, "dir"), nil, nil); status != wantStatus {
+			t.Errorf("mkdir: status %d, want %d", status, wantStatus)
+		}
+		os.Remove(filepath.Join(root, "dir"))
+	}
+
+	if readOnly, err := toggle(); err != nil || readOnly {
+		t.Fatalf("first toggle = %v, %v; want false (read/write), nil", readOnly, err)
+	}
+	check(false)
+	if readOnly, err := toggle(); err != nil || !readOnly {
+		t.Fatalf("second toggle = %v, %v; want true (read-only), nil", readOnly, err)
+	}
+	check(true)
+}
+
+func TestRCAccessToggleNeedsOneConfigRoot(t *testing.T) {
+	sc, fake := newTestTransferClient(t)
+	a, b := t.TempDir(), t.TempDir()
+
+	cfg := &Config{AgentRoots: []AgentRoot{{Path: a}, {Path: b}}}
+	ta := newTestAgentWithRoots(t, sc, fake, true, resolveAgentRoots(cfg))
+	if rcAccessToggle(cfg, ta.server) != nil {
+		t.Error("rcAccessToggle with two roots, want nil")
+	}
+
+	// An --agent-root root is always read-only, so it can't be toggled.
+	prev := agentRootsFlag
+	agentRootsFlag = stringList{a}
+	t.Cleanup(func() { agentRootsFlag = prev })
+	cfg = &Config{AgentRoots: []AgentRoot{{Path: a}}}
+	ta = newTestAgentWithRoots(t, sc, fake, true, resolveAgentRoots(cfg))
+	if rcAccessToggle(cfg, ta.server) != nil {
+		t.Error("rcAccessToggle with an --agent-root root, want nil")
+	}
+}

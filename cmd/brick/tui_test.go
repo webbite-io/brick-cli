@@ -403,3 +403,35 @@ func TestRCTUIModelIgnoresDetachAndPause(t *testing.T) {
 		t.Errorf("commandsLine offers sync shortcuts: %q", line)
 	}
 }
+
+func TestToggleRCAccessShortcut(t *testing.T) {
+	m := newSyncTUIModel("1.2.3", "/sync/folder", func() {}, new(atomic.Bool), func() {})
+	m.width, m.height = 160, 24
+
+	// Several roots: no toggle, even if one is handed over.
+	m.setRemoteControl([]agentRoot{{path: "/a"}, {path: "/b"}})
+	m.setRCAccessToggle(func() (bool, error) { return false, nil })
+	if strings.Contains(m.commandsLine(), "Toggle R/W") {
+		t.Errorf("commandsLine() with several roots = %q, should not offer Toggle R/W", m.commandsLine())
+	}
+	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")}); cmd != nil {
+		t.Error("R with several roots returned a command, want none")
+	}
+
+	m.setRemoteControl([]agentRoot{{path: "/a", readOnly: true}})
+	readOnly := true
+	m.setRCAccessToggle(func() (bool, error) { readOnly = !readOnly; return readOnly, nil })
+	if !strings.Contains(m.commandsLine(), "R"+ansiReset+": Toggle R/W") {
+		t.Errorf("commandsLine() with one root = %q, want it to offer R: Toggle R/W", m.commandsLine())
+	}
+	for _, want := range []string{"R/W", "R/O"} {
+		_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+		if cmd == nil {
+			t.Fatal("R returned no command, want the toggle")
+		}
+		m.Update(cmd())
+		if m.rcAccess != want {
+			t.Errorf("after R: rcAccess = %q, want %q", m.rcAccess, want)
+		}
+	}
+}

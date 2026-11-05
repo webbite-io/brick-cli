@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 )
 
 // settingsResponse is the body of GET and PATCH /settings. selectiveSync can
@@ -99,12 +101,68 @@ func (a *agentServer) handleUpdateSettings(w http.ResponseWriter, r *http.Reques
 // hasWritableRoot reports whether remote control may change anything on the
 // device: whether any of its roots is writable.
 func (a *agentServer) hasWritableRoot() bool {
+	a.rootsMu.RLock()
+	defer a.rootsMu.RUnlock()
 	for _, root := range a.roots {
 		if !root.readOnly {
 			return true
 		}
 	}
 	return false
+}
+
+// rcAccessToggle returns what the TUI's Toggle R/W shortcut runs: it flips
+// the agent's one root between read-only and read/write, saves that to
+// config.yaml and applies it to the agent straight away, so the very next
+// remote control request (GET /fs/roots included) sees it. It returns the
+// root's new readOnly.
+//
+// It returns nil, offering no toggle, unless there's exactly one root and
+// it's set only in the config file: an --agent-root root is always
+// read-only, so there'd be nothing to save the change to.
+func rcAccessToggle(cfg *Config, a *agentServer) func() (bool, error) {
+	if len(a.roots) != 1 {
+		return nil
+	}
+	root := a.roots[0].path
+	for _, p := range agentRootsFlag {
+		if abs, err := agentRootPath(p); err == nil && abs == root {
+			return nil
+		}
+	}
+
+	var mu sync.Mutex // one toggle at a time, so two quick presses flip twice
+	return func() (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		readOnly := !a.rootReadOnly(0)
+
+		// Read-only is saved by leaving readOnly unset, the plain-path form
+		// onboarding writes too. tokenMu serializes this with
+		// rotateAccessToken's own saveConfig of the same *Config.
+		var saved *bool
+		if !readOnly {
+			saved = new(bool)
+		}
+		tokenMu.Lock()
+		prev := slices.Clone(cfg.AgentRoots)
+		for i, r := range cfg.AgentRoots {
+			if abs, err := agentRootPath(r.Path); err == nil && abs == root {
+				cfg.AgentRoots[i].ReadOnly = saved
+			}
+		}
+		err := saveConfig(cfg)
+		if err != nil {
+			cfg.AgentRoots = prev
+		}
+		tokenMu.Unlock()
+		if err != nil {
+			return !readOnly, err
+		}
+
+		a.setRootReadOnly(0, readOnly)
+		return readOnly, nil
+	}
 }
 
 // normalizeExcludeDirs validates excludeDirs entries and puts them in the
