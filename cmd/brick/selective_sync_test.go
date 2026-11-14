@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -85,5 +86,91 @@ func TestReconcileAllDoesNotCreateExcludedFolder(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(syncFolder, "Camera Uploads", "photo1.jpg")); !os.IsNotExist(err) {
 		t.Errorf("excluded file must never be downloaded: stat = %v", err)
+	}
+}
+
+// A synced folder or file moved into an excluded folder on the server must
+// not be mirrored with a local rename: that would carry a local copy into a
+// folder sync ignores, where nothing ever updates or removes it again. The
+// normal passes treat the old path as deleted on the server instead. Moves out
+// of an excluded folder are left to the normal passes too (they download it).
+func TestRemoteMovesAcrossExcludedFolderAreNotMirrored(t *testing.T) {
+	folder := t.TempDir()
+	for _, rel := range []string{"Photos/a.jpg", "b.jpg"} {
+		abs := filepath.Join(folder, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(abs, []byte(rel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e := &syncEngine{
+		folder:      folder,
+		excludeDirs: []string{"Camera Uploads"},
+		state: &SyncState{
+			Folder:    folder,
+			Entries:   map[string]SyncEntry{"Photos/a.jpg": {RelPath: "Photos/a.jpg", NodeID: "a1"}, "b.jpg": {RelPath: "b.jpg", NodeID: "b1"}},
+			Folders:   map[string]bool{"Photos": true, "Camera Uploads/Trip": true},
+			FolderIDs: map[string]string{"Photos": "f1", "Camera Uploads/Trip": "f2"},
+		},
+	}
+	localDirs := map[string]bool{"Photos": true}
+	localFiles := map[string]int64{"Photos/a.jpg": 1, "b.jpg": 1}
+
+	e.applyRemoteFolderMoves(map[string]storageNode{
+		"Camera Uploads/Photos": {ID: "f1", NodeType: "folder"},
+		"Trip":                  {ID: "f2", NodeType: "folder"},
+	}, localDirs, localFiles)
+	e.applyRemoteFileMoves(map[string]storageNode{
+		"Camera Uploads/b.jpg": {ID: "b1", NodeType: "file"},
+	}, localFiles)
+
+	if _, err := os.Stat(filepath.Join(folder, "Camera Uploads")); !os.IsNotExist(err) {
+		t.Errorf("excluded folder created locally: stat = %v", err)
+	}
+	for _, rel := range []string{"Photos/a.jpg", "b.jpg"} {
+		if _, ok := e.state.Entries[rel]; !ok {
+			t.Errorf("index entry %q rewritten, want it left for the file pass", rel)
+		}
+	}
+	if n := e.moved.Load(); n != 0 {
+		t.Errorf("moved = %d, want 0", n)
+	}
+}
+
+// Pass 0 not mirroring such a move only works if the file pass then visits
+// every file under both the old and new paths: a folder move's delta carries
+// just the folder's own row, so applyRemoteDelta must report its descendants.
+func TestApplyRemoteDeltaReportsDescendantsOfFolderMovedAcrossExclude(t *testing.T) {
+	for _, tc := range []struct{ to, wantOld, wantNew string }{
+		{"/Camera Uploads/docs", "docs/a.txt", "Camera Uploads/docs/a.txt"}, // into
+		{"/archive", "", ""}, // neither side excluded: pass 0 mirrors it, nothing extra to report
+	} {
+		e := newDeltaTestEngine()
+		e.excludeDirs = []string{"Camera Uploads"}
+		affected := e.applyRemoteDelta([]storageNode{{ID: "f1", NodeType: "folder", Path: tc.to}})
+		if tc.wantOld == "" {
+			if len(affected) != 0 {
+				t.Errorf("move to %s: affected = %v, want none", tc.to, affected)
+			}
+			continue
+		}
+		for _, want := range []string{tc.wantOld, tc.wantNew} {
+			if !slices.Contains(affected, want) {
+				t.Errorf("move to %s: affected = %v, want it to include %q", tc.to, affected, want)
+			}
+		}
+	}
+
+	// Out of an excluded folder: the newly synced files must be reported so
+	// an incremental pass downloads them.
+	e := newDeltaTestEngine()
+	e.excludeDirs = []string{"docs"}
+	affected := e.applyRemoteDelta([]storageNode{{ID: "f1", NodeType: "folder", Path: "/archive"}})
+	for _, want := range []string{"archive/a.txt", "archive/b.txt", "docs/a.txt", "docs/b.txt"} {
+		if !slices.Contains(affected, want) {
+			t.Errorf("move out of exclude: affected = %v, want it to include %q", affected, want)
+		}
 	}
 }
