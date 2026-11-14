@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -172,5 +173,47 @@ func TestApplyRemoteDeltaReportsDescendantsOfFolderMovedAcrossExclude(t *testing
 		if !slices.Contains(affected, want) {
 			t.Errorf("move out of exclude: affected = %v, want it to include %q", affected, want)
 		}
+	}
+}
+
+// An account with no folders yet gets no sync-scope question, but Camera
+// Uploads is still left out, so it isn't synced by default once the first
+// camera upload creates it. Exclusions already configured are kept.
+func TestSyncScopeOnboardingExcludesCameraUploadsOnEmptyAccount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".config", "brick"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/accounts/acct-1/nodes/root/children", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, storageNodeList{
+			Data:  []storageNode{{ID: "f1", ParentID: "root", Name: "loose.txt", NodeType: "file"}},
+			Count: 1,
+		})
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	cfg := &Config{AccessToken: "test-token", ActiveAccountID: "acct-1"}
+	cfg.ensureActiveAccount().ExcludeDirs = []string{"Old"}
+	sc := &storageClient{baseURL: server.URL, apiURL: server.URL, accountID: "acct-1", cfg: cfg}
+
+	for i := 0; i < 2; i++ { // and running it again doesn't add a duplicate
+		if err := runSyncScopeOnboarding(sc, "root", cfg, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := []string{"Old", cameraUploadsFolder}
+	if got := cfg.ensureActiveAccount().ExcludeDirs; !slices.Equal(got, want) {
+		t.Errorf("ExcludeDirs = %v, want %v", got, want)
+	}
+	saved, err := os.ReadFile(filepath.Join(home, ".config", "brick", "config.yaml"))
+	if err != nil {
+		t.Fatalf("config not saved: %v", err)
+	}
+	if !strings.Contains(string(saved), cameraUploadsFolder) {
+		t.Errorf("saved config doesn't exclude Camera Uploads:\n%s", saved)
 	}
 }
