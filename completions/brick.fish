@@ -60,7 +60,7 @@ complete -c brick -n '__fish_seen_subcommand_from sync' -l agent-root \
     -d 'Additional read-only directory to expose to remote clients when remote control is enabled' -r
 
 complete -c brick -n '__fish_seen_subcommand_from sync' -s s -l selective-sync \
-    -d 'Choose which folders to exclude from sync'
+    -d 'Update which folders to sync (removing a folder removes local files)'
 
 complete -c brick -n '__fish_seen_subcommand_from sync' -l list-selective-sync \
     -d 'List the folders currently excluded from sync'

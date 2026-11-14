@@ -3939,11 +3939,12 @@ func runSyncScopeOnboarding(sc *storageClient, rootID string, cfg *Config, check
 	return nil
 }
 
-// runSelectiveSync lets the user update which top-level folders are excluded
-// from sync, pre-ticking whichever ones are already excluded. Folders newly
-// excluded by this run are deleted from local disk immediately (they're no
-// longer supposed to live on this device) and the updated exclude list is
-// persisted to the active account's config.
+// runSelectiveSync lets the user update which top-level folders are synced,
+// like the onboarding's "Pick which folders to sync": every folder not
+// already excluded starts out ticked, and whatever ends up unticked is
+// excluded. Folders newly excluded by this run are deleted from local disk
+// immediately (they're no longer supposed to live on this device) and the
+// updated exclude list is persisted to the active account's config.
 //
 // It refuses while another instance is running. That instance still has the
 // old exclude list in memory, so a reconcile pass racing the deletions below
@@ -3977,36 +3978,35 @@ func runSelectiveSync(apiURL, storageURL string) error {
 		return err
 	}
 	if len(topFolders) == 0 {
-		fmt.Println("No folders to exclude — this account has no top-level folders yet.")
+		fmt.Println("No folders to choose from — this account has no top-level folders yet.")
 		return nil
 	}
 
+	names := make([]string, len(topFolders))
 	options := make([]huh.Option[string], len(topFolders))
 	for i, f := range topFolders {
+		names[i] = f.Name
 		options[i] = huh.NewOption(f.Name, f.Name)
 	}
 	// Pre-populated before Options()/Value() are chained below, so huh ticks
-	// every option already present in ac.ExcludeDirs.
-	excludeDirs := append([]string(nil), ac.ExcludeDirs...)
+	// every folder not already excluded.
+	prev := normalizeExcludeDirEntries(ac.ExcludeDirs)
+	var includeDirs []string
+	for _, name := range names {
+		if !slices.Contains(prev, name) {
+			includeDirs = append(includeDirs, name)
+		}
+	}
 	if err := huh.NewForm(huh.NewGroup(
 		huh.NewMultiSelect[string]().
-			Title("Select the folders to exclude from sync").
+			Title("Select the folders to INCLUDE in sync (type \"x\" to toggle)").
 			Options(options...).
-			Value(&excludeDirs),
+			Value(&includeDirs),
 	)).Run(); err != nil {
 		return err
 	}
 
-	wasExcluded := map[string]bool{}
-	for _, d := range ac.ExcludeDirs {
-		wasExcluded[d] = true
-	}
-	var newlyExcluded []string
-	for _, name := range excludeDirs {
-		if !wasExcluded[name] {
-			newlyExcluded = append(newlyExcluded, name)
-		}
-	}
+	excludeDirs, newlyExcluded := selectiveSyncExcludes(prev, names, includeDirs)
 
 	// Safe to delete without pausing anything: requireNoRunningInstance above
 	// established that no engine is reconciling this folder.
@@ -4026,6 +4026,41 @@ func runSelectiveSync(apiURL, storageURL string) error {
 	fmt.Println("Saved selective sync settings.")
 	fmt.Println("\nRun 'brick sync' to start syncing with the new selection.")
 	return nil
+}
+
+// selectiveSyncExcludes works out the new exclude list after the user ticked
+// include among the listed top-level folders, and which of those it newly
+// excludes. Only the listed folders' entries change: any other entry in prev
+// (a folder not on Brick yet, such as the Camera Uploads onboarding leaves
+// out by default, a nested path added by hand, or a folder currently missing
+// on the server) is kept, since the user was never shown it to untick.
+func selectiveSyncExcludes(prev, listed, include []string) (exclude, newlyExcluded []string) {
+	for _, d := range prev {
+		if !slices.Contains(listed, d) || !slices.Contains(include, d) {
+			exclude = append(exclude, d)
+		}
+	}
+	for _, name := range listed {
+		if !slices.Contains(include, name) && !slices.Contains(prev, name) {
+			exclude = append(exclude, name)
+			newlyExcluded = append(newlyExcluded, name)
+		}
+	}
+	return exclude, newlyExcluded
+}
+
+// normalizeExcludeDirEntries trims the slashes isExcludedPath ignores anyway
+// ("/Music/" excludes the same folder as "Music"), so an entry written by
+// hand still matches the folder name it is compared with, and drops empty
+// entries.
+func normalizeExcludeDirEntries(dirs []string) []string {
+	var out []string
+	for _, d := range dirs {
+		if d = strings.Trim(filepath.ToSlash(d), "/"); d != "" && !slices.Contains(out, d) {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // runListSelectiveSync prints the folders currently excluded from sync for

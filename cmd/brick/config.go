@@ -322,7 +322,7 @@ func printHelp() {
 	fmt.Printf("  sync [options]                Sync Brick folder and watch for change (with Remote Control if enabled)\n")
 	fmt.Printf("        --agent-root PATH       Read-only directory to expose to remote clients (repeatable)\n")
 	fmt.Printf("    -d, --daemon                Detach into the background once logged in and Brick Online is reachable\n")
-	fmt.Printf("    -s, --selective-sync        Choose which folders to exclude from sync (deletes their local copies)\n")
+	fmt.Printf("    -s, --selective-sync        Update which folders to sync (removing a folder removes local files)\n")
 	fmt.Printf("        --list-selective-sync   List the folders currently excluded from sync\n")
 	fmt.Printf("        --dry-run               Report what would be synced without transferring, deleting or writing anything\n")
 	fmt.Printf("\n%sRemote Control:%s\n\n", ansiPurple, ansiReset)

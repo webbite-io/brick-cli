@@ -217,3 +217,58 @@ func TestSyncScopeOnboardingExcludesCameraUploadsOnEmptyAccount(t *testing.T) {
 		t.Errorf("saved config doesn't exclude Camera Uploads:\n%s", saved)
 	}
 }
+
+// brick sync -s lists only the account's current top-level folders, so only
+// their entries may change: an exclusion for anything else (Camera Uploads
+// before it exists, a nested path, a folder missing on the server) must
+// survive, where it used to be dropped because huh rebuilds the selection
+// from the listed options alone.
+func TestSelectiveSyncExcludesKeepsUnlistedEntries(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		prev, listed, incl  []string
+		wantExcl, wantNewly []string
+	}{
+		{
+			name:     "untick one; unlisted entries kept",
+			prev:     []string{cameraUploadsFolder, "Photos/2019"},
+			listed:   []string{"Music", "Work"},
+			incl:     []string{"Work"},
+			wantExcl: []string{cameraUploadsFolder, "Photos/2019", "Music"}, wantNewly: []string{"Music"},
+		},
+		{
+			name:     "re-tick a previously excluded folder",
+			prev:     []string{"Music", cameraUploadsFolder},
+			listed:   []string{"Music", "Work"},
+			incl:     []string{"Music", "Work"},
+			wantExcl: []string{cameraUploadsFolder},
+		},
+		{
+			name:     "keep an existing exclusion: not newly excluded",
+			prev:     []string{"Music"},
+			listed:   []string{"Music", "Work"},
+			incl:     []string{"Work"},
+			wantExcl: []string{"Music"},
+		},
+		{
+			name:     "everything ticked, nothing excluded",
+			listed:   []string{"Music", "Work"},
+			incl:     []string{"Music", "Work"},
+			wantExcl: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			excl, newly := selectiveSyncExcludes(tc.prev, tc.listed, tc.incl)
+			if !slices.Equal(excl, tc.wantExcl) || !slices.Equal(newly, tc.wantNewly) {
+				t.Errorf("got exclude=%v newly=%v, want exclude=%v newly=%v", excl, newly, tc.wantExcl, tc.wantNewly)
+			}
+		})
+	}
+}
+
+func TestNormalizeExcludeDirEntries(t *testing.T) {
+	got := normalizeExcludeDirEntries([]string{"/Music/", "", "Music", "Photos/2019/", "/"})
+	if want := []string{"Music", "Photos/2019"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}

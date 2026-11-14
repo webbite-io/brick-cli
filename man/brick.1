@@ -143,11 +143,15 @@ to remote clients when
 is enabled. Repeatable.
 .TP
 .BR \-s ", " \-\-selective\-sync
-Interactively choose which top-level folders of the active account are
-excluded from sync. Folders newly excluded are deleted from local disk
-immediately; any running
+Interactively update which top-level folders of the active account are
+synced. Every folder not already excluded starts out ticked; folders
+unticked are excluded from sync and their local copies deleted immediately.
+Exclusions for folders not listed (such as a
+.I Camera Uploads
+folder that doesn't exist on Brick yet) are kept. Refuses to run while
+another
 .B brick
-instance is restarted to pick up the change.
+instance is running.
 .TP
 .B \-\-list\-selective\-sync
 Print the folders currently excluded from sync for the active account.
@@ -251,7 +255,7 @@ Sync and immediately detach into the background:
 brick sync \-\-daemon
 .EE
 .TP
-Choose which folders to exclude from sync:
+Update which folders to sync:
 .EX
 brick sync \-\-selective\-sync
 .EE
